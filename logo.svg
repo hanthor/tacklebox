@@ -1,0 +1,21 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Tacklebox Background (Modern 3D Shape) -->
+  <rect x="64" y="128" width="384" height="320" rx="20" fill="#3B82F6"/>
+  <rect x="64" y="128" width="384" height="64" rx="20" fill="#2563EB"/>
+  
+  <!-- Handle -->
+  <path d="M192 128V96C192 78.3269 206.327 64 224 64H288C305.673 64 320 78.3269 320 96V128" stroke="#1D4ED8" stroke-width="24" stroke-linecap="round"/>
+  
+  <!-- Latches -->
+  <rect x="128" y="170" width="48" height="24" rx="4" fill="#1D4ED8"/>
+  <rect x="336" y="170" width="48" height="24" rx="4" fill="#1D4ED8"/>
+
+  <!-- Inner Symbol (Multiple Disks Overlay) -->
+  <circle cx="256" cy="288" r="80" fill="white" fill-opacity="0.2"/>
+  <circle cx="240" cy="272" r="80" fill="white" fill-opacity="0.3"/>
+  <circle cx="224" cy="256" r="80" fill="white" fill-opacity="0.4"/>
+  
+  <!-- USB Style Connector Symbol -->
+  <path d="M210 320L256 370L302 320" stroke="white" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="246" y="220" width="20" height="100" rx="4" fill="white"/>
+</svg>

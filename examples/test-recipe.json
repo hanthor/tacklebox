@@ -1,0 +1,19 @@
+{
+  "media_name": "Tacklebox-Test-Media",
+  "size": "10G",
+  "shared_store": {
+    "format": "ext4",
+    "compression": "zstd"
+  },
+  "bootable_environments": [
+    {
+      "id": "bluefin",
+      "image": "ghcr.io/ublue-os/bluefin:stable",
+      "desktop": "gnome",
+      "modes": ["live", "persistent"]
+    }
+  ],
+  "offline_payloads": [
+    "ghcr.io/projectbluefin/dakota:latest"
+  ]
+}

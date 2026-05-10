@@ -1,0 +1,19 @@
+{
+  "media_name": "Tacklebox-Multi-Boot-Media",
+  "size": "30G",
+  "shared_store": {
+    "format": "ext4",
+    "compression": "zstd"
+  },
+  "bootable_environments": [
+    {
+      "id": "bluefin",
+      "image": "localhost/superiso-live-bluefin:latest",
+      "desktop": "gnome",
+      "modes": ["live", "persistent"]
+    }
+  ],
+  "offline_payloads": [
+    "ghcr.io/projectbluefin/dakota:latest"
+  ]
+}

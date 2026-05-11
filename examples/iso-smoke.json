@@ -1,0 +1,15 @@
+{
+  "media_name": "TBX_ISO",
+  "size": "10G",
+  "shared_store": {
+    "format": "ext4"
+  },
+  "bootable_environments": [
+    {
+      "id": "bazzite",
+      "image": "localhost/superiso-live-bazzite:latest",
+      "desktop": "kde",
+      "modes": ["live"]
+    }
+  ]
+}

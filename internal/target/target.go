@@ -30,24 +30,53 @@ type Mountpoints struct {
 	StoreMount string
 }
 
+// InstallMode tells the orchestrator how each environment's content
+// should be materialised onto the target.
+//
+//   - Bootc: per-env `bootc install to-filesystem` into a stateroot
+//     subdir of the shared store. Used by BlockTarget. Each env ends
+//     up as an ostree (or composefs) deployment.
+//   - Live:  per-env podman-image-mount + mksquashfs into a single
+//     <env>.rootfs.sfs file. Used by IsoTarget. Boot-time pivot is
+//     dmsquash-live's job (rd.live.* on the kernel cmdline).
+type InstallMode string
+
+const (
+	InstallModeBootc InstallMode = "bootc"
+	InstallModeLive  InstallMode = "live"
+)
+
 // Target is the lifecycle a media build follows.
 //
 // Implementations register their own per-phase cleanup internally; the
 // orchestrator only needs to call Cleanup once on the way out.
 type Target interface {
 	// Prepare creates whatever underlying storage is needed (loop dev,
-	// partitions, filesystems, FAT image, scratch dirs) and installs the
-	// bootloader onto the ESP. Returns the mount points the install loop
-	// will write into.
+	// partitions, filesystems, FAT image, scratch dirs) and (for block
+	// targets) installs the bootloader onto the ESP. Returns the mount
+	// points the install loop will write into.
 	Prepare(track Track) (*Mountpoints, error)
 
 	// Finalize unmounts/detaches and produces the final artifact. Returns
 	// the path (or device) of the produced media. For BlockTarget on a
 	// loop image this is the .img file; for /dev/* it's the device path;
-	// for IsoTarget it'll be the .iso file.
+	// for IsoTarget it's the .iso file.
 	Finalize(track Track) (string, error)
 
 	// Cleanup runs on error or signal. Must be idempotent — the
 	// orchestrator may call it multiple times (deferred + signal handler).
 	Cleanup()
+
+	// InstallMode tells the orchestrator which per-env install backend to
+	// drive (bootc vs live). The orchestrator handles the actual install
+	// loop; the target just declares which one fits its layout.
+	InstallMode() InstallMode
+
+	// KernelPath / InitrdPath return the *boot-loader-relative* paths the
+	// BLS `linux` and `initrd` lines should reference for env. For
+	// BlockTarget these are `/EFI/<env>/vmlinuz` (the ESP root *is* the
+	// boot fs). For IsoTarget they're `/images/pxeboot/<env>/vmlinuz`
+	// (where dmsquash-live expects them on a live ISO).
+	KernelPath(envID string) string
+	InitrdPath(envID string) string
 }

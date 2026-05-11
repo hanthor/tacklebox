@@ -113,8 +113,13 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	defer signal.Stop(sigCh)
 	defer close(sigCh)
 
+	isoOut, _ := cmd.Flags().GetString("iso")
 	var deviceArg string
 	isBlockDevice := false
+	isIso := isoOut != ""
+	if isIso && len(args) == 2 {
+		return fmt.Errorf("cannot pass a TARGET argument together with --iso")
+	}
 	if len(args) == 2 {
 		deviceArg = args[1]
 		isBlockDevice = true
@@ -130,8 +135,10 @@ func runBuild(cmd *cobra.Command, args []string) error {
 
 	// Pre-flight: free-space and store-sizing warnings. Done here (not in
 	// the target) because they're recipe-shaped, not target-shaped, and
-	// most useful before we've burned any I/O.
-	if !isBlockDevice {
+	// most useful before we've burned any I/O. ISO targets don't have a
+	// fixed-size store partition so the warnings only apply to the
+	// loop-image case.
+	if !isBlockDevice && !isIso {
 		needed, ok := parseSize(r.Size)
 		if !ok {
 			return fmt.Errorf("unrecognised size %q in recipe (expected e.g. 32G, 16384M)", r.Size)
@@ -141,12 +148,12 @@ func runBuild(cmd *cobra.Command, args []string) error {
 				">>> WARNING: only %d MiB free under %s; recipe asks for %s (sparse, but installs will write real data)\n",
 				free/(1024*1024), outputBase, r.Size)
 		}
-	}
-	if needed, store, ok := estimateStoreUsage(r); ok && needed > store {
-		fmt.Fprintf(os.Stderr,
-			">>> WARNING: %d environments may need ~%d GiB of store, but recipe layout only allocates ~%d GiB.\n"+
-				">>>          Consider increasing recipe size (current: %s).\n",
-			len(r.BootableEnvironments), needed>>30, store>>30, r.Size)
+		if needed, store, ok := estimateStoreUsage(r); ok && needed > store {
+			fmt.Fprintf(os.Stderr,
+				">>> WARNING: %d environments may need ~%d GiB of store, but recipe layout only allocates ~%d GiB.\n"+
+					">>>          Consider increasing recipe size (current: %s).\n",
+				len(r.BootableEnvironments), needed>>30, store>>30, r.Size)
+		}
 	}
 
 	timings := map[string]time.Duration{}
@@ -161,18 +168,25 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	}
 	buildStart := time.Now()
 
-	// Partition layout is derived from the recipe so a 30G recipe doesn't
-	// share a 20G store with a 5G recipe.
-	//
-	//   p1 TBOX_ESP    : 1 GiB           (bootloader + per-env kernel/initrd)
-	//   p2 TBOX_STORE  : total - 1 - 2   (shared bootc installs)
-	//   p3 TBOX_PERSIST: remainder       (~2 GiB+ for persistent overlays)
-	partitions, err := computePartitions(r)
-	if err != nil {
-		return err
+	var tgt target.Target
+	if isIso {
+		// First env's image doubles as the EFI binary source. All ublue
+		// live containers ship systemd-boot under
+		// /usr/lib/systemd/boot/efi/ — see live/Containerfile.generic.
+		efiSource := r.BootableEnvironments[0].Image
+		isoTgt := target.NewIsoTarget(outputBase, isoOut, r.MediaName, efiSource)
+		tgt = isoTgt
+	} else {
+		// Block target: derive GPT partition layout from recipe size.
+		//   p1 TBOX_ESP    : 1 GiB           (bootloader + per-env kernel/initrd)
+		//   p2 TBOX_STORE  : total - 1 - 2   (shared bootc installs)
+		//   p3 TBOX_PERSIST: remainder       (~2 GiB+ for persistent overlays)
+		partitions, err := computePartitions(r)
+		if err != nil {
+			return err
+		}
+		tgt = target.NewBlockTarget(outputBase, deviceArg, r.Size, partitions)
 	}
-
-	tgt := target.NewBlockTarget(outputBase, deviceArg, r.Size, partitions)
 	addCleanup(tgt.Cleanup)
 
 	mp, err := tgt.Prepare(track)
@@ -195,7 +209,7 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	if parallelN > len(r.BootableEnvironments) {
 		parallelN = len(r.BootableEnvironments)
 	}
-	if err := runEnvs(r.BootableEnvironments, mp.StoreMount, mp.EspMount, parallelN, track); err != nil {
+	if err := runEnvs(r.BootableEnvironments, tgt, mp.StoreMount, mp.EspMount, parallelN, track); err != nil {
 		return err
 	}
 
@@ -204,7 +218,12 @@ func runBuild(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if !isBlockDevice {
+	switch {
+	case isIso:
+		fmt.Printf(">>> Tacklebox ISO complete: %s\n", artifact)
+	case isBlockDevice:
+		fmt.Printf(">>> Tacklebox provisioning complete: %s\n", artifact)
+	default:
 		fmt.Printf(">>> Tacklebox build complete: %s\n", artifact)
 		xz, _ := cmd.Flags().GetBool("xz")
 		if xz {
@@ -214,8 +233,6 @@ func runBuild(cmd *cobra.Command, args []string) error {
 			}
 			fmt.Printf(">>> Compression complete: %s.xz\n", artifact)
 		}
-	} else {
-		fmt.Printf(">>> Tacklebox provisioning complete: %s\n", artifact)
 	}
 
 	printTimings(timings, time.Since(buildStart))
@@ -288,10 +305,10 @@ func confirmDestructive(target string, assumeYes bool) error {
 // because we haven't broadly battle-tested it across image families. Stick
 // with parallel=1 for production builds; use --parallel-install=N to try
 // the faster path when total wall time matters more than risk.
-func runEnvs(envs []recipe.BootableEnvironment, storeMount, espMount string, parallel int, track func(string, func() error) error) error {
+func runEnvs(envs []recipe.BootableEnvironment, tgt target.Target, storeMount, espMount string, parallel int, track func(string, func() error) error) error {
 	if parallel <= 1 {
 		for _, env := range envs {
-			if err := installEnv(env, storeMount, espMount, track); err != nil {
+			if err := installEnv(env, tgt, storeMount, espMount, track); err != nil {
 				return err
 			}
 		}
@@ -308,7 +325,7 @@ func runEnvs(envs []recipe.BootableEnvironment, storeMount, espMount string, par
 		go func(i int, env recipe.BootableEnvironment) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			errs[i] = installEnv(env, storeMount, espMount, track)
+			errs[i] = installEnv(env, tgt, storeMount, espMount, track)
 		}(i, env)
 	}
 	wg.Wait()
@@ -323,6 +340,29 @@ func runEnvs(envs []recipe.BootableEnvironment, storeMount, espMount string, par
 		return fmt.Errorf("%d environment(s) failed:\n%s", len(failed), strings.Join(failed, "\n"))
 	}
 	return nil
+}
+
+// buildLiveKernelCmdline returns the BLS `options` line for an env that
+// will be booted via dmsquash-live from a per-env squashfs in /LiveOS/.
+// Used by IsoTarget. label is the ISO9660 volume label (so dmsquash-live
+// can find the iso by `root=live:CDLABEL=...`).
+func buildLiveKernelCmdline(envID, label string) string {
+	// rd.live.overlay.overlayfs=1 alone => tmpfs-backed overlayfs (the
+	// default). DON'T pass `rd.live.overlay=tmpfs` — that's interpreted
+	// as a label/path to look up, not the literal string "tmpfs", which
+	// stalls dracut-initqueue waiting for a non-existent device.
+	// enforcing=0: live boots can't use the on-disk SELinux contexts
+	// from the bootc image because the labels reference paths that
+	// don't exist in the overlayfs view. Without this, systemd PID 1
+	// dies with "Failed to allocate manager object: Permission denied"
+	// before reaching userspace. SuperISO's existing build-iso.sh sets
+	// the same flag for the same reason.
+	return fmt.Sprintf(
+		"root=live:CDLABEL=%s rd.live.image rd.live.dir=LiveOS rd.live.squashimg=%s.rootfs.sfs"+
+			" rd.live.overlay.overlayfs=1 enforcing=0"+
+			" tacklebox.env=%s console=ttyS0,115200n8",
+		label, envID, envID,
+	)
 }
 
 // buildKernelCmdline assembles the BLS `options` line for one (env, mode,
@@ -371,10 +411,20 @@ func buildKernelCmdline(envID string, mode recipe.BootMode, backend install.Back
 	return cmdline
 }
 
-// installEnv handles the per-environment pipeline. Safe to invoke concurrently
-// for distinct envs provided ExtractBootFiles uses the staging cache (which it
-// does — fetchToStaging serialises around extractCacheMu).
-func installEnv(env recipe.BootableEnvironment, storeMount, espMount string, track func(string, func() error) error) error {
+// installEnv runs the per-env install pipeline. Dispatches on the
+// target's InstallMode: bootc (block targets) or live (iso targets).
+// Safe to invoke concurrently for distinct envs.
+func installEnv(env recipe.BootableEnvironment, tgt target.Target, storeMount, espMount string, track func(string, func() error) error) error {
+	switch tgt.InstallMode() {
+	case target.InstallModeBootc:
+		return installEnvBootc(env, tgt, storeMount, espMount, track)
+	case target.InstallModeLive:
+		return installEnvLive(env, tgt, storeMount, espMount, track)
+	}
+	return fmt.Errorf("unsupported install mode %q", tgt.InstallMode())
+}
+
+func installEnvBootc(env recipe.BootableEnvironment, tgt target.Target, storeMount, espMount string, track func(string, func() error) error) error {
 	backend := install.Backend(env.Backend)
 	if backend == "" {
 		detected, err := install.DetectBackend(env.Image)
@@ -409,9 +459,6 @@ func installEnv(env recipe.BootableEnvironment, storeMount, espMount string, tra
 		return fmt.Errorf("extract boot files for %s: %w", env.ID, err)
 	}
 
-	kernelRelPath := filepath.Join("/EFI", env.ID, "vmlinuz")
-	initrdRelPath := filepath.Join("/EFI", env.ID, "initrd.img")
-
 	var ostreeBootcsum string
 	if backend == install.BackendOstree {
 		csum, fErr := install.FindOstreeDeployment(envRoot, env.ID)
@@ -428,9 +475,51 @@ func installEnv(env recipe.BootableEnvironment, storeMount, espMount string, tra
 		title := fmt.Sprintf("%s (%s)", env.ID, mode)
 		id := fmt.Sprintf("%s-%s", env.ID, mode)
 		options := buildKernelCmdline(env.ID, mode, backend, blockdev.UsbSafe, ostreeBootcsum)
-		if err := install.WriteBLSEntry(espMount, id, title, kernelRelPath, initrdRelPath, options); err != nil {
+		if err := install.WriteBLSEntry(espMount, id, title, tgt.KernelPath(env.ID), tgt.InitrdPath(env.ID), options); err != nil {
 			return err
 		}
+	}
+	fmt.Printf(">>> Finished environment: %s (kernel=%s)\n", env.ID, kver)
+	return nil
+}
+
+// installEnvLive packs env's container rootfs as a single squashfs and
+// writes a dmsquash-live BLS entry. ISO label comes from the IsoTarget;
+// we reach it via a small interface to avoid a hard target.IsoTarget
+// import.
+func installEnvLive(env recipe.BootableEnvironment, tgt target.Target, storeMount, espMount string, track func(string, func() error) error) error {
+	type labelled interface{ IsoLabel() string }
+	label := "TACKLEBOX"
+	if l, ok := tgt.(labelled); ok {
+		label = l.IsoLabel()
+	}
+
+	sfs := filepath.Join(storeMount, env.ID+".rootfs.sfs")
+	if err := track("install:"+env.ID, func() error {
+		return install.InstallLive(env.Image, sfs)
+	}); err != nil {
+		return fmt.Errorf("squashfs %s: %w", env.ID, err)
+	}
+
+	// Per-env kernel/initrd lives at /images/pxeboot/<env>/ inside the
+	// FAT ESP (mirrored to iso-root by IsoTarget.Finalize).
+	bootDir := filepath.Join(espMount, "images", "pxeboot", env.ID)
+	if err := runner.Run("sudo", "mkdir", "-p", bootDir); err != nil {
+		return fmt.Errorf("create boot dir %s: %w", bootDir, err)
+	}
+	var kver string
+	if err := track("extract:"+env.ID, func() error {
+		var err error
+		kver, err = install.ExtractBootFiles(env.Image, bootDir)
+		return err
+	}); err != nil {
+		return fmt.Errorf("extract boot files for %s: %w", env.ID, err)
+	}
+
+	options := buildLiveKernelCmdline(env.ID, label)
+	title := fmt.Sprintf("%s (live)", env.ID)
+	if err := install.WriteBLSEntry(espMount, env.ID, title, tgt.KernelPath(env.ID), tgt.InitrdPath(env.ID), options); err != nil {
+		return err
 	}
 	fmt.Printf(">>> Finished environment: %s (kernel=%s)\n", env.ID, kver)
 	return nil
@@ -644,6 +733,7 @@ func parseSize(s string) (uint64, bool) {
 }
 
 func init() {
+	buildCmd.Flags().String("iso", "", "Produce a UEFI-bootable .iso at this path instead of a disk image. Implies live-mode install for every env.")
 	buildCmd.Flags().Bool("xz", false, "Compress the final image with xz")
 	buildCmd.Flags().BoolP("verbose", "v", false, "Stream subprocess output and command traces")
 	buildCmd.Flags().BoolP("yes", "y", false, "Skip destructive confirmation when TARGET is a /dev/* device")

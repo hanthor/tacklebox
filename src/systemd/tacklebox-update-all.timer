@@ -1,0 +1,17 @@
+[Unit]
+Description=Tacklebox: update all envs on boot
+Documentation=https://github.com/tuna-os/tacklebox
+
+[Timer]
+# Fire 2 minutes after boot — long enough for networking to come up but
+# short enough that the update lands before the user finishes logging in.
+OnBootSec=2min
+# A single shot per boot. Persistent=false means we DON'T catch up on a
+# missed run from a previous boot; that's intentional — if the user
+# booted, didn't see updates, then rebooted shortly after, we don't want
+# to re-trigger immediately.
+Persistent=false
+Unit=tacklebox-update-all.service
+
+[Install]
+WantedBy=timers.target

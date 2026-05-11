@@ -1,0 +1,25 @@
+[Unit]
+Description=Tacklebox: update all bootable environments
+Documentation=https://github.com/tuna-os/tacklebox
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/tacklebox/recipe.json
+ConditionPathExists=/usr/local/bin/tacklebox
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tacklebox update-all --print-images
+# Updates can take a while when there's a new release of any env's image;
+# don't kill the job for being slow. systemd's default is 90 s which is
+# definitely too short for image pulls.
+TimeoutStartSec=infinity
+# Stream output to journal AND console so the user sees what's happening
+# at boot time. The user explicitly asked for image refs printed during
+# update.
+StandardOutput=journal+console
+StandardError=journal+console
+# Updates are best-effort; never block boot or fail the timer's next run.
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=timers.target

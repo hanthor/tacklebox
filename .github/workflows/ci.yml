@@ -24,6 +24,13 @@ jobs:
       - name: go test
         run: go test ./...
 
+      # Integration tests are gated by -tags=integration and rely on
+      # podman/sudo/etc. The non-fixture cases just exec the built
+      # binary with --help to confirm CLI surface is intact; the
+      # fixture-smoke case auto-skips when sudo/tools aren't available.
+      - name: go test (integration tag, help-only)
+        run: go test -tags=integration -run='Help' ./...
+
       - name: go build
         run: go build ./...
 

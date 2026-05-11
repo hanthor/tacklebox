@@ -102,6 +102,61 @@ func TestBuildKernelCmdline(t *testing.T) {
 	}
 }
 
+func TestBuildLiveKernelCmdline(t *testing.T) {
+	cases := []struct {
+		name     string
+		envID    string
+		label    string
+		contains []string
+		excludes []string
+	}{
+		{
+			name:  "basic",
+			envID: "bazzite",
+			label: "TBX_ISO",
+			contains: []string{
+				"root=live:CDLABEL=TBX_ISO",
+				"rd.live.image",
+				"rd.live.dir=LiveOS",
+				"rd.live.squashimg=bazzite.rootfs.sfs",
+				"rd.live.overlay.overlayfs=1",
+				"enforcing=0",
+				"tacklebox.env=bazzite",
+				"console=ttyS0,115200n8",
+			},
+			// Regression: rd.live.overlay=tmpfs hangs dracut-initqueue
+			// because dmsquash-live treats "tmpfs" as a label/path, not
+			// the literal string. We rely on rd.live.overlay.overlayfs=1
+			// alone defaulting to a tmpfs upper.
+			excludes: []string{"rd.live.overlay=tmpfs"},
+		},
+		{
+			name:  "label with spaces gets passed verbatim",
+			envID: "fedora",
+			label: "MY_LABEL",
+			contains: []string{
+				"root=live:CDLABEL=MY_LABEL",
+				"rd.live.squashimg=fedora.rootfs.sfs",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildLiveKernelCmdline(tc.envID, tc.label)
+			for _, s := range tc.contains {
+				if !strings.Contains(got, s) {
+					t.Errorf("missing %q in %q", s, got)
+				}
+			}
+			for _, s := range tc.excludes {
+				if strings.Contains(got, s) {
+					t.Errorf("unexpected %q in %q", s, got)
+				}
+			}
+		})
+	}
+}
+
 func TestParseSize(t *testing.T) {
 	cases := []struct {
 		in     string

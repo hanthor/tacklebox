@@ -209,7 +209,7 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	if parallelN > len(r.BootableEnvironments) {
 		parallelN = len(r.BootableEnvironments)
 	}
-	if err := runEnvs(r.BootableEnvironments, tgt, mp.StoreMount, mp.EspMount, parallelN, track); err != nil {
+	if err := runEnvs(r, tgt, mp.StoreMount, mp.EspMount, parallelN, track); err != nil {
 		return err
 	}
 
@@ -305,27 +305,27 @@ func confirmDestructive(target string, assumeYes bool) error {
 // because we haven't broadly battle-tested it across image families. Stick
 // with parallel=1 for production builds; use --parallel-install=N to try
 // the faster path when total wall time matters more than risk.
-func runEnvs(envs []recipe.BootableEnvironment, tgt target.Target, storeMount, espMount string, parallel int, track func(string, func() error) error) error {
+func runEnvs(r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, parallel int, track func(string, func() error) error) error {
 	if parallel <= 1 {
-		for _, env := range envs {
-			if err := installEnv(env, tgt, storeMount, espMount, track); err != nil {
+		for _, env := range r.BootableEnvironments {
+			if err := installEnv(env, r, tgt, storeMount, espMount, track); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 
-	fmt.Printf(">>> Running %d environments with parallelism=%d\n", len(envs), parallel)
+	fmt.Printf(">>> Running %d environments with parallelism=%d\n", len(r.BootableEnvironments), parallel)
 	sem := make(chan struct{}, parallel)
 	var wg sync.WaitGroup
-	errs := make([]error, len(envs))
-	for i, env := range envs {
+	errs := make([]error, len(r.BootableEnvironments))
+	for i, env := range r.BootableEnvironments {
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(i int, env recipe.BootableEnvironment) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			errs[i] = installEnv(env, tgt, storeMount, espMount, track)
+			errs[i] = installEnv(env, r, tgt, storeMount, espMount, track)
 		}(i, env)
 	}
 	wg.Wait()
@@ -333,7 +333,7 @@ func runEnvs(envs []recipe.BootableEnvironment, tgt target.Target, storeMount, e
 	var failed []string
 	for i, err := range errs {
 		if err != nil {
-			failed = append(failed, fmt.Sprintf("  - %s: %v", envs[i].ID, err))
+			failed = append(failed, fmt.Sprintf("  - %s: %v", r.BootableEnvironments[i].ID, err))
 		}
 	}
 	if len(failed) > 0 {
@@ -414,17 +414,17 @@ func buildKernelCmdline(envID string, mode recipe.BootMode, backend install.Back
 // installEnv runs the per-env install pipeline. Dispatches on the
 // target's InstallMode: bootc (block targets) or live (iso targets).
 // Safe to invoke concurrently for distinct envs.
-func installEnv(env recipe.BootableEnvironment, tgt target.Target, storeMount, espMount string, track func(string, func() error) error) error {
+func installEnv(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, track func(string, func() error) error) error {
 	switch tgt.InstallMode() {
 	case target.InstallModeBootc:
-		return installEnvBootc(env, tgt, storeMount, espMount, track)
+		return installEnvBootc(env, r, tgt, storeMount, espMount, track)
 	case target.InstallModeLive:
-		return installEnvLive(env, tgt, storeMount, espMount, track)
+		return installEnvLive(env, r, tgt, storeMount, espMount, track)
 	}
 	return fmt.Errorf("unsupported install mode %q", tgt.InstallMode())
 }
 
-func installEnvBootc(env recipe.BootableEnvironment, tgt target.Target, storeMount, espMount string, track func(string, func() error) error) error {
+func installEnvBootc(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, track func(string, func() error) error) error {
 	backend := install.Backend(env.Backend)
 	if backend == "" {
 		detected, err := install.DetectBackend(env.Image)
@@ -479,6 +479,15 @@ func installEnvBootc(env recipe.BootableEnvironment, tgt target.Target, storeMou
 			return err
 		}
 	}
+
+	// Provision the update-all timer and tools into the env's deployment.
+	// Only for BlockTarget (live ISOs are ephemeral/read-only anyway).
+	if err := track("provision:"+env.ID, func() error {
+		return provisionUpdateSystem(envRoot, env.ID, r)
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, ">>> WARNING: failed to provision update tools into %s: %v\n", env.ID, err)
+	}
+
 	fmt.Printf(">>> Finished environment: %s (kernel=%s)\n", env.ID, kver)
 	return nil
 }
@@ -487,7 +496,7 @@ func installEnvBootc(env recipe.BootableEnvironment, tgt target.Target, storeMou
 // writes a dmsquash-live BLS entry. ISO label comes from the IsoTarget;
 // we reach it via a small interface to avoid a hard target.IsoTarget
 // import.
-func installEnvLive(env recipe.BootableEnvironment, tgt target.Target, storeMount, espMount string, track func(string, func() error) error) error {
+func installEnvLive(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, track func(string, func() error) error) error {
 	type labelled interface{ IsoLabel() string }
 	label := "TACKLEBOX"
 	if l, ok := tgt.(labelled); ok {
@@ -740,4 +749,59 @@ func init() {
 	buildCmd.Flags().Int("parallel-install", 1, "How many bootc installs to run concurrently. Experimental; >1 shares /var/lib/containers across envs and is fastest when total wall time matters more than risk.")
 	buildCmd.Flags().Bool("unsafe", false, "Disable USB-corruption-resistance defaults (ext4 csums, rootflags=commit=1,errors=remount-ro). Default is safe-on.")
 	rootCmd.AddCommand(buildCmd)
+}
+
+// provisionUpdateSystem drops the tacklebox binary, systemd units, and
+// build-time recipe into the env's filesystem so it can stay current
+// autonomously.
+func provisionUpdateSystem(envRoot, envID string, r recipe.MediaRecipe) error {
+	destBin := filepath.Join(envRoot, "usr", "local", "bin", "tacklebox")
+	destUnitDir := filepath.Join(envRoot, "etc", "systemd", "system")
+	destRecipeDir := filepath.Join(envRoot, "etc", "tacklebox")
+
+	// 1. tacklebox binary
+	self, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve self-path: %w", err)
+	}
+	runner.Run("sudo", "mkdir", "-p", filepath.Dir(destBin))
+	if err := runner.Run("sudo", "cp", self, destBin); err != nil {
+		return fmt.Errorf("copy tacklebox binary to %s: %w", destBin, err)
+	}
+
+	// 2. recipe.json
+	runner.Run("sudo", "mkdir", "-p", destRecipeDir)
+	recipeData, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal recipe: %w", err)
+	}
+	if err := os.WriteFile("/tmp/tbox-recipe.json", recipeData, 0644); err != nil {
+		return err
+	}
+	if err := runner.Run("sudo", "cp", "/tmp/tbox-recipe.json", filepath.Join(destRecipeDir, "recipe.json")); err != nil {
+		return fmt.Errorf("copy recipe to %s: %w", destRecipeDir, err)
+	}
+
+	// 3. systemd units
+	// These are shipped in src/systemd/ inside the repo.
+	runner.Run("sudo", "mkdir", "-p", destUnitDir)
+	for _, f := range []string{"tacklebox-update-all.service", "tacklebox-update-all.timer"} {
+		src := filepath.Join("src", "systemd", f)
+		if _, err := os.Stat(src); err != nil {
+			// Fallback for when running from a non-repo binary (e.g. installed)
+			continue
+		}
+		if err := runner.Run("sudo", "cp", src, filepath.Join(destUnitDir, f)); err != nil {
+			return fmt.Errorf("copy %s: %w", f, err)
+		}
+	}
+
+	// 4. enable the timer
+	timerWants := filepath.Join(destUnitDir, "timers.target.wants")
+	runner.Run("sudo", "mkdir", "-p", timerWants)
+	runner.Run("sudo", "ln", "-sf",
+		"../tacklebox-update-all.timer",
+		filepath.Join(timerWants, "tacklebox-update-all.timer"))
+
+	return nil
 }

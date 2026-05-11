@@ -163,8 +163,8 @@ Three pieces:
    one-shot per boot, `Persistent=false` (don't catch up on missed runs).
 
 `tacklebox build` installs the binary + units + recipe + enable symlink
-into each env's deployment at install time. Updates are best-effort and
-never block boot; failures log but exit 0.
+into each env's deployment at install time (`provisionUpdateSystem`).
+Updates are best-effort and never block boot; failures log but exit 0.
 
 ## The CI pipeline
 
@@ -174,12 +174,11 @@ never block boot; failures log but exit 0.
   JSON-schema parse of every recipe, shellcheck the dracut module.
 - **`verify-smoke`** (~10-15 min) — builds a 10 GB two-env block image
   from `centos-bootc:stream10` + `fedora-bootc:42`, runs `tacklebox
-  verify` against it. Two distinct upstream images means a clean
-  regression baseline for the cross-env collision check.
-
-Boot-in-QEMU smoke (CI Stage 4) is a TODO — needs either a published
-fixture container with `dmsquash-live` in the initramfs, or a per-CI
-build of one (~5 min added to verify-smoke).
+  verify` and `tacklebox status` against it.
+- **Stage 4 Boot Smoke** — boots the `verify-smoke` image in QEMU (via
+  TCG) and asserts that the boot menu, kernel, and initramfs (with
+  `tbox-root` pivot) all work by grepping the serial console for success
+  patterns.
 
 ## Key invariants
 

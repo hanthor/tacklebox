@@ -30,7 +30,7 @@ import (
 func buildTacklebox(t *testing.T) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "tacklebox")
-	cmd := exec.Command("go", "build", "-o", bin, "./...")
+	cmd := exec.Command("go", "build", "-o", bin, "./cmd/tacklebox")
 	cmd.Dir = filepath.Join("..", "..") // module root
 	out, err := cmd.CombinedOutput()
 	if err != nil {

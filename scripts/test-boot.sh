@@ -24,8 +24,21 @@ else
 fi
 
 # Prepare OVMF
+OVMF_PATHS=(
+    "/usr/share/edk2/ovmf/OVMF_CODE.fd"
+    "/usr/share/OVMF/OVMF_CODE.fd"
+    "/usr/share/OVMF/OVMF_CODE_4M.fd"
+    "/usr/share/edk2/x64/OVMF_CODE.fd"
+)
+OVMF_VARS_PATHS=(
+    "/usr/share/edk2/ovmf/OVMF_VARS.fd"
+    "/usr/share/OVMF/OVMF_VARS.fd"
+    "/usr/share/OVMF/OVMF_VARS_4M.fd"
+    "/usr/share/edk2/x64/OVMF_VARS.fd"
+)
+
 OVMF_CODE=""
-for p in "/usr/share/edk2/ovmf/OVMF_CODE.fd" "/usr/share/OVMF/OVMF_CODE.fd" "/usr/share/edk2/x64/OVMF_CODE.fd"; do
+for p in "${OVMF_PATHS[@]}"; do
     if [ -f "$p" ]; then
         OVMF_CODE="$p"
         break
@@ -33,7 +46,7 @@ for p in "/usr/share/edk2/ovmf/OVMF_CODE.fd" "/usr/share/OVMF/OVMF_CODE.fd" "/us
 done
 
 OVMF_VARS_SRC=""
-for p in "/usr/share/edk2/ovmf/OVMF_VARS.fd" "/usr/share/OVMF/OVMF_VARS.fd" "/usr/share/edk2/x64/OVMF_VARS.fd"; do
+for p in "${OVMF_VARS_PATHS[@]}"; do
     if [ -f "$p" ]; then
         OVMF_VARS_SRC="$p"
         break
@@ -42,6 +55,10 @@ done
 
 if [ -z "$OVMF_CODE" ] || [ -z "$OVMF_VARS_SRC" ]; then
     echo "Error: OVMF_CODE.fd or OVMF_VARS.fd not found in standard paths"
+    echo "Checked OVMF_CODE paths: ${OVMF_PATHS[*]}"
+    echo "Checked OVMF_VARS paths: ${OVMF_VARS_PATHS[*]}"
+    echo "Contents of /usr/share/OVMF (if it exists):"
+    ls -la /usr/share/OVMF 2>/dev/null || echo "/usr/share/OVMF not found"
     exit 1
 fi
 

@@ -3,6 +3,7 @@ package install
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -11,7 +12,14 @@ import (
 
 func SetupBootloader(espMount string) error {
 	fmt.Printf(">>> Installing systemd-boot to %s\n", espMount)
-	if err := runner.Run("sudo", "bootctl", "install", "--esp-path", espMount, "--no-variables"); err != nil {
+	// Resolve bootctl from the user's PATH so `sudo /abs/bootctl ...` works
+	// even when bootctl lives outside sudo's secure_path (linuxbrew on dev
+	// boxes; some ubuntu installs that put it under /usr/lib/systemd/).
+	bootctl, err := exec.LookPath("bootctl")
+	if err != nil {
+		return fmt.Errorf("bootctl not found in PATH (install systemd-boot package): %w", err)
+	}
+	if err := runner.Run("sudo", bootctl, "install", "--esp-path", espMount, "--no-variables"); err != nil {
 		return fmt.Errorf("failed to install systemd-boot: %w", err)
 	}
 

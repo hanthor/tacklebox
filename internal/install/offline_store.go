@@ -53,7 +53,7 @@ func BuildOfflineStore(images []string, stagingRoot, dstSquashfs string) error {
 		script := fmt.Sprintf(
 			"podman --root %s --runroot %s pull %s",
 			shellEsc(storeRoot), shellEsc(storeRunRoot), shellEsc(img))
-		if err := runner.Run("podman", "unshare", "--", "sh", "-c", script); err != nil {
+		if err := RunUnshare(script); err != nil {
 			return fmt.Errorf("pull %s into offline store: %w", img, err)
 		}
 	}
@@ -86,7 +86,7 @@ func BuildOfflineStore(images []string, stagingRoot, dstSquashfs string) error {
 		mksquashfsPath, shellEsc(storeRoot), shellEsc(tmpPath), level, block)
 
 	fmt.Printf(">>> [offline-store] mksquashfs %s -> %s (zstd-%s, podman unshare)\n", storeRoot, dstSquashfs, level)
-	if err := runner.Run("podman", "unshare", "--", "sh", "-c", sqScript); err != nil {
+	if err := RunUnshare(sqScript); err != nil {
 		return fmt.Errorf("mksquashfs offline store: %w", err)
 	}
 

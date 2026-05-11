@@ -64,7 +64,7 @@ trap 'podman image unmount %s' EXIT
 		level, block)
 
 	fmt.Printf(">>> [live] squashing %s -> %s (podman unshare)\n", image, dstSquashfs)
-	if err := runner.Run("podman", "unshare", "--", "sh", "-c", script); err != nil {
+	if err := RunUnshare(script); err != nil {
 		return fmt.Errorf("squashfs %s: %w", image, err)
 	}
 
@@ -178,12 +178,16 @@ func fetchToStaging(image string) (stagedFiles, error) {
 		fmt.Printf(">>> Extracting boot files from %s\n", image)
 	}
 
-	// Rootless podman run — accesses the user's store directly.
-	out, err := runner.Output("podman", "run", "--rm",
+	// Use UserPodmanPrefix() so that when tacklebox runs under sudo,
+	// we drop back to the original user who has the images in their store.
+	upodman := UserPodmanPrefix()
+	runArgs := append(upodman[1:],
+		"run", "--rm",
 		"--security-opt", "label=disable",
 		"-v", tmpDir+":/dest",
 		"--entrypoint", "/bin/sh",
 		image, "-c", extractScript)
+	out, err := runner.Output(upodman[0], runArgs...)
 	if err != nil {
 		return stagedFiles{}, fmt.Errorf("extract boot files for %s: %w", image, err)
 	}

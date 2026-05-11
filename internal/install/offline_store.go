@@ -36,14 +36,18 @@ func BuildOfflineStore(images []string, stagingRoot, dstSquashfs string) error {
 	storeRoot := filepath.Join(stagingRoot, "tbox-offline-store")
 	storeRunRoot := filepath.Join(stagingRoot, "tbox-offline-run")
 
-	// User-writable scratch dirs; podman unshare owns the namespace inside them.
-	// Must be 0777 so the SUDO_USER running inside podman unshare can write.
+	// Must be world-writable: tacklebox runs as root (sudo) so os.MkdirAll
+	// creates root-owned dirs, but the SUDO_USER running inside podman unshare
+	// needs write access. os.Chmod bypasses the process umask.
 	for _, d := range []string{storeRoot, storeRunRoot} {
 		if err := os.RemoveAll(d); err != nil {
 			return fmt.Errorf("clear %s: %w", d, err)
 		}
 		if err := os.MkdirAll(d, 0777); err != nil {
 			return fmt.Errorf("mkdir %s: %w", d, err)
+		}
+		if err := os.Chmod(d, 0777); err != nil {
+			return fmt.Errorf("chmod %s: %w", d, err)
 		}
 	}
 

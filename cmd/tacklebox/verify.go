@@ -123,12 +123,18 @@ func verifyIso(path string) []checkResult {
 	// /LiveOS/<env>.rootfs.sfs (full hash would mean reading 5+ GB through
 	// xorriso for a multi-env ISO; the first MiB diverges the moment
 	// content does, which is what we care about for collision detection).
+	// Also note if store.squashfs.img is present (offline payloads built).
 	sfsList, err := listIsoDir(path, "/LiveOS")
 	if err != nil {
 		return append(results, checkResult{"list /LiveOS in ISO", err})
 	}
+	var hasOfflineStore bool
 	hashes := map[string][]string{}
 	for _, name := range sfsList {
+		if name == "store.squashfs.img" {
+			hasOfflineStore = true
+			continue
+		}
 		if !strings.HasSuffix(name, ".rootfs.sfs") {
 			continue
 		}
@@ -153,6 +159,9 @@ func verifyIso(path string) []checkResult {
 		results = append(results, checkResult{
 			fmt.Sprintf("per-env squashfs distinct (%d unique)", len(hashes)), nil,
 		})
+	}
+	if hasOfflineStore {
+		results = append(results, checkResult{"offline store present (LiveOS/store.squashfs.img)", nil})
 	}
 
 	return results
@@ -262,6 +271,14 @@ func verifyBlock(path string) []checkResult {
 			results = append(results, checkResult{
 				fmt.Sprintf("per-env ostree commit distinct (%d unique across %d envs)", len(envHashes), len(envs)), nil,
 			})
+		}
+	}
+
+	// Offline store squashfs present?
+	if _, err := readDirSudo(storeMnt); err == nil {
+		offlinePath := filepath.Join(storeMnt, "tbox-containers.squashfs")
+		if _, err := os.Stat(offlinePath); err == nil {
+			results = append(results, checkResult{"offline store present (tbox-containers.squashfs)", nil})
 		}
 	}
 

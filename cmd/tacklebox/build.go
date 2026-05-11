@@ -194,11 +194,12 @@ func runBuild(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Pre-pull all images in parallel. The actual `bootc install` step still
-	// runs sequentially per environment (it shares /var/lib/containers locking
-	// and would race), but pulling in parallel overlaps the network-bound
-	// portion of the build, which is the dominant cost on a fresh host.
-	if err := track("pre-pull (parallel)", func() error { return prePullImages(r.BootableEnvironments) }); err != nil {
+	// Pre-pull all images in parallel — both env images and offline payloads.
+	// The actual install steps still run sequentially (locking / ordering
+	// constraints) but overlapping network I/O here cuts wall time significantly.
+	if err := track("pre-pull (parallel)", func() error {
+		return prePullAll(r)
+	}); err != nil {
 		return err
 	}
 
@@ -211,6 +212,41 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	}
 	if err := runEnvs(r, tgt, mp.StoreMount, mp.EspMount, parallelN, track); err != nil {
 		return err
+	}
+
+	// Build the offline image store if the recipe lists offline_payloads.
+	// For IsoTarget the squashfs lands at LiveOS/store.squashfs.img where the
+	// live container's superiso-store.mount unit expects it.
+	// For BlockTarget it lands at the root of TBOX_STORE as
+	// tbox-containers.squashfs and each deployed env gets a mount unit +
+	// storage.conf drop-in provisioned so the store is visible at boot.
+	if len(r.OfflinePayloads) > 0 {
+		switch tgt.InstallMode() {
+		case target.InstallModeLive:
+			dst := filepath.Join(mp.StoreMount, "store.squashfs.img")
+			if err := track("offline-store", func() error {
+				return install.BuildOfflineStore(r.OfflinePayloads, outputBase, dst)
+			}); err != nil {
+				return err
+			}
+		case target.InstallModeBootc:
+			dst := filepath.Join(mp.StoreMount, "tbox-containers.squashfs")
+			if err := track("offline-store", func() error {
+				return install.BuildOfflineStore(r.OfflinePayloads, outputBase, dst)
+			}); err != nil {
+				return err
+			}
+			// Provision the mount unit + storage.conf drop-in into each env.
+			for _, env := range r.BootableEnvironments {
+				envRoot := filepath.Join(mp.StoreMount, "tbox-install", env.ID)
+				if err := track("provision-store:"+env.ID, func() error {
+					return install.ProvisionStoreMountBlock(envRoot)
+				}); err != nil {
+					// Non-fatal: log and continue rather than aborting the whole build.
+					fmt.Fprintf(os.Stderr, ">>> WARNING: provision offline store for %s: %v\n", env.ID, err)
+				}
+			}
+		}
 	}
 
 	artifact, err := tgt.Finalize(track)
@@ -537,6 +573,52 @@ func installEnvLive(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt ta
 
 // prePullImages pulls all unique images concurrently. Errors are aggregated so
 // the user sees every failure in one go instead of fixing them one-by-one.
+// prePullAll pulls all env images + offline payloads concurrently, deduplicating
+// references that appear in both lists (e.g. a payload that is also a live env).
+func prePullAll(r recipe.MediaRecipe) error {
+	seen := make(map[string]struct{})
+	var unique []string
+	add := func(ref string) {
+		if _, dup := seen[ref]; !dup {
+			seen[ref] = struct{}{}
+			unique = append(unique, ref)
+		}
+	}
+	for _, e := range r.BootableEnvironments {
+		add(e.Image)
+	}
+	for _, p := range r.OfflinePayloads {
+		add(p)
+	}
+	if len(unique) == 0 {
+		return nil
+	}
+
+	fmt.Printf(">>> Pre-pulling %d image(s) in parallel (%d env, %d payload)\n",
+		len(unique), len(r.BootableEnvironments), len(r.OfflinePayloads))
+	var wg sync.WaitGroup
+	errs := make([]error, len(unique))
+	for i, img := range unique {
+		wg.Add(1)
+		go func(i int, img string) {
+			defer wg.Done()
+			errs[i] = install.Pull(img)
+		}(i, img)
+	}
+	wg.Wait()
+
+	var failed []string
+	for i, err := range errs {
+		if err != nil {
+			failed = append(failed, fmt.Sprintf("  - %s: %v", unique[i], err))
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("pre-pull failed for %d image(s):\n%s", len(failed), strings.Join(failed, "\n"))
+	}
+	return nil
+}
+
 func prePullImages(envs []recipe.BootableEnvironment) error {
 	seen := make(map[string]struct{}, len(envs))
 	var unique []string

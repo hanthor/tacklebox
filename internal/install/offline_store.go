@@ -36,66 +36,69 @@ func BuildOfflineStore(images []string, stagingRoot, dstSquashfs string) error {
 	storeRoot := filepath.Join(stagingRoot, "tbox-offline-store")
 	storeRunRoot := filepath.Join(stagingRoot, "tbox-offline-run")
 
-	// Clean and create scratch dirs.
+	// User-writable scratch dirs; podman unshare owns the namespace inside them.
 	for _, d := range []string{storeRoot, storeRunRoot} {
-		if err := runner.Run("sudo", "rm", "-rf", d); err != nil {
+		if err := os.RemoveAll(d); err != nil {
 			return fmt.Errorf("clear %s: %w", d, err)
 		}
-		if err := runner.Run("sudo", "mkdir", "-p", d); err != nil {
+		if err := os.MkdirAll(d, 0755); err != nil {
 			return fmt.Errorf("mkdir %s: %w", d, err)
 		}
 	}
 
-	// Pull each image into the isolated graphroot. Images that share layers
-	// (e.g. all bazzite variants share the ublue base) deduplicate
-	// automatically inside the overlay store — identical layer blobs are
-	// hard-linked, so pulling N images costs less than N × full-image size.
+	// Pull each image inside podman unshare: user-namespace overlay gives
+	// correct UID mappings and deduplication across shared base layers.
 	for _, img := range images {
-		fmt.Printf(">>> [offline-store] pulling %s\n", img)
-		if err := runner.Run("sudo", "podman",
-			"--root", storeRoot,
-			"--runroot", storeRunRoot,
-			"pull", img); err != nil {
+		fmt.Printf(">>> [offline-store] pulling %s (podman unshare)\n", img)
+		script := fmt.Sprintf(
+			"podman --root %s --runroot %s pull %s",
+			shellEsc(storeRoot), shellEsc(storeRunRoot), shellEsc(img))
+		if err := runner.Run("podman", "unshare", "--", "sh", "-c", script); err != nil {
 			return fmt.Errorf("pull %s into offline store: %w", img, err)
 		}
 	}
 
-	// Disk usage summary before compression.
-	if out, err := runner.Output("sudo", "du", "-sh", storeRoot); err == nil {
+	if out, err := runner.Output("du", "-sh", storeRoot); err == nil {
 		fmt.Printf(">>> [offline-store] raw store size: %s", out)
 	}
 
-	if err := runner.Run("sudo", "mkdir", "-p", filepath.Dir(dstSquashfs)); err != nil {
-		return err
-	}
-
-	// mksquashfs may be outside sudo's secure_path (e.g. linuxbrew).
 	mksquashfsPath, err := exec.LookPath("mksquashfs")
 	if err != nil {
 		return fmt.Errorf("mksquashfs not found in PATH: %w", err)
 	}
 
-	// Compression preset matches live/scripts/build-store-sqfs.sh "fast" preset:
-	// zstd level 3, 128 KiB blocks, 4 processors.  Switch SUPERISO_COMPRESSION=release
-	// for zstd-15/1MiB for distribution builds.
 	level, block := "3", "131072"
 	if os.Getenv("SUPERISO_COMPRESSION") == "release" {
 		level, block = "15", "1048576"
 	}
 
-	fmt.Printf(">>> [offline-store] mksquashfs %s -> %s (zstd-%s)\n", storeRoot, dstSquashfs, level)
-	if err := runner.Run("sudo", mksquashfsPath,
-		storeRoot, dstSquashfs,
-		"-noappend",
-		"-comp", "zstd", "-Xcompression-level", level,
-		"-b", block,
-		"-processors", "4",
-	); err != nil {
+	// User-writable temp file; sudo-move to final dest after squashfs completes.
+	tmpF, err := os.CreateTemp("", "tbox-store-*.squashfs")
+	if err != nil {
+		return fmt.Errorf("create temp squashfs: %w", err)
+	}
+	tmpF.Close()
+	tmpPath := tmpF.Name()
+	defer os.Remove(tmpPath)
+
+	// mksquashfs inside podman unshare for correct UID mappings.
+	sqScript := fmt.Sprintf("%s %s %s -noappend -comp zstd -Xcompression-level %s -b %s -processors 4",
+		mksquashfsPath, shellEsc(storeRoot), shellEsc(tmpPath), level, block)
+
+	fmt.Printf(">>> [offline-store] mksquashfs %s -> %s (zstd-%s, podman unshare)\n", storeRoot, dstSquashfs, level)
+	if err := runner.Run("podman", "unshare", "--", "sh", "-c", sqScript); err != nil {
 		return fmt.Errorf("mksquashfs offline store: %w", err)
 	}
 
-	if out, err := runner.Output("sudo", "du", "-sh", dstSquashfs); err == nil {
+	if out, err := runner.Output("du", "-sh", tmpPath); err == nil {
 		fmt.Printf(">>> [offline-store] squashfs size: %s", out)
+	}
+
+	if err := runner.Run("sudo", "mkdir", "-p", filepath.Dir(dstSquashfs)); err != nil {
+		return err
+	}
+	if err := runner.Run("sudo", "mv", tmpPath, dstSquashfs); err != nil {
+		return fmt.Errorf("move store squashfs to %s: %w", dstSquashfs, err)
 	}
 	return nil
 }

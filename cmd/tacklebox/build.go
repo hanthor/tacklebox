@@ -574,11 +574,17 @@ func installEnvLive(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt ta
 // prePullImages pulls all unique images concurrently. Errors are aggregated so
 // the user sees every failure in one go instead of fixing them one-by-one.
 // prePullAll pulls all env images + offline payloads concurrently, deduplicating
-// references that appear in both lists (e.g. a payload that is also a live env).
+// references that appear in both lists.
+// localhost/ images are skipped — they live in the user's podman store and
+// cannot be pulled from a registry. InstallLive / fetchToStaging access them
+// via rootless podman (user store) without needing a pre-pull.
 func prePullAll(r recipe.MediaRecipe) error {
 	seen := make(map[string]struct{})
 	var unique []string
 	add := func(ref string) {
+		if strings.HasPrefix(ref, "localhost/") {
+			return // built locally; rootless podman accesses them directly
+		}
 		if _, dup := seen[ref]; !dup {
 			seen[ref] = struct{}{}
 			unique = append(unique, ref)

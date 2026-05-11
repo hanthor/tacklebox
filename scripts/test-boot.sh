@@ -59,6 +59,7 @@ if [ -e /dev/kvm ] && [ -w /dev/kvm ]; then
     ACCEL="kvm"
 fi
 
+# shellcheck disable=SC2054
 QEMU_CMD=(
     qemu-system-x86_64
     -m 4G
@@ -103,6 +104,10 @@ PATTERNS=(
     "login:"
 )
 
+# Join patterns for grep
+PATTERN_REGEX=$(printf "|%s" "${PATTERNS[@]}")
+PATTERN_REGEX=${PATTERN_REGEX:1}
+
 echo ">>> Monitoring $LOG for success patterns..."
 while true; do
     CURRENT_TIME=$(date +%s)
@@ -123,8 +128,8 @@ while true; do
     fi
 
     # Check for success (we want to see at least 'Welcome to' or 'login:')
-    if grep -qE "Welcome to|login:" "$LOG"; then
-        echo ">>> SUCCESS: Reached login/welcome after ${ELAPSED}s"
+    if grep -qE "$PATTERN_REGEX" "$LOG"; then
+        echo ">>> SUCCESS: Reached expected pattern after ${ELAPSED}s"
         SUCCESS=1
         break
     fi

@@ -101,7 +101,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             xorriso mtools squashfs-tools dosfstools \
-            systemd-boot systemd-boot-efi gdisk podman
+            systemd-boot systemd-boot-efi gdisk podman \
+            qemu-system-x86 ovmf
 
       - name: build tacklebox
         run: go build -o tacklebox ./cmd/tacklebox
@@ -119,9 +120,22 @@ jobs:
       - name: tacklebox verify
         run: sudo ./tacklebox verify /mnt/tbx/tacklebox.img
 
+      # Stage 4: Boot smoke. We use TCG (no KVM on free runners) so it's
+      # slow (~3 min to login).
+      - name: tacklebox boot smoke (Stage 4)
+        run: |
+          chmod +x scripts/test-boot.sh
+          sudo ./scripts/test-boot.sh /mnt/tbx/tacklebox.img 600
+
       - name: artifact summary
         if: always()
         run: |
           echo '## tacklebox build artefacts' >> "$GITHUB_STEP_SUMMARY"
           ls -lh /mnt/tbx/ 2>/dev/null | awk 'NR>1 {print "- `" $NF "` (" $5 ")"}' >> "$GITHUB_STEP_SUMMARY"
           df -h / /mnt 2>/dev/null >> "$GITHUB_STEP_SUMMARY"
+          if [ -f qemu-boot.log ]; then
+            echo '### QEMU Boot Log (tail)' >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            tail -n 50 qemu-boot.log >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi

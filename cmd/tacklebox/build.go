@@ -17,6 +17,7 @@ import (
 	"github.com/tuna-os/tacklebox/internal/install"
 	"github.com/tuna-os/tacklebox/internal/recipe"
 	"github.com/tuna-os/tacklebox/internal/runner"
+	"github.com/tuna-os/tacklebox/internal/target"
 )
 
 var buildCmd = &cobra.Command{
@@ -112,21 +113,41 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	defer signal.Stop(sigCh)
 	defer close(sigCh)
 
-	var targetDevice string
-	var isBlockDevice bool
-
+	var deviceArg string
+	isBlockDevice := false
 	if len(args) == 2 {
-		targetDevice = args[1]
+		deviceArg = args[1]
 		isBlockDevice = true
-		fmt.Printf(">>> Target is a block device: %s\n", targetDevice)
+		fmt.Printf(">>> Target is a block device: %s\n", deviceArg)
 		assumeYes, _ := cmd.Flags().GetBool("yes")
-		if err := confirmDestructive(targetDevice, assumeYes); err != nil {
+		if err := confirmDestructive(deviceArg, assumeYes); err != nil {
 			return err
 		}
 	}
 
 	fmt.Printf(">>> Building media: %s (%s)\n", r.MediaName, r.Size)
 	fmt.Printf(">>> Output directory: %s\n", outputBase)
+
+	// Pre-flight: free-space and store-sizing warnings. Done here (not in
+	// the target) because they're recipe-shaped, not target-shaped, and
+	// most useful before we've burned any I/O.
+	if !isBlockDevice {
+		needed, ok := parseSize(r.Size)
+		if !ok {
+			return fmt.Errorf("unrecognised size %q in recipe (expected e.g. 32G, 16384M)", r.Size)
+		}
+		if free, err := target.FreeBytes(outputBase); err == nil && free < needed/2 {
+			fmt.Fprintf(os.Stderr,
+				">>> WARNING: only %d MiB free under %s; recipe asks for %s (sparse, but installs will write real data)\n",
+				free/(1024*1024), outputBase, r.Size)
+		}
+	}
+	if needed, store, ok := estimateStoreUsage(r); ok && needed > store {
+		fmt.Fprintf(os.Stderr,
+			">>> WARNING: %d environments may need ~%d GiB of store, but recipe layout only allocates ~%d GiB.\n"+
+				">>>          Consider increasing recipe size (current: %s).\n",
+			len(r.BootableEnvironments), needed>>30, store>>30, r.Size)
+	}
 
 	timings := map[string]time.Duration{}
 	var timingsMu sync.Mutex
@@ -140,103 +161,22 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	}
 	buildStart := time.Now()
 
-	var imagePath string
-	var loopDev string
-
-	if !isBlockDevice {
-		imagePath = filepath.Join(outputBase, "tacklebox.img")
-
-		// Pre-flight: make sure we won't blow up halfway through `truncate`
-		// because the filesystem can't hold the image. truncate creates a
-		// sparse file so this only catches gross misconfigurations, but
-		// without it the failure surfaces much later as cryptic mkfs errors.
-		if needed, ok := parseSize(r.Size); ok {
-			if free, err := freeBytes(outputBase); err == nil && free < needed/2 {
-				fmt.Fprintf(os.Stderr,
-					">>> WARNING: only %d MiB free under %s; recipe asks for %s (sparse, but installs will write real data)\n",
-					free/(1024*1024), outputBase, r.Size)
-			}
-		} else {
-			return fmt.Errorf("unrecognised size %q in recipe (expected e.g. 32G, 16384M)", r.Size)
-		}
-
-		fmt.Printf(">>> Creating raw image: %s\n", imagePath)
-		if err := runner.Run("truncate", "-s", r.Size, imagePath); err != nil {
-			return fmt.Errorf("create sparse file %s: %w", imagePath, err)
-		}
-
-		loopDevBytes, err := runner.Output("sudo", "losetup", "--find", "--show", "--partscan", imagePath)
-		if err != nil {
-			return fmt.Errorf("setup loop device for %s: %w", imagePath, err)
-		}
-		loopDev = strings.TrimSpace(string(loopDevBytes))
-		targetDevice = loopDev
-		addCleanup(func() {
-			fmt.Printf(">>> Detaching loop device: %s\n", loopDev)
-			runner.Run("sudo", "losetup", "-d", loopDev)
-		})
-	}
-
-	// Rough sanity check on store sizing. ostree stateroots are large the
-	// first time they're populated (~10 GiB observed for bluefin/bazzite);
-	// composefs deployments are more compact (~3-5 GiB). These estimates
-	// are deliberately conservative — better to warn unnecessarily than to
-	// let a build burn 4 minutes only to OOM on env #N.
-	if needed, store, ok := estimateStoreUsage(r); ok && needed > store {
-		fmt.Fprintf(os.Stderr,
-			">>> WARNING: %d environments may need ~%d GiB of store, but recipe layout only allocates ~%d GiB.\n"+
-				">>>          Consider increasing recipe size (current: %s).\n",
-			len(r.BootableEnvironments), needed>>30, store>>30, r.Size)
-	}
-
-	// Partition + format. Layout is derived from the recipe's total size so
-	// a 30G recipe doesn't share a 20G store with a 5G recipe — that was a
-	// previous foot-gun where bootc installs would silently OOM the store
-	// partition on the second environment.
+	// Partition layout is derived from the recipe so a 30G recipe doesn't
+	// share a 20G store with a 5G recipe.
 	//
 	//   p1 TBOX_ESP    : 1 GiB           (bootloader + per-env kernel/initrd)
 	//   p2 TBOX_STORE  : total - 1 - 2   (shared bootc installs)
 	//   p3 TBOX_PERSIST: remainder       (~2 GiB+ for persistent overlays)
-	//
-	// sgdisk's `+SIZE` syntax means "this length starting at default" so we
-	// can express STORE as an explicit length rather than an end-position.
 	partitions, err := computePartitions(r)
 	if err != nil {
 		return err
 	}
-	if err := track("partition", func() error { return blockdev.FormatDisk(targetDevice, partitions) }); err != nil {
-		return err
-	}
-	if err := track("mkfs", func() error { return blockdev.CreateFilesystems(targetDevice, partitions) }); err != nil {
-		return err
-	}
 
-	espMount := filepath.Join(outputBase, "mount-esp")
-	storeMount := filepath.Join(outputBase, "mount-store")
-	os.MkdirAll(espMount, 0755)
-	os.MkdirAll(storeMount, 0755)
+	tgt := target.NewBlockTarget(outputBase, deviceArg, r.Size, partitions)
+	addCleanup(tgt.Cleanup)
 
-	espDev := blockdev.PartitionPath(targetDevice, 1)
-	storeDev := blockdev.PartitionPath(targetDevice, 2)
-
-	// Wait for the kernel to expose the partition nodes. Without this, mount
-	// can race the partition rescan after mkfs on busy hosts (--timeout
-	// caps the wait at 10 s so we fail fast on real misconfigurations).
-	runner.Run("udevadm", "settle", "--timeout=10")
-
-	fmt.Printf(">>> Mounting ESP to %s\n", espMount)
-	if err := runner.Run("sudo", "mount", espDev, espMount); err != nil {
-		return fmt.Errorf("mount ESP %s: %w", espDev, err)
-	}
-	addCleanup(func() { runner.Run("sudo", "umount", espMount) })
-
-	fmt.Printf(">>> Mounting STORE to %s\n", storeMount)
-	if err := runner.Run("sudo", "mount", storeDev, storeMount); err != nil {
-		return fmt.Errorf("mount STORE %s: %w", storeDev, err)
-	}
-	addCleanup(func() { runner.Run("sudo", "umount", storeMount) })
-
-	if err := track("bootloader", func() error { return install.SetupBootloader(espMount) }); err != nil {
+	mp, err := tgt.Prepare(track)
+	if err != nil {
 		return err
 	}
 
@@ -255,22 +195,27 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	if parallelN > len(r.BootableEnvironments) {
 		parallelN = len(r.BootableEnvironments)
 	}
-	if err := runEnvs(r.BootableEnvironments, storeMount, espMount, parallelN, track); err != nil {
+	if err := runEnvs(r.BootableEnvironments, mp.StoreMount, mp.EspMount, parallelN, track); err != nil {
+		return err
+	}
+
+	artifact, err := tgt.Finalize(track)
+	if err != nil {
 		return err
 	}
 
 	if !isBlockDevice {
-		fmt.Printf(">>> Tacklebox build complete: %s\n", imagePath)
+		fmt.Printf(">>> Tacklebox build complete: %s\n", artifact)
 		xz, _ := cmd.Flags().GetBool("xz")
 		if xz {
-			fmt.Printf(">>> Compressing image to %s.xz...\n", imagePath)
-			if err := runner.Run("xz", "-T0", "-k", imagePath); err != nil {
-				return fmt.Errorf("compress image %s: %w", imagePath, err)
+			fmt.Printf(">>> Compressing image to %s.xz...\n", artifact)
+			if err := runner.Run("xz", "-T0", "-k", artifact); err != nil {
+				return fmt.Errorf("compress image %s: %w", artifact, err)
 			}
-			fmt.Printf(">>> Compression complete: %s.xz\n", imagePath)
+			fmt.Printf(">>> Compression complete: %s.xz\n", artifact)
 		}
 	} else {
-		fmt.Printf(">>> Tacklebox provisioning complete: %s\n", targetDevice)
+		fmt.Printf(">>> Tacklebox provisioning complete: %s\n", artifact)
 	}
 
 	printTimings(timings, time.Since(buildStart))
@@ -696,14 +641,6 @@ func parseSize(s string) (uint64, bool) {
 		return 0, false
 	}
 	return n * unit, true
-}
-
-func freeBytes(path string) (uint64, error) {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(path, &stat); err != nil {
-		return 0, err
-	}
-	return stat.Bavail * uint64(stat.Bsize), nil
 }
 
 func init() {

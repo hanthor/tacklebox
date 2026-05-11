@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -14,8 +13,9 @@ var rootCmd = &cobra.Command{
 }
 
 func main() {
+	// Cobra prints the "Error: ..." line itself; we only need to set the
+	// non-zero exit status here.
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }

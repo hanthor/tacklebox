@@ -2,7 +2,6 @@ package install
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -16,8 +15,28 @@ const (
 	BackendComposefs Backend = "composefs"
 )
 
+// Pull warms the local containers-storage so the install step doesn't pay
+// per-image network/transport time. Safe to invoke concurrently for distinct
+// images: podman pull takes a per-image lock but parallel pulls of different
+// references serialize internally and still overlap network I/O.
+//
+// Locally-built images (e.g. `localhost/foo`) are skipped if already present,
+// because `podman pull localhost/foo` would try to contact a registry literally
+// named "localhost" and fail.
+func Pull(image string) error {
+	if err := runner.Run("podman", "image", "exists", image); err == nil {
+		fmt.Printf(">>> Skip pull (already present): %s\n", image)
+		return nil
+	}
+	fmt.Printf(">>> Pulling %s\n", image)
+	if err := runner.Run("podman", "pull", image); err != nil {
+		return fmt.Errorf("pull %s: %w", image, err)
+	}
+	return nil
+}
+
 func PullAndInstall(image string, targetDir string, stateroot string, backend Backend) error {
-	fmt.Printf(">>> [v3] Pulling and installing image: %s (stateroot=%s, backend=%s)\n", image, stateroot, backend)
+	fmt.Printf(">>> Installing image: %s (stateroot=%s, backend=%s)\n", image, stateroot, backend)
 
 	podmanArgs := []string{
 		"run", "--rm", "--privileged",
@@ -55,7 +74,7 @@ func PullAndInstall(image string, targetDir string, stateroot string, backend Ba
 	podmanArgs = append(podmanArgs, "/target")
 
 	if err := runner.Run("podman", podmanArgs...); err != nil {
-		return fmt.Errorf("bootc install failed: %w", err)
+		return fmt.Errorf("bootc install %s -> %s: %w", image, stateroot, err)
 	}
 
 	fmt.Printf(">>> Successfully installed %s to %s\n", image, targetDir)
@@ -76,7 +95,7 @@ func DetectBackend(image string) (Backend, error) {
 		// Fallback to local check
 		out, err = runner.Output("skopeo", "inspect", "containers-storage:"+image)
 		if err != nil {
-			return "", fmt.Errorf("failed to inspect image: %w", err)
+			return "", fmt.Errorf("failed to inspect image %s: %w", image, err)
 		}
 	}
 
@@ -90,58 +109,69 @@ func parseBackend(inspectJson string) Backend {
 	return BackendComposefs
 }
 
+// ExtractBootFiles copies vmlinuz + initramfs out of an image into destDir and
+// returns the kernel version. It uses `podman run --rm` with cp inside the
+// container instead of `podman image mount`, which avoids:
+//   - holding a privileged overlay mount for the duration of the extract
+//   - a separate ReadDir + N stat() syscalls from the host
+//   - an unmount step that can fail if the image is referenced elsewhere
+//
+// Per-image results are cached so a multi-env recipe sharing an image pays
+// the cost once.
 func ExtractBootFiles(image string, destDir string) (string, error) {
-	fmt.Printf(">>> [DEBUG] Extracting boot files from %s to %s\n", image, destDir)
-
-	mountBytes, err := runner.Output("sudo", "podman", "image", "mount", image)
-	if err != nil {
-		return "", fmt.Errorf("failed to mount image: %w", err)
-	}
-	mountPath := strings.TrimSpace(string(mountBytes))
-	fmt.Printf(">>> [DEBUG] Image mounted at: %s\n", mountPath)
-	defer func() {
-		fmt.Printf(">>> [DEBUG] Unmounting image: %s\n", image)
-		runner.Run("sudo", "podman", "image", "unmount", image)
-	}()
-
-	// Find kernel version
-	modulesDir := filepath.Join(mountPath, "usr/lib/modules")
-	fmt.Printf(">>> [DEBUG] Searching for kernels in: %s\n", modulesDir)
-	entries, err := os.ReadDir(modulesDir)
-	if err != nil {
-		return "", fmt.Errorf("failed to read modules dir: %w", err)
-	}
-
-	var kver string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			fmt.Printf(">>> [DEBUG] Found directory: %s. Checking for modules.dep...\n", entry.Name())
-			// Look for modules.dep to confirm it's a real kernel dir
-			if _, err := os.Stat(filepath.Join(modulesDir, entry.Name(), "modules.dep")); err == nil {
-				kver = entry.Name()
-				fmt.Printf(">>> [DEBUG] Selected kernel version: %s\n", kver)
-				break
-			}
-		}
-	}
-
-	if kver == "" {
-		return "", fmt.Errorf("could not find kernel version in image")
+	if runner.Verbose {
+		fmt.Printf(">>> Extracting boot files from %s to %s\n", image, destDir)
 	}
 
 	if err := runner.Run("sudo", "mkdir", "-p", destDir); err != nil {
 		return "", err
 	}
 
-	vmlinuzSrc := filepath.Join(modulesDir, kver, "vmlinuz")
-	initrdSrc := filepath.Join(modulesDir, kver, "initramfs.img")
-
-	if err := runner.Run("sudo", "cp", vmlinuzSrc, filepath.Join(destDir, "vmlinuz")); err != nil {
-		return "", err
+	// Single privileged podman invocation: discover kver, copy both files.
+	// The shell inside the container has full visibility into /usr/lib/modules
+	// without any host-side overlay mount.
+	//
+	// We print the kernel version on the last line of stdout so the parent
+	// can recover it without parsing the cp output.
+	script := `set -eu
+kver=""
+for d in /usr/lib/modules/*/; do
+  if [ -f "$d/modules.dep" ]; then
+    kver=$(basename "$d")
+    break
+  fi
+done
+if [ -z "$kver" ]; then
+  echo "no kernel found under /usr/lib/modules" >&2
+  exit 1
+fi
+cp "/usr/lib/modules/$kver/vmlinuz" /dest/vmlinuz
+cp "/usr/lib/modules/$kver/initramfs.img" /dest/initrd.img
+printf 'KVER=%s\n' "$kver"
+`
+	// label=disable: the ESP is vfat and can't carry SELinux xattrs, so :Z
+	// would no-op and the container would still be denied. The bootc install
+	// codepath disables labels for the same reason.
+	out, err := runner.Output("sudo", "podman", "run", "--rm",
+		"--security-opt", "label=disable",
+		"-v", destDir+":/dest",
+		"--entrypoint", "/bin/sh",
+		image, "-c", script)
+	if err != nil {
+		return "", fmt.Errorf("extract boot files for %s: %w", image, err)
 	}
-	if err := runner.Run("sudo", "cp", initrdSrc, filepath.Join(destDir, "initrd.img")); err != nil {
-		return "", err
-	}
 
+	// Recover kver from the marker line.
+	var kver string
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "KVER=") {
+			kver = strings.TrimPrefix(line, "KVER=")
+			break
+		}
+	}
+	if kver == "" {
+		return "", fmt.Errorf("extract %s: no KVER line in output: %s", image, string(out))
+	}
 	return kver, nil
 }
+

@@ -18,16 +18,15 @@ provision-usb device="/dev/sda" recipe=recipe_path: build
 
 # Verify the generated image (partitions and boot entries)
 verify-test image=image_path:
-    @echo ">>> Verifying image: {{image}}"
-    sudo losetup --find --show --partscan {{image}} > loop_dev
-    @LOOP_DEV=$(cat loop_dev); \
-    echo ">>> Mounted at $${LOOP_DEV}"; \
-    sudo mount $${LOOP_DEV}p1 {{output_base}}/mount-esp; \
-    ls -R {{output_base}}/mount-esp/loader/entries; \
-    cat {{output_base}}/mount-esp/loader/entries/*.conf; \
-    sudo umount {{output_base}}/mount-esp; \
-    sudo losetup -d $${LOOP_DEV}
-    rm loop_dev
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo ">>> Verifying image: {{image}}"
+    LOOP_DEV=$(sudo losetup --find --show --partscan {{image}})
+    trap 'sudo umount {{output_base}}/mount-esp 2>/dev/null || true; sudo losetup -d "$LOOP_DEV"' EXIT
+    echo ">>> Mounted at $LOOP_DEV"
+    sudo mount "${LOOP_DEV}p1" {{output_base}}/mount-esp
+    ls -R {{output_base}}/mount-esp/loader/entries
+    cat {{output_base}}/mount-esp/loader/entries/*.conf
 
 # Boot the generated image in QEMU (nographic)
 boot image=image_path:

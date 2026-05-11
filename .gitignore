@@ -1,0 +1,12 @@
+# Build artifacts
+/tacklebox
+/tbox-*
+/loop_dev
+
+# Build output
+/build/
+/dist/
+
+# Test artifacts
+/coverage.out
+*.test

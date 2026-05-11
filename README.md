@@ -92,6 +92,7 @@ larger ESP (more kernels), more persistent space, or want to leave headroom.
 | `-y, --yes` | Skip the destructive-target confirmation. Required in CI / non-tty contexts. |
 | `-v, --verbose` | Stream subprocess output and command traces. Default is quiet (stderr still captured on failure). |
 | `--parallel-install N` | **Experimental.** Run N bootc installs concurrently. Bounded by slowest env, not sum — but shares `/var/lib/containers`. Default 1 (sequential). |
+| `--unsafe` | Opt out of USB-corruption-resistance defaults. By default Tacklebox emits BLS entries with `rootflags=commit=1,errors=remount-ro` (and `subvol=...` merged for composefs), which shrinks the ext4 metadata commit interval from 5 s to 1 s and remounts read-only on FS errors. Negligible perf cost on flash; meaningful protection against half-written rootfs on unexpected USB removal. Use `--unsafe` only when you're building an image-file you don't intend to plug into anything. |
 
 ## 🏗 Requirements
 

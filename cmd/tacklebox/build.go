@@ -46,6 +46,12 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	verbose, _ := cmd.Flags().GetBool("verbose")
 	runner.Verbose = verbose
 
+	unsafe, _ := cmd.Flags().GetBool("unsafe")
+	blockdev.UsbSafe = !unsafe
+	if unsafe {
+		fmt.Fprintln(os.Stderr, ">>> WARNING: --unsafe set; skipping USB-corruption-resistance defaults")
+	}
+
 	recipePath := args[0]
 	data, err := os.ReadFile(recipePath)
 	if err != nil {
@@ -374,6 +380,43 @@ func runEnvs(envs []recipe.BootableEnvironment, storeMount, espMount string, par
 	return nil
 }
 
+// buildKernelCmdline assembles the BLS `options` line for one (env, mode,
+// backend) tuple. Pure — no I/O — so it can be unit-tested.
+//
+// rootflags handling:
+//   - composefs needs `subvol=containers/storage/overlay/default/diff`
+//   - usbSafe adds `commit=1,errors=remount-ro` for corruption resistance
+//   - both compose into a single comma-separated rootflags= clause
+func buildKernelCmdline(envID string, mode recipe.BootMode, backend install.Backend, usbSafe bool) string {
+	cmdline := fmt.Sprintf("root=LABEL=TBOX_STORE rw console=ttyS0 tacklebox.root=tbox-install/%s", envID)
+	if mode == recipe.ModeLive {
+		cmdline += " rd.live.overlay=tmpfs"
+	} else {
+		cmdline += " tacklebox.persist=LABEL=TBOX_PERSIST"
+	}
+
+	var rootflags []string
+	if backend == install.BackendOstree {
+		cmdline += fmt.Sprintf(" ostree=/ostree/boot.1/%s/current/0", envID)
+	} else {
+		rootflags = append(rootflags, "subvol=containers/storage/overlay/default/diff")
+	}
+
+	if usbSafe {
+		// commit=1: flush ext4 metadata + ordered data every 1 s
+		// (default 5 s). Shrinks the data-loss window on unexpected USB
+		// removal; the perf cost is negligible on flash.
+		// errors=remount-ro: halt the bleeding on first FS error instead
+		// of letting corruption snowball.
+		rootflags = append(rootflags, "commit=1", "errors=remount-ro")
+	}
+
+	if len(rootflags) > 0 {
+		cmdline += " rootflags=" + strings.Join(rootflags, ",")
+	}
+	return cmdline
+}
+
 // installEnv handles the per-environment pipeline. Safe to invoke concurrently
 // for distinct envs provided ExtractBootFiles uses the staging cache (which it
 // does — fetchToStaging serialises around extractCacheMu).
@@ -418,20 +461,7 @@ func installEnv(env recipe.BootableEnvironment, storeMount, espMount string, tra
 	for _, mode := range env.Modes {
 		title := fmt.Sprintf("%s (%s)", env.ID, mode)
 		id := fmt.Sprintf("%s-%s", env.ID, mode)
-
-		options := fmt.Sprintf("root=LABEL=TBOX_STORE rw console=ttyS0 tacklebox.root=tbox-install/%s", env.ID)
-		if mode == recipe.ModeLive {
-			options += " rd.live.overlay=tmpfs"
-		} else {
-			options += " tacklebox.persist=LABEL=TBOX_PERSIST"
-		}
-
-		if backend == install.BackendOstree {
-			options += fmt.Sprintf(" ostree=/ostree/boot.1/%s/current/0", env.ID)
-		} else {
-			options += " rootflags=subvol=containers/storage/overlay/default/diff"
-		}
-
+		options := buildKernelCmdline(env.ID, mode, backend, blockdev.UsbSafe)
 		if err := install.WriteBLSEntry(espMount, id, title, kernelRelPath, initrdRelPath, options); err != nil {
 			return err
 		}
@@ -660,5 +690,6 @@ func init() {
 	buildCmd.Flags().BoolP("verbose", "v", false, "Stream subprocess output and command traces")
 	buildCmd.Flags().BoolP("yes", "y", false, "Skip destructive confirmation when TARGET is a /dev/* device")
 	buildCmd.Flags().Int("parallel-install", 1, "How many bootc installs to run concurrently. Experimental; >1 shares /var/lib/containers across envs and is fastest when total wall time matters more than risk.")
+	buildCmd.Flags().Bool("unsafe", false, "Disable USB-corruption-resistance defaults (ext4 csums, rootflags=commit=1,errors=remount-ro). Default is safe-on.")
 	rootCmd.AddCommand(buildCmd)
 }

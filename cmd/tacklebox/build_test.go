@@ -4,8 +4,103 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tuna-os/tacklebox/internal/install"
 	"github.com/tuna-os/tacklebox/internal/recipe"
 )
+
+// Small adapters so the table-driven test can use plain strings.
+func modeOf(s string) recipe.BootMode { return recipe.BootMode(s) }
+func backendOf(s string) install.Backend {
+	switch s {
+	case "ostree":
+		return install.BackendOstree
+	case "composefs":
+		return install.BackendComposefs
+	}
+	return ""
+}
+
+func TestBuildKernelCmdline(t *testing.T) {
+	// install package types aren't worth importing here; use string constants.
+	const ostree = "ostree"
+	const composefs = "composefs"
+
+	cases := []struct {
+		name     string
+		env      string
+		mode     string
+		backend  string
+		usbSafe  bool
+		contains []string
+		excludes []string
+	}{
+		{
+			name:    "ostree live with usb-safe",
+			env:     "bluefin",
+			mode:    "live",
+			backend: ostree,
+			usbSafe: true,
+			contains: []string{
+				"root=LABEL=TBOX_STORE",
+				"tacklebox.root=tbox-install/bluefin",
+				"rd.live.overlay=tmpfs",
+				"ostree=/ostree/boot.1/bluefin/current/0",
+				"rootflags=commit=1,errors=remount-ro",
+			},
+			excludes: []string{"subvol=", "tacklebox.persist"},
+		},
+		{
+			name:    "composefs live with usb-safe merges rootflags",
+			env:     "dakota",
+			mode:    "live",
+			backend: composefs,
+			usbSafe: true,
+			contains: []string{
+				"rootflags=subvol=containers/storage/overlay/default/diff,commit=1,errors=remount-ro",
+			},
+			excludes: []string{"ostree="},
+		},
+		{
+			name:    "ostree persistent without usb-safe",
+			env:     "bluefin",
+			mode:    "persistent",
+			backend: ostree,
+			usbSafe: false,
+			contains: []string{
+				"tacklebox.persist=LABEL=TBOX_PERSIST",
+				"ostree=",
+			},
+			excludes: []string{"commit=", "errors=remount-ro", "rd.live.overlay"},
+		},
+		{
+			name:    "composefs persistent unsafe — no rootflags at all",
+			env:     "dakota",
+			mode:    "persistent",
+			backend: composefs,
+			usbSafe: false,
+			contains: []string{"rootflags=subvol=containers/storage/overlay/default/diff"},
+			excludes: []string{"commit=", "errors=remount-ro"},
+		},
+	}
+
+	// Indirect through interface{} to avoid pulling install + recipe types
+	// into the test signature; the production function casts back.
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildKernelCmdline(tc.env, modeOf(tc.mode), backendOf(tc.backend), tc.usbSafe)
+			for _, s := range tc.contains {
+				if !strings.Contains(got, s) {
+					t.Errorf("missing %q in %q", s, got)
+				}
+			}
+			for _, s := range tc.excludes {
+				if strings.Contains(got, s) {
+					t.Errorf("unexpected %q in %q", s, got)
+				}
+			}
+		})
+	}
+}
 
 func TestParseSize(t *testing.T) {
 	cases := []struct {

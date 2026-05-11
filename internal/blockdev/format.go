@@ -15,6 +15,11 @@ type Partition struct {
 	FS     string
 }
 
+// UsbSafe controls whether mkfs adds extra integrity features. Tacklebox's
+// audience builds USB media for the most part, so this defaults to true; the
+// build command flips it false on --unsafe.
+var UsbSafe = true
+
 // PartitionPath returns the kernel device path for partition n on device.
 // /dev/sda + 1 -> /dev/sda1
 // /dev/nvme0n1 + 1 -> /dev/nvme0n1p1
@@ -87,10 +92,16 @@ func CreateFilesystems(device string, partitions []Partition) error {
 		case "vfat":
 			err = runner.Run("mkfs.vfat", "-I", "-n", p.Label, partDev)
 		case "btrfs":
+			// btrfs already checksums data + metadata; nothing extra to add.
 			err = runner.Run("mkfs.btrfs", "-f", "-L", p.Label, partDev)
 		case "ext4":
-			// -O verity was historically set here but the persist partition
-			// is read-write, so verity is inapplicable and just costs setup.
+			// We deliberately don't pass `-O metadata_csum,journal_csum`
+			// here: metadata_csum has been the default since e2fsprogs 1.43
+			// (2016) and journal_csum isn't a mkfs-time feature at all
+			// (journal checksumming comes along for the ride with
+			// metadata_csum). The real USB-safety wins live in the kernel
+			// cmdline (rootflags=commit=1,errors=remount-ro), not in extra
+			// mkfs feature toggles.
 			err = runner.Run("mkfs.ext4", "-F", "-L", p.Label, partDev)
 		default:
 			return fmt.Errorf("unsupported filesystem: %s", p.FS)

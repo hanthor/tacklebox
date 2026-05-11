@@ -77,7 +77,7 @@ var buildCmd = &cobra.Command{
 		// 3. Partition disk
 		partitions := []blockdev.Partition{
 			{Number: 1, Label: "TBOX_ESP", Size: "1G", Type: "ef00", FS: "vfat"},
-			{Number: 2, Label: "TBOX_STORE", Size: "100G", Type: "8300", FS: r.SharedStore.Format},
+			{Number: 2, Label: "TBOX_STORE", Size: "20G", Type: "8300", FS: r.SharedStore.Format},
 			{Number: 3, Label: "TBOX_PERSIST", Size: "0", Type: "8300", FS: "ext4"},
 		}
 		if err := blockdev.FormatDisk(targetDevice, partitions); err != nil {
@@ -129,20 +129,29 @@ var buildCmd = &cobra.Command{
 
 			// Pull and install to shared store with unique stateroot
 			envRoot := filepath.Join(storeMount, "tbox-install", env.ID)
-			if err := os.MkdirAll(envRoot, 0755); err != nil {
-				return err
+			runner.Run("sudo", "rm", "-rf", envRoot)
+			if err := runner.Run("sudo", "mkdir", "-p", envRoot); err != nil {
+				return fmt.Errorf("failed to create env root: %w", err)
 			}
+			fmt.Printf(">>> [DEBUG] Starting installation for payload: %s\n", env.ID)
 			if err := install.PullAndInstall(env.Image, envRoot, env.ID, backend); err != nil {
+				fmt.Printf(">>> [ERROR] Installation failed for %s: %v\n", env.ID, err)
 				return err
 			}
+			fmt.Printf(">>> [DEBUG] Installation complete for %s. Extracting boot files...\n", env.ID)
 
 			// Extract boot files to ESP
 			bootDir := filepath.Join(espMount, "EFI", env.ID)
-			os.MkdirAll(bootDir, 0755)
+			fmt.Printf(">>> Creating boot directory: %s\n", bootDir)
+			if err := runner.Run("sudo", "mkdir", "-p", bootDir); err != nil {
+				return fmt.Errorf("failed to create boot dir: %w", err)
+			}
 			kver, err := install.ExtractBootFiles(env.Image, bootDir)
 			if err != nil {
+				fmt.Printf(">>> [ERROR] Boot file extraction failed for %s: %v\n", env.ID, err)
 				return err
 			}
+			fmt.Printf(">>> [DEBUG] Boot files extracted for %s (kernel=%s)\n", env.ID, kver)
 
 			// Generate BLS Entries
 			kernelRelPath := filepath.Join("/EFI", env.ID, "vmlinuz")

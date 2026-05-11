@@ -1,0 +1,17 @@
+{
+  "media_name": "Tbox-Simple",
+  "size": "10G",
+  "shared_store": {
+    "format": "ext4",
+    "compression": "zstd"
+  },
+  "bootable_environments": [
+    {
+      "id": "bazzite",
+      "image": "ghcr.io/ublue-os/bazzite:stable",
+      "desktop": "kde",
+      "modes": ["live"]
+    }
+  ],
+  "offline_payloads": []
+}

@@ -11,6 +11,12 @@
       "image": "localhost/superiso-live-bluefin:latest",
       "desktop": "gnome",
       "modes": ["live", "persistent"]
+    },
+    {
+      "id": "bazzite",
+      "image": "ghcr.io/ublue-os/bazzite:stable",
+      "desktop": "kde",
+      "modes": ["live"]
     }
   ],
   "offline_payloads": [

@@ -1,0 +1,17 @@
+{
+  "media_name": "Tacklebox-Composefs-Test",
+  "size": "10G",
+  "shared_store": {
+    "format": "ext4",
+    "compression": "zstd"
+  },
+  "bootable_environments": [
+    {
+      "id": "dakota",
+      "image": "ghcr.io/projectbluefin/dakota:latest",
+      "desktop": "gnome",
+      "modes": ["live"]
+    }
+  ],
+  "offline_payloads": []
+}

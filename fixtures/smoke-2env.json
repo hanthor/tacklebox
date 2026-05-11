@@ -1,0 +1,19 @@
+{
+  "media_name": "TBX_SMOKE_2ENV",
+  "size": "10G",
+  "shared_store": {
+    "format": "ext4"
+  },
+  "bootable_environments": [
+    {
+      "id": "centos",
+      "image": "quay.io/centos-bootc/centos-bootc:stream10",
+      "modes": ["live"]
+    },
+    {
+      "id": "fedora",
+      "image": "quay.io/fedora/fedora-bootc:42",
+      "modes": ["live"]
+    }
+  ]
+}

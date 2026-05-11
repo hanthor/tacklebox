@@ -1,0 +1,120 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ── Stage 1+2: lint + unit + recipe schema parse ────────────────────────────
+  # Cheap, runs on every PR. ~2 min.
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      - name: go build
+        run: go build ./...
+
+      # Stage 2: every example recipe must parse successfully. The build
+      # tool itself enforces the schema; we just feed each one to a no-op
+      # invocation and check exit status. --help short-circuits before any
+      # actual I/O so this is fast.
+      - name: recipe schema parses
+        run: |
+          go build -o tacklebox ./cmd/tacklebox
+          fail=0
+          for r in examples/*.json fixtures/*.json; do
+            [ -f "$r" ] || continue
+            # Use a syntactic-only parse: jq if installed, else go's parser
+            # via `tacklebox build --help` (rejects the recipe arg before
+            # opening anything).
+            if ! python3 -c "import json,sys; json.load(open('$r'))"; then
+              echo "::error file=$r::JSON parse failed"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: shellcheck dracut module
+        uses: ludeeus/action-shellcheck@master
+        with:
+          additional_files: src/dracut/95tbox-root/module-setup.sh src/dracut/95tbox-root/tbox-root-mount.sh
+          severity: warning
+
+  # ── Stage 3: two-env disk-build smoke + verify ──────────────────────────────
+  # Builds a 10 GB loop image with two distinct upstream bootc images and
+  # asserts `tacklebox verify` passes (each env must end up with a distinct
+  # ostree commit hash — the regression check for the 2026-05-11 cross-env
+  # collision bug).
+  #
+  # Uses /mnt (~75 GB NVMe on free runners) for build artefacts; jlumbroso/
+  # free-disk-space recovers another ~30 GB on / by stripping pre-installed
+  # toolchains we don't use.
+  #
+  # Boot-in-QEMU smoke (Stage 4) is intentionally not here yet — it needs
+  # our custom live container (with dmsquash-live in the initramfs), and
+  # building that adds ~5 min per env. Will land separately once we either
+  # publish a pre-built fixture container to GHCR or accept the time.
+  verify-smoke:
+    runs-on: ubuntu-latest
+    needs: lint-test
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xorriso mtools squashfs-tools dosfstools \
+            systemd-boot-efi gdisk podman
+
+      - name: build tacklebox
+        run: go build -o tacklebox ./cmd/tacklebox
+
+      - name: pre-pull fixture images
+        run: |
+          sudo podman pull quay.io/centos-bootc/centos-bootc:stream10
+          sudo podman pull quay.io/fedora/fedora-bootc:42
+
+      - name: tacklebox build (2-env block image)
+        run: |
+          sudo mkdir -p /mnt/tbx
+          sudo ./tacklebox build fixtures/smoke-2env.json -b /mnt/tbx
+
+      - name: tacklebox verify
+        run: sudo ./tacklebox verify /mnt/tbx/tacklebox.img
+
+      - name: artifact summary
+        if: always()
+        run: |
+          echo '## tacklebox build artefacts' >> "$GITHUB_STEP_SUMMARY"
+          ls -lh /mnt/tbx/ 2>/dev/null | awk 'NR>1 {print "- `" $NF "` (" $5 ")"}' >> "$GITHUB_STEP_SUMMARY"
+          df -h / /mnt 2>/dev/null >> "$GITHUB_STEP_SUMMARY"

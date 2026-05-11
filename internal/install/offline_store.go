@@ -80,6 +80,9 @@ func BuildOfflineStore(images []string, stagingRoot, dstSquashfs string) error {
 	tmpF.Close()
 	tmpPath := tmpF.Name()
 	defer os.Remove(tmpPath)
+	if err := os.Chmod(tmpPath, 0666); err != nil {
+		return fmt.Errorf("chmod temp squashfs: %w", err)
+	}
 
 	// mksquashfs inside podman unshare for correct UID mappings.
 	sqScript := fmt.Sprintf("%s %s %s -noappend -comp zstd -Xcompression-level %s -b %s -processors 4",

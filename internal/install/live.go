@@ -48,6 +48,12 @@ func InstallLive(image, dstSquashfs string) error {
 	tmpF.Close()
 	tmpPath := tmpF.Name()
 	defer os.Remove(tmpPath)
+	// The temp file is owned by root (tacklebox runs under sudo), but
+	// mksquashfs runs as the original user inside podman unshare.
+	// Make it world-writable so the unshare user can write the squashfs.
+	if err := os.Chmod(tmpPath, 0666); err != nil {
+		return fmt.Errorf("chmod temp squashfs: %w", err)
+	}
 
 	// Single podman unshare session: mount → squashfs → unmount.
 	// shellEscape is applied to every variable interpolated into the script.
@@ -173,6 +179,10 @@ func fetchToStaging(image string) (stagedFiles, error) {
 		return stagedFiles{}, fmt.Errorf("mktemp: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
+	// World-writable so the user running inside podman unshare can write here.
+	if err := os.Chmod(tmpDir, 0777); err != nil {
+		return stagedFiles{}, fmt.Errorf("chmod tmpdir: %w", err)
+	}
 
 	if runner.Verbose {
 		fmt.Printf(">>> Extracting boot files from %s\n", image)

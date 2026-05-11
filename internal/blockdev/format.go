@@ -95,14 +95,12 @@ func CreateFilesystems(device string, partitions []Partition) error {
 			// btrfs already checksums data + metadata; nothing extra to add.
 			err = runner.Run("mkfs.btrfs", "-f", "-L", p.Label, partDev)
 		case "ext4":
-			// We deliberately don't pass `-O metadata_csum,journal_csum`
-			// here: metadata_csum has been the default since e2fsprogs 1.43
-			// (2016) and journal_csum isn't a mkfs-time feature at all
-			// (journal checksumming comes along for the ride with
-			// metadata_csum). The real USB-safety wins live in the kernel
-			// cmdline (rootflags=commit=1,errors=remount-ro), not in extra
-			// mkfs feature toggles.
-			err = runner.Run("mkfs.ext4", "-F", "-L", p.Label, partDev)
+			// -i 4096: one inode per 4K of disk. Composefs/ostree stores
+			// every regular file as a separate object; with the default
+			// 16K bytes-per-inode ratio, a multi-image shared_store
+			// exhausts inodes long before it runs out of blocks and
+			// bootc install dies with ENOSPC mid-extract.
+			err = runner.Run("mkfs.ext4", "-F", "-i", "4096", "-L", p.Label, partDev)
 		default:
 			return fmt.Errorf("unsupported filesystem: %s", p.FS)
 		}

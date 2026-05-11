@@ -1,8 +1,16 @@
 #!/bin/bash
 # Handle subdirectory root and shared persistence for Tacklebox
 
+type getarg >/dev/null 2>&1 || . /lib/dracut-lib.sh
+
 TBOX_ROOT=$(getarg tacklebox.root)
 TBOX_PERSIST=$(getarg tacklebox.persist)
+
+echo ">>> Tacklebox: tbox-root-mount.sh starting"
+echo ">>> Tacklebox: tacklebox.root=$TBOX_ROOT  tacklebox.persist=$TBOX_PERSIST"
+echo ">>> Tacklebox: /sysroot before:"
+ls -la /sysroot 2>&1 | head -20
+findmnt /sysroot 2>&1 || true
 
 # 1. Handle Subdirectory Root
 #

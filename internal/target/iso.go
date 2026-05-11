@@ -3,7 +3,9 @@ package target
 import (
 	"fmt"
 	"os"
+	osuser "os/user"
 	"path/filepath"
+	"strconv"
 	"sync"
 
 	"github.com/tuna-os/tacklebox/internal/install"
@@ -184,9 +186,16 @@ func (i *IsoTarget) Finalize(track Track) (string, error) {
 		return "", err
 	}
 
-	// Best-effort: ownership fixup so the user can read the resulting ISO
-	// without sudo.
-	if uid := os.Getuid(); uid != 0 {
+	// Ownership fixup: when run under sudo the ISO is owned by root but the
+	// invoking user needs to read/compress it. Look up SUDO_USER first;
+	// fall back to the current uid if not running under sudo.
+	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+		if u, err := osuser.Lookup(sudoUser); err == nil {
+			uid, _ := strconv.Atoi(u.Uid)
+			gid, _ := strconv.Atoi(u.Gid)
+			_ = os.Chown(i.OutputIso, uid, gid)
+		}
+	} else if uid := os.Getuid(); uid != 0 {
 		_ = runner.Run("sudo", "chown", fmt.Sprintf("%d:%d", uid, os.Getgid()), i.OutputIso)
 	}
 

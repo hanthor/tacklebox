@@ -121,7 +121,7 @@ jobs:
         run: sudo ./tacklebox verify /mnt/tbx/tacklebox.img
 
       - name: tacklebox status check
-        run: sudo ./tacklebox status /mnt/tbx/mount-store
+        run: sudo ./tacklebox status /mnt/tbx/tacklebox.img
 
       # Stage 4: Boot smoke. We use TCG (no KVM on free runners) so it's
       # slow (~3 min to login).

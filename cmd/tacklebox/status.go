@@ -9,14 +9,16 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/tuna-os/tacklebox/internal/recipe"
+	"github.com/tuna-os/tacklebox/internal/runner"
 )
 
 var statusCmd = &cobra.Command{
-	Use:   "status [STORE_MOUNT]",
+	Use:   "status [PATH]",
 	Short: "Show status of installed environments on the media",
 	Long: `Display a summary of the environments installed on the tacklebox media.
 
-If STORE_MOUNT is omitted, it auto-detects the partition labeled TBOX_STORE.
+PATH can be a mount point (e.g. /mnt/tbx) or a raw disk image file.
+If PATH is omitted, it auto-detects the partition labeled TBOX_STORE.
 For each environment, it shows:
   - Current booted deployment (if running from this media)
   - Staged deployment (pending reboot)
@@ -33,11 +35,52 @@ func init() {
 }
 
 func runStatus(cmd *cobra.Command, args []string) error {
-	var storeMount string
-	var err error
+	var path string
 	if len(args) > 0 {
-		storeMount = args[0]
-	} else {
+		path = args[0]
+	}
+
+	if path != "" {
+		fi, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("stat %s: %w", path, err)
+		}
+		if !fi.IsDir() {
+			// It's a file — assume it's a block image and mount it
+			return runStatusOnImage(path)
+		}
+	}
+
+	return runStatusOnDir(path)
+}
+
+func runStatusOnImage(path string) error {
+	fmt.Printf(">>> Reading status from image: %s\n", path)
+	out, err := runner.Output("sudo", "losetup", "--find", "--show", "--partscan", "--read-only", path)
+	if err != nil {
+		return fmt.Errorf("losetup %s: %w", path, err)
+	}
+	loop := strings.TrimSpace(string(out))
+	defer runner.Run("sudo", "losetup", "-d", loop)
+
+	mnt, err := os.MkdirTemp("", "tbx-status-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(mnt)
+
+	// Mount STORE (p2) read-only.
+	if err := runner.Run("sudo", "mount", "-o", "ro,noload", loop+"p2", mnt); err != nil {
+		return fmt.Errorf("mount STORE from %s: %w", path, err)
+	}
+	defer runner.Run("sudo", "umount", mnt)
+
+	return runStatusOnDir(mnt)
+}
+
+func runStatusOnDir(storeMount string) error {
+	var err error
+	if storeMount == "" {
 		storeMount, err = findStoreMount()
 		if err != nil {
 			return fmt.Errorf("locate TBOX_STORE mount: %w", err)

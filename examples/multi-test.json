@@ -17,6 +17,13 @@
       "image": "ghcr.io/ublue-os/bazzite:stable",
       "desktop": "kde",
       "modes": ["live"]
+    },
+    {
+      "id": "dakota",
+      "image": "ghcr.io/projectbluefin/dakota:latest",
+      "desktop": "gnome",
+      "backend": "composefs",
+      "modes": ["live"]
     }
   ],
   "offline_payloads": [

@@ -122,9 +122,13 @@ var buildCmd = &cobra.Command{
 
 		// 7. Install Payloads and Configure Boot Entries
 		for _, env := range r.BootableEnvironments {
-			backend, err := install.DetectBackend(env.Image)
-			if err != nil {
-				return err
+			backend := install.Backend(env.Backend)
+			if backend == "" {
+				var err error
+				backend, err = install.DetectBackend(env.Image)
+				if err != nil {
+					return err
+				}
 			}
 
 			// Pull and install to shared store with unique stateroot

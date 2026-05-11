@@ -58,8 +58,9 @@ Tacklebox is driven by simple JSON recipes:
       "modes": ["live", "persistent"]
     },
     {
-      "id": "bazzite",
-      "image": "ghcr.io/ublue-os/bazzite:stable",
+      "id": "dakota",
+      "image": "ghcr.io/projectbluefin/dakota:stable",
+      "backend": "composefs",
       "modes": ["live"]
     }
   ]

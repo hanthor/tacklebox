@@ -16,6 +16,7 @@ type BootableEnvironment struct {
 	ID      string     `json:"id"`
 	Image   string     `json:"image"`
 	Desktop string     `json:"desktop"`
+	Backend string     `json:"backend"`
 	Modes   []BootMode `json:"modes"`
 }
 

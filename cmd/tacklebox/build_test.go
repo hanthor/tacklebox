@@ -128,6 +128,55 @@ func TestComputePartitions(t *testing.T) {
 		}
 	})
 
+	t.Run("partition overrides honoured", func(t *testing.T) {
+		parts, err := computePartitions(recipe.MediaRecipe{
+			Size:        "40G",
+			SharedStore: recipe.SharedStore{Format: "btrfs"},
+			Partitions:  recipe.Partitions{ESP: "2G", Persist: "8G"},
+		})
+		if err != nil {
+			t.Fatalf("unexpected: %v", err)
+		}
+		if parts[0].Size != "+2G" {
+			t.Errorf("ESP override lost: %q", parts[0].Size)
+		}
+		// Persist override -> not remainder, store fills the middle: 40-2-8=30
+		if parts[1].Size != "+30G" {
+			t.Errorf("STORE = %q, want +30G", parts[1].Size)
+		}
+		if parts[2].Size != "+8G" {
+			t.Errorf("PERSIST = %q, want +8G", parts[2].Size)
+		}
+	})
+
+	t.Run("explicit STORE override", func(t *testing.T) {
+		parts, err := computePartitions(recipe.MediaRecipe{
+			Size:        "60G",
+			SharedStore: recipe.SharedStore{Format: "ext4"},
+			Partitions:  recipe.Partitions{Store: "40G"},
+		})
+		if err != nil {
+			t.Fatalf("unexpected: %v", err)
+		}
+		if parts[1].Size != "+40G" {
+			t.Errorf("STORE = %q, want +40G", parts[1].Size)
+		}
+		// PERSIST remains remainder (no override)
+		if parts[2].Size != "0" {
+			t.Errorf("PERSIST should be remainder, got %q", parts[2].Size)
+		}
+	})
+
+	t.Run("invalid override rejected", func(t *testing.T) {
+		_, err := computePartitions(recipe.MediaRecipe{
+			Size:       "60G",
+			Partitions: recipe.Partitions{ESP: "huge"},
+		})
+		if err == nil || !strings.Contains(err.Error(), "partitions.esp") {
+			t.Errorf("want partitions.esp error, got %v", err)
+		}
+	})
+
 	t.Run("STORE scales with recipe", func(t *testing.T) {
 		for _, recipeSize := range []string{"10G", "16G", "64G", "128G"} {
 			parts, err := computePartitions(recipe.MediaRecipe{

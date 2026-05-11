@@ -2,8 +2,10 @@ package install
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/tuna-os/tacklebox/internal/runner"
 )
@@ -109,6 +111,28 @@ func parseBackend(inspectJson string) Backend {
 	return BackendComposefs
 }
 
+// extractStaging holds the host-side cache of (vmlinuz, initrd) artifacts
+// keyed by image reference. Recipes that reference the same image from
+// multiple bootable_environments only pay the podman run cost once.
+type stagedFiles struct {
+	dir  string // host-side staging directory holding vmlinuz + initrd.img
+	kver string
+}
+
+var (
+	extractCacheMu sync.Mutex
+	extractCache   = map[string]stagedFiles{}
+)
+
+// stagingRoot is overridable by callers (the build command sets this from
+// --output-base) so the staging dir lives next to the rest of the build
+// artifacts instead of in /tmp.
+var stagingRoot = "/tmp"
+
+// SetStagingRoot redirects the per-image extract staging area. Must be called
+// before the first ExtractBootFiles in a build.
+func SetStagingRoot(p string) { stagingRoot = p }
+
 // ExtractBootFiles copies vmlinuz + initramfs out of an image into destDir and
 // returns the kernel version. It uses `podman run --rm` with cp inside the
 // container instead of `podman image mount`, which avoids:
@@ -118,22 +142,9 @@ func parseBackend(inspectJson string) Backend {
 //
 // Per-image results are cached so a multi-env recipe sharing an image pays
 // the cost once.
-func ExtractBootFiles(image string, destDir string) (string, error) {
-	if runner.Verbose {
-		fmt.Printf(">>> Extracting boot files from %s to %s\n", image, destDir)
-	}
-
-	if err := runner.Run("sudo", "mkdir", "-p", destDir); err != nil {
-		return "", err
-	}
-
-	// Single privileged podman invocation: discover kver, copy both files.
-	// The shell inside the container has full visibility into /usr/lib/modules
-	// without any host-side overlay mount.
-	//
-	// We print the kernel version on the last line of stdout so the parent
-	// can recover it without parsing the cp output.
-	script := `set -eu
+// extractScript runs inside the container and is the same regardless of
+// whether the dest is a staging dir or the ESP itself.
+const extractScript = `set -eu
 kver=""
 for d in /usr/lib/modules/*/; do
   if [ -f "$d/modules.dep" ]; then
@@ -149,19 +160,54 @@ cp "/usr/lib/modules/$kver/vmlinuz" /dest/vmlinuz
 cp "/usr/lib/modules/$kver/initramfs.img" /dest/initrd.img
 printf 'KVER=%s\n' "$kver"
 `
-	// label=disable: the ESP is vfat and can't carry SELinux xattrs, so :Z
-	// would no-op and the container would still be denied. The bootc install
-	// codepath disables labels for the same reason.
-	out, err := runner.Output("sudo", "podman", "run", "--rm",
-		"--security-opt", "label=disable",
-		"-v", destDir+":/dest",
-		"--entrypoint", "/bin/sh",
-		image, "-c", script)
-	if err != nil {
-		return "", fmt.Errorf("extract boot files for %s: %w", image, err)
+
+// fetchToStaging populates the cache entry for image: runs podman once,
+// writes both files to a host-side staging dir under stagingRoot, returns
+// the cached struct. Concurrent callers for the same image serialize on
+// extractCacheMu and only one of them does the actual podman run.
+func fetchToStaging(image string) (stagedFiles, error) {
+	extractCacheMu.Lock()
+	if s, ok := extractCache[image]; ok {
+		extractCacheMu.Unlock()
+		return s, nil
+	}
+	extractCacheMu.Unlock()
+
+	// Sanitise image ref for use as a directory name. Replace anything that's
+	// not [A-Za-z0-9._-] with '_'. Good enough for collision-free naming in
+	// practice (image refs are themselves unique).
+	safe := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			return r
+		case r == '.' || r == '_' || r == '-':
+			return r
+		}
+		return '_'
+	}, image)
+	dir := filepath.Join(stagingRoot, "tbox-extract", safe)
+
+	if err := runner.Run("sudo", "mkdir", "-p", dir); err != nil {
+		return stagedFiles{}, err
+	}
+	// Make the staging dir writable so the container (running as root via
+	// sudo podman, but with label=disable) can write into it on hosts where
+	// the bind-mount target sits on a filesystem that does carry SELinux.
+	if err := runner.Run("sudo", "chmod", "0777", dir); err != nil {
+		return stagedFiles{}, err
 	}
 
-	// Recover kver from the marker line.
+	if runner.Verbose {
+		fmt.Printf(">>> Extracting boot files from %s into staging %s\n", image, dir)
+	}
+	out, err := runner.Output("sudo", "podman", "run", "--rm",
+		"--security-opt", "label=disable",
+		"-v", dir+":/dest",
+		"--entrypoint", "/bin/sh",
+		image, "-c", extractScript)
+	if err != nil {
+		return stagedFiles{}, fmt.Errorf("extract boot files for %s: %w", image, err)
+	}
 	var kver string
 	for _, line := range strings.Split(string(out), "\n") {
 		if strings.HasPrefix(line, "KVER=") {
@@ -170,8 +216,48 @@ printf 'KVER=%s\n' "$kver"
 		}
 	}
 	if kver == "" {
-		return "", fmt.Errorf("extract %s: no KVER line in output: %s", image, string(out))
+		return stagedFiles{}, fmt.Errorf("extract %s: no KVER line in output: %s", image, string(out))
 	}
-	return kver, nil
+
+	s := stagedFiles{dir: dir, kver: kver}
+	extractCacheMu.Lock()
+	extractCache[image] = s
+	extractCacheMu.Unlock()
+	return s, nil
+}
+
+// CleanupStaging removes all host-side extract staging directories. Best-
+// effort: errors are logged but not propagated.
+func CleanupStaging() {
+	extractCacheMu.Lock()
+	defer extractCacheMu.Unlock()
+	for _, s := range extractCache {
+		_ = runner.Run("sudo", "rm", "-rf", s.dir)
+	}
+	root := filepath.Join(stagingRoot, "tbox-extract")
+	if fi, err := os.Stat(root); err == nil && fi.IsDir() {
+		_ = runner.Run("sudo", "rmdir", root)
+	}
+	extractCache = map[string]stagedFiles{}
+}
+
+// ExtractBootFiles copies vmlinuz + initramfs from the per-image staging
+// cache into destDir. The first call for a given image runs podman once;
+// subsequent calls are just `cp` operations from the staging dir.
+func ExtractBootFiles(image string, destDir string) (string, error) {
+	if err := runner.Run("sudo", "mkdir", "-p", destDir); err != nil {
+		return "", err
+	}
+	s, err := fetchToStaging(image)
+	if err != nil {
+		return "", err
+	}
+	if err := runner.Run("sudo", "cp", filepath.Join(s.dir, "vmlinuz"), filepath.Join(destDir, "vmlinuz")); err != nil {
+		return "", fmt.Errorf("copy vmlinuz from staging: %w", err)
+	}
+	if err := runner.Run("sudo", "cp", filepath.Join(s.dir, "initrd.img"), filepath.Join(destDir, "initrd.img")); err != nil {
+		return "", fmt.Errorf("copy initrd from staging: %w", err)
+	}
+	return s.kver, nil
 }
 

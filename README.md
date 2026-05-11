@@ -17,10 +17,12 @@ Born from the `superiso` project, Tacklebox evolves the concept from static ISOs
 ## 🏗️ Architecture
 
 ### `tbox-root` Dracut Module
-Tacklebox ships with a custom dracut module that handles the heavy lifting of multi-tenancy. At boot time, it:
+Tacklebox ships with a custom dracut module (`src/dracut/95tbox-root/`) that handles the heavy lifting of multi-tenancy. At boot time, it:
 1.  Locates the target OS subdirectory on the `TBOX_STORE` partition.
 2.  Bind-mounts it to `/sysroot`.
 3.  Sets up the persistent home overlay if requested.
+
+> **Image requirement:** Tacklebox does not patch the booted initramfs; it simply extracts whatever `/usr/lib/modules/<kver>/initramfs.img` is shipped inside the source bootc image. **For `switch_root` to succeed, the source image must already include the `95tbox-root` dracut module.** In the superiso parent project, `live/Containerfile.ublue` bakes this in via `--add tbox-root` during a Debian-stage dracut rebuild. Stock upstream images (`ghcr.io/ublue-os/bluefin:stable`, etc.) lack the module and will halt at `initrd-switch-root.service`. Use the transformed `localhost/superiso-live-*:latest` references in your recipes for fully-booting media.
 
 ### Composefs Support
 Tacklebox automatically handles the unique requirements of the Composefs backend, including:
@@ -47,25 +49,49 @@ Tacklebox is driven by simple JSON recipes:
 ```json
 {
   "media_name": "Tuna-Toolkit",
-  "size": "30G",
+  "size": "60G",
   "shared_store": {
     "format": "ext4"
+  },
+  "partitions": {
+    "esp": "1G",
+    "store": "50G",
+    "persist": "8G"
   },
   "bootable_environments": [
     {
       "id": "bluefin",
-      "image": "ghcr.io/ublue-os/bluefin:stable",
+      "image": "localhost/superiso-live-bluefin:latest",
       "modes": ["live", "persistent"]
     },
     {
       "id": "dakota",
-      "image": "ghcr.io/projectbluefin/dakota:stable",
+      "image": "localhost/superiso-live-dakota:latest",
       "backend": "composefs",
       "modes": ["live"]
     }
   ]
 }
 ```
+
+The `partitions` block is optional. By default Tacklebox uses ESP=1 GiB,
+Persist=2 GiB, and Store=remainder. Provide explicit sizes when you need a
+larger ESP (more kernels), more persistent space, or want to leave headroom.
+
+> **Sizing rule of thumb:** ostree-backed bootc deployments occupy ~10 GiB
+> each, composefs-backed ones ~5 GiB. A 30 GiB recipe is enough for one
+> ostree env; three need ~60 GiB. Tacklebox prints a warning before
+> partitioning when the math doesn't add up — see `estimateStoreUsage`.
+
+## ⚡ Flags
+
+| Flag | What it does |
+|---|---|
+| `-b, --output-base DIR` | Where intermediate artifacts and `tacklebox.img` are written. |
+| `--xz` | Compress the resulting image with `xz -T0`. |
+| `-y, --yes` | Skip the destructive-target confirmation. Required in CI / non-tty contexts. |
+| `-v, --verbose` | Stream subprocess output and command traces. Default is quiet (stderr still captured on failure). |
+| `--parallel-install N` | **Experimental.** Run N bootc installs concurrently. Bounded by slowest env, not sum — but shares `/var/lib/containers`. Default 1 (sequential). |
 
 ## 🏗 Requirements
 

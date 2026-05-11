@@ -74,6 +74,10 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	if err := os.MkdirAll(outputBase, 0755); err != nil {
 		return fmt.Errorf("create output directory %s: %w", outputBase, err)
 	}
+	// Host-side extract cache lives under the build output so it shares disk
+	// budget with the build itself and gets cleaned up alongside it.
+	install.SetStagingRoot(outputBase)
+	defer install.CleanupStaging()
 
 	// Cleanup stack runs in LIFO order, including on SIGINT.
 	var cleanups []func()
@@ -119,10 +123,13 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	fmt.Printf(">>> Output directory: %s\n", outputBase)
 
 	timings := map[string]time.Duration{}
+	var timingsMu sync.Mutex
 	track := func(name string, fn func() error) error {
 		t0 := time.Now()
 		err := fn()
+		timingsMu.Lock()
 		timings[name] = time.Since(t0)
+		timingsMu.Unlock()
 		return err
 	}
 	buildStart := time.Now()
@@ -235,67 +242,15 @@ func runBuild(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Install + boot file extraction per environment.
-	for _, env := range r.BootableEnvironments {
-		backend := install.Backend(env.Backend)
-		if backend == "" {
-			detected, err := install.DetectBackend(env.Image)
-			if err != nil {
-				return err
-			}
-			backend = detected
-		}
-
-		envRoot := filepath.Join(storeMount, "tbox-install", env.ID)
-		runner.Run("sudo", "rm", "-rf", envRoot)
-		if err := runner.Run("sudo", "mkdir", "-p", envRoot); err != nil {
-			return fmt.Errorf("create env root for %s: %w", env.ID, err)
-		}
-		fmt.Printf(">>> Installing %s (backend=%s)\n", env.ID, backend)
-		if err := track("install:"+env.ID, func() error {
-			return install.PullAndInstall(env.Image, envRoot, env.ID, backend)
-		}); err != nil {
-			return fmt.Errorf("install %s: %w", env.ID, err)
-		}
-
-		bootDir := filepath.Join(espMount, "EFI", env.ID)
-		if err := runner.Run("sudo", "mkdir", "-p", bootDir); err != nil {
-			return fmt.Errorf("create boot dir %s: %w", bootDir, err)
-		}
-		var kver string
-		if err := track("extract:"+env.ID, func() error {
-			var err error
-			kver, err = install.ExtractBootFiles(env.Image, bootDir)
-			return err
-		}); err != nil {
-			return fmt.Errorf("extract boot files for %s: %w", env.ID, err)
-		}
-
-		kernelRelPath := filepath.Join("/EFI", env.ID, "vmlinuz")
-		initrdRelPath := filepath.Join("/EFI", env.ID, "initrd.img")
-
-		for _, mode := range env.Modes {
-			title := fmt.Sprintf("%s (%s)", env.ID, mode)
-			id := fmt.Sprintf("%s-%s", env.ID, mode)
-
-			options := fmt.Sprintf("root=LABEL=TBOX_STORE rw console=ttyS0 tacklebox.root=tbox-install/%s", env.ID)
-			if mode == recipe.ModeLive {
-				options += " rd.live.overlay=tmpfs"
-			} else {
-				options += " tacklebox.persist=LABEL=TBOX_PERSIST"
-			}
-
-			if backend == install.BackendOstree {
-				options += fmt.Sprintf(" ostree=/ostree/boot.1/%s/current/0", env.ID)
-			} else {
-				options += " rootflags=subvol=containers/storage/overlay/default/diff"
-			}
-
-			if err := install.WriteBLSEntry(espMount, id, title, kernelRelPath, initrdRelPath, options); err != nil {
-				return err
-			}
-		}
-		fmt.Printf(">>> Finished environment: %s (kernel=%s)\n", env.ID, kver)
+	parallelN, _ := cmd.Flags().GetInt("parallel-install")
+	if parallelN < 1 {
+		parallelN = 1
+	}
+	if parallelN > len(r.BootableEnvironments) {
+		parallelN = len(r.BootableEnvironments)
+	}
+	if err := runEnvs(r.BootableEnvironments, storeMount, espMount, parallelN, track); err != nil {
+		return err
 	}
 
 	if !isBlockDevice {
@@ -371,6 +326,120 @@ func confirmDestructive(target string, assumeYes bool) error {
 	return nil
 }
 
+// runEnvs runs the install + extract + BLS pipeline for each environment.
+// When parallel > 1 it runs that many environments concurrently using a
+// fixed-size worker pool. BLS writes happen inside the per-env worker
+// because each env produces its own entry files (no contention).
+//
+// CAUTION: concurrent bootc installs share /var/lib/containers and a single
+// target store mount. In practice they work because they install to distinct
+// stateroots (different subdirs of /target), but this is OPT-IN behaviour
+// because we haven't broadly battle-tested it across image families. Stick
+// with parallel=1 for production builds; use --parallel-install=N to try
+// the faster path when total wall time matters more than risk.
+func runEnvs(envs []recipe.BootableEnvironment, storeMount, espMount string, parallel int, track func(string, func() error) error) error {
+	if parallel <= 1 {
+		for _, env := range envs {
+			if err := installEnv(env, storeMount, espMount, track); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	fmt.Printf(">>> Running %d environments with parallelism=%d\n", len(envs), parallel)
+	sem := make(chan struct{}, parallel)
+	var wg sync.WaitGroup
+	errs := make([]error, len(envs))
+	for i, env := range envs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, env recipe.BootableEnvironment) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			errs[i] = installEnv(env, storeMount, espMount, track)
+		}(i, env)
+	}
+	wg.Wait()
+
+	var failed []string
+	for i, err := range errs {
+		if err != nil {
+			failed = append(failed, fmt.Sprintf("  - %s: %v", envs[i].ID, err))
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("%d environment(s) failed:\n%s", len(failed), strings.Join(failed, "\n"))
+	}
+	return nil
+}
+
+// installEnv handles the per-environment pipeline. Safe to invoke concurrently
+// for distinct envs provided ExtractBootFiles uses the staging cache (which it
+// does — fetchToStaging serialises around extractCacheMu).
+func installEnv(env recipe.BootableEnvironment, storeMount, espMount string, track func(string, func() error) error) error {
+	backend := install.Backend(env.Backend)
+	if backend == "" {
+		detected, err := install.DetectBackend(env.Image)
+		if err != nil {
+			return err
+		}
+		backend = detected
+	}
+
+	envRoot := filepath.Join(storeMount, "tbox-install", env.ID)
+	runner.Run("sudo", "rm", "-rf", envRoot)
+	if err := runner.Run("sudo", "mkdir", "-p", envRoot); err != nil {
+		return fmt.Errorf("create env root for %s: %w", env.ID, err)
+	}
+	fmt.Printf(">>> Installing %s (backend=%s)\n", env.ID, backend)
+	if err := track("install:"+env.ID, func() error {
+		return install.PullAndInstall(env.Image, envRoot, env.ID, backend)
+	}); err != nil {
+		return fmt.Errorf("install %s: %w", env.ID, err)
+	}
+
+	bootDir := filepath.Join(espMount, "EFI", env.ID)
+	if err := runner.Run("sudo", "mkdir", "-p", bootDir); err != nil {
+		return fmt.Errorf("create boot dir %s: %w", bootDir, err)
+	}
+	var kver string
+	if err := track("extract:"+env.ID, func() error {
+		var err error
+		kver, err = install.ExtractBootFiles(env.Image, bootDir)
+		return err
+	}); err != nil {
+		return fmt.Errorf("extract boot files for %s: %w", env.ID, err)
+	}
+
+	kernelRelPath := filepath.Join("/EFI", env.ID, "vmlinuz")
+	initrdRelPath := filepath.Join("/EFI", env.ID, "initrd.img")
+
+	for _, mode := range env.Modes {
+		title := fmt.Sprintf("%s (%s)", env.ID, mode)
+		id := fmt.Sprintf("%s-%s", env.ID, mode)
+
+		options := fmt.Sprintf("root=LABEL=TBOX_STORE rw console=ttyS0 tacklebox.root=tbox-install/%s", env.ID)
+		if mode == recipe.ModeLive {
+			options += " rd.live.overlay=tmpfs"
+		} else {
+			options += " tacklebox.persist=LABEL=TBOX_PERSIST"
+		}
+
+		if backend == install.BackendOstree {
+			options += fmt.Sprintf(" ostree=/ostree/boot.1/%s/current/0", env.ID)
+		} else {
+			options += " rootflags=subvol=containers/storage/overlay/default/diff"
+		}
+
+		if err := install.WriteBLSEntry(espMount, id, title, kernelRelPath, initrdRelPath, options); err != nil {
+			return err
+		}
+	}
+	fmt.Printf(">>> Finished environment: %s (kernel=%s)\n", env.ID, kver)
+	return nil
+}
+
 // prePullImages pulls all unique images concurrently. Errors are aggregated so
 // the user sees every failure in one go instead of fixing them one-by-one.
 func prePullImages(envs []recipe.BootableEnvironment) error {
@@ -419,28 +488,72 @@ const (
 	minStoreBytes uint64 = 3 << 30 // 3 GiB
 )
 
-// computePartitions derives the disk layout from the recipe's total size.
-// STORE gets total - ESP - PERSIST so larger recipes automatically get
-// larger shared stores.
+// computePartitions derives the disk layout from the recipe's total size,
+// honouring any per-partition overrides in recipe.Partitions. STORE defaults
+// to total - ESP - PERSIST so larger recipes automatically get larger
+// shared stores.
 func computePartitions(r recipe.MediaRecipe) ([]blockdev.Partition, error) {
 	total, ok := parseSize(r.Size)
 	if !ok {
 		return nil, fmt.Errorf("unrecognised size %q in recipe", r.Size)
 	}
-	if total < espBytes+persistBytes+minStoreBytes {
-		return nil, fmt.Errorf(
-			"recipe size %s is too small: need at least %d GiB (1 ESP + %d store + %d persist)",
-			r.Size, (espBytes+persistBytes+minStoreBytes)>>30, minStoreBytes>>30, persistBytes>>30)
-	}
-	storeBytes := total - espBytes - persistBytes
-	// Round down to whole GiB so the partition table is tidy.
-	storeGiB := storeBytes >> 30
 
-	return []blockdev.Partition{
-		{Number: 1, Label: "TBOX_ESP", Size: "+1G", Type: "ef00", FS: "vfat"},
-		{Number: 2, Label: "TBOX_STORE", Size: fmt.Sprintf("+%dG", storeGiB), Type: "8300", FS: r.SharedStore.Format},
-		{Number: 3, Label: "TBOX_PERSIST", Size: "0", Type: "8300", FS: "ext4"},
-	}, nil
+	// Resolve sizes: explicit override -> parsed bytes; otherwise default.
+	resolve := func(field, def string, defBytes uint64) (string, uint64, error) {
+		if field == "" {
+			return def, defBytes, nil
+		}
+		b, ok := parseSize(field)
+		if !ok {
+			return "", 0, fmt.Errorf("invalid partition size %q", field)
+		}
+		// Re-emit in sgdisk +SIZE form. Use GiB precision since sgdisk
+		// rounds to sector alignment anyway.
+		return fmt.Sprintf("+%dG", b>>30), b, nil
+	}
+
+	espSpec, esp, err := resolve(r.Partitions.ESP, "+1G", espBytes)
+	if err != nil {
+		return nil, fmt.Errorf("partitions.esp: %w", err)
+	}
+	persistSpec, persist, err := resolve(r.Partitions.Persist, "", persistBytes)
+	if err != nil {
+		return nil, fmt.Errorf("partitions.persist: %w", err)
+	}
+	// Persist defaults to "0" (remainder) when no override; with override
+	// we pin its size explicitly and let STORE float instead.
+	persistIsRemainder := r.Partitions.Persist == ""
+
+	// STORE: explicit override > computed remainder.
+	var storeSpec string
+	var store uint64
+	if r.Partitions.Store != "" {
+		storeSpec, store, err = resolve(r.Partitions.Store, "", 0)
+		if err != nil {
+			return nil, fmt.Errorf("partitions.store: %w", err)
+		}
+	} else {
+		// Sized so persist gets its target as remainder.
+		if total < esp+persist+minStoreBytes {
+			return nil, fmt.Errorf(
+				"recipe size %s is too small: need at least %d GiB (ESP %d + store %d + persist %d)",
+				r.Size, (esp+persist+minStoreBytes)>>30, esp>>30, minStoreBytes>>30, persist>>30)
+		}
+		store = total - esp - persist
+		storeSpec = fmt.Sprintf("+%dG", store>>30)
+	}
+
+	parts := []blockdev.Partition{
+		{Number: 1, Label: "TBOX_ESP", Size: espSpec, Type: "ef00", FS: "vfat"},
+		{Number: 2, Label: "TBOX_STORE", Size: storeSpec, Type: "8300", FS: r.SharedStore.Format},
+	}
+	// Persist is "0" (= sgdisk "use rest of disk") only when no override.
+	if persistIsRemainder {
+		parts = append(parts, blockdev.Partition{Number: 3, Label: "TBOX_PERSIST", Size: "0", Type: "8300", FS: "ext4"})
+	} else {
+		parts = append(parts, blockdev.Partition{Number: 3, Label: "TBOX_PERSIST", Size: persistSpec, Type: "8300", FS: "ext4"})
+	}
+	return parts, nil
 }
 
 // Rough per-env disk usage estimates (observed empirically — see commit
@@ -455,11 +568,35 @@ const (
 // ok). If the recipe is malformed it returns ok=false and the caller skips
 // the pre-flight warning.
 func estimateStoreUsage(r recipe.MediaRecipe) (uint64, uint64, bool) {
+	// Mirror computePartitions' sizing logic so the warning matches what
+	// the build will actually create.
 	total, ok := parseSize(r.Size)
-	if !ok || total < espBytes+persistBytes {
+	if !ok {
 		return 0, 0, false
 	}
-	store := total - espBytes - persistBytes
+	esp := espBytes
+	if r.Partitions.ESP != "" {
+		if b, ok := parseSize(r.Partitions.ESP); ok {
+			esp = b
+		}
+	}
+	var store uint64
+	if r.Partitions.Store != "" {
+		if b, ok := parseSize(r.Partitions.Store); ok {
+			store = b
+		}
+	} else {
+		persist := persistBytes
+		if r.Partitions.Persist != "" {
+			if b, ok := parseSize(r.Partitions.Persist); ok {
+				persist = b
+			}
+		}
+		if total <= esp+persist {
+			return 0, 0, false
+		}
+		store = total - esp - persist
+	}
 
 	// We treat unknown / empty backend as ostree to match the DetectBackend
 	// fallback bias and to err on the side of warning more (ostree estimate
@@ -522,5 +659,6 @@ func init() {
 	buildCmd.Flags().Bool("xz", false, "Compress the final image with xz")
 	buildCmd.Flags().BoolP("verbose", "v", false, "Stream subprocess output and command traces")
 	buildCmd.Flags().BoolP("yes", "y", false, "Skip destructive confirmation when TARGET is a /dev/* device")
+	buildCmd.Flags().Int("parallel-install", 1, "How many bootc installs to run concurrently. Experimental; >1 shares /var/lib/containers across envs and is fastest when total wall time matters more than risk.")
 	rootCmd.AddCommand(buildCmd)
 }

@@ -49,16 +49,31 @@ targets, not loop images.
 **Reproduces with `examples/all-test.json`.** Each `bootc install
 to-filesystem` runs from the correct container image, but both
 `tbox-install/aurora` and `tbox-install/bazzite` end up with the
-*same* ostree commit hash (bazzite content). The aurora container
-itself contains genuine Aurora content when run standalone, so the
-bug is in how bootc resolves the source image when serial installs
-share `--mount type=bind,src=/var/lib/containers`. Either:
-- Work around it on the tacklebox side (per-env scratch containers
-  storage, copy image references into an env-local store before
-  invoking bootc), or
-- File upstream against bootc.
+*same* ostree commit hash (`e2c044ed7f9a…` — bazzite content). The
+aurora container itself contains genuine Aurora content when run
+standalone (`podman run --rm localhost/superiso-live-aurora cat
+/etc/os-release` shows `NAME="Aurora"`).
 
-`tacklebox verify` (above) would have caught this in CI.
+**What was tried and didn't fix it (2026-05-11):**
+- Pass `--source-imgref containers-storage:<image>` to bootc install
+  to pin the source explicitly. Hash unchanged — verify still flags
+  the same collision.
+- Remove the `--mount type=bind,src=/var/lib/containers` so the install
+  container can't see host's containers-storage at all. Hash *still*
+  unchanged. So the bug is not (or not only) about which image bootc
+  resolves; bootc seems to share state somewhere we haven't found.
+
+Both fixes are kept in `internal/install/bootc.go` as defense in depth
+since they're cheap and harmless, but the actual root cause needs
+either:
+- A deeper read of bootc's install-source resolution (RUST_LOG=debug
+  on a single install would help isolate where the wrong commit gets
+  computed), or
+- Filing upstream — bootc 1.15.2 against ublue-os/aurora + ublue-os/
+  bazzite reproduces deterministically in our setup.
+
+`tacklebox verify` (above) catches this in CI; nightly builds of
+all-test will fail until the underlying bootc bug is fixed.
 
 ## CI / automated testing
 

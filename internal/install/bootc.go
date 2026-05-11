@@ -63,13 +63,13 @@ func PullAndInstall(image string, targetDir string, stateroot string, backend Ba
 	podmanArgs = append(podmanArgs, image)
 	podmanArgs = append(podmanArgs, "bootc", "install", "to-filesystem", "--skip-finalize")
 
-	// --source-imgref pins bootc to install THIS image, not whatever its
-	// "running container's image" inference picks. The default inference
-	// breaks when /var/lib/containers is shared across serial installs:
-	// the second install ends up writing the FIRST install's content
-	// (observed 2026-05-11 with examples/all-test.json — both aurora
-	// and bazzite stateroots got bazzite content). Specifying the source
-	// explicitly bypasses that inference entirely.
+	// --source-imgref *should* pin bootc to install THIS image. In
+	// practice it doesn't fully resolve the cross-env collision observed
+	// 2026-05-11 with examples/all-test.json (aurora stateroot still
+	// gets bazzite content even with --source-imgref + no shared
+	// containers-storage bind). Kept here as defense-in-depth and as
+	// documentation; the real fix needs an upstream bootc change. See
+	// tacklebox/TODO.md §"Bugs".
 	podmanArgs = append(podmanArgs, "--source-imgref", "containers-storage:"+image)
 
 	if backend == BackendOstree {

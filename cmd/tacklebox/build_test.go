@@ -44,7 +44,7 @@ func TestBuildKernelCmdline(t *testing.T) {
 				"root=LABEL=TBOX_STORE",
 				"tacklebox.root=tbox-install/bluefin",
 				"rd.live.overlay=tmpfs",
-				"ostree=/ostree/boot.1/bluefin/current/0",
+				"ostree=/ostree/boot.1/bluefin/abc123/0",
 				"rootflags=commit=1,errors=remount-ro",
 			},
 			excludes: []string{"subvol=", "tacklebox.persist"},
@@ -87,7 +87,7 @@ func TestBuildKernelCmdline(t *testing.T) {
 	// into the test signature; the production function casts back.
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildKernelCmdline(tc.env, modeOf(tc.mode), backendOf(tc.backend), tc.usbSafe)
+			got := buildKernelCmdline(tc.env, modeOf(tc.mode), backendOf(tc.backend), tc.usbSafe, "abc123")
 			for _, s := range tc.contains {
 				if !strings.Contains(got, s) {
 					t.Errorf("missing %q in %q", s, got)

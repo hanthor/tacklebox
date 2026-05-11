@@ -387,7 +387,11 @@ func runEnvs(envs []recipe.BootableEnvironment, storeMount, espMount string, par
 //   - composefs needs `subvol=containers/storage/overlay/default/diff`
 //   - usbSafe adds `commit=1,errors=remount-ro` for corruption resistance
 //   - both compose into a single comma-separated rootflags= clause
-func buildKernelCmdline(envID string, mode recipe.BootMode, backend install.Backend, usbSafe bool) string {
+//
+// ostreeBootcsum is the deployment hash found under
+// <envRoot>/ostree/boot.1/<stateroot>/. Required for ostree backends;
+// ignored for composefs. Pass "" for non-ostree envs.
+func buildKernelCmdline(envID string, mode recipe.BootMode, backend install.Backend, usbSafe bool, ostreeBootcsum string) string {
 	cmdline := fmt.Sprintf("root=LABEL=TBOX_STORE rw console=ttyS0 tacklebox.root=tbox-install/%s", envID)
 	if mode == recipe.ModeLive {
 		cmdline += " rd.live.overlay=tmpfs"
@@ -397,7 +401,12 @@ func buildKernelCmdline(envID string, mode recipe.BootMode, backend install.Back
 
 	var rootflags []string
 	if backend == install.BackendOstree {
-		cmdline += fmt.Sprintf(" ostree=/ostree/boot.1/%s/current/0", envID)
+		// The deployment's content-hash dir name comes from bootc; we
+		// look it up at runtime via FindOstreeDeployment. Previously we
+		// hardcoded `current` here which was wrong — bootc doesn't
+		// create that symlink and ostree-prepare-root crashed at
+		// switch_root every time.
+		cmdline += fmt.Sprintf(" ostree=/ostree/boot.1/%s/%s/0", envID, ostreeBootcsum)
 	} else {
 		rootflags = append(rootflags, "subvol=containers/storage/overlay/default/diff")
 	}
@@ -458,10 +467,22 @@ func installEnv(env recipe.BootableEnvironment, storeMount, espMount string, tra
 	kernelRelPath := filepath.Join("/EFI", env.ID, "vmlinuz")
 	initrdRelPath := filepath.Join("/EFI", env.ID, "initrd.img")
 
+	var ostreeBootcsum string
+	if backend == install.BackendOstree {
+		csum, fErr := install.FindOstreeDeployment(envRoot, env.ID)
+		if fErr != nil {
+			return fmt.Errorf("locate ostree deployment for %s: %w", env.ID, fErr)
+		}
+		if csum == "" {
+			return fmt.Errorf("ostree backend declared but no deployment found under %s", envRoot)
+		}
+		ostreeBootcsum = csum
+	}
+
 	for _, mode := range env.Modes {
 		title := fmt.Sprintf("%s (%s)", env.ID, mode)
 		id := fmt.Sprintf("%s-%s", env.ID, mode)
-		options := buildKernelCmdline(env.ID, mode, backend, blockdev.UsbSafe)
+		options := buildKernelCmdline(env.ID, mode, backend, blockdev.UsbSafe, ostreeBootcsum)
 		if err := install.WriteBLSEntry(espMount, id, title, kernelRelPath, initrdRelPath, options); err != nil {
 			return err
 		}

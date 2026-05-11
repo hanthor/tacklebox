@@ -241,6 +241,62 @@ func CleanupStaging() {
 	extractCache = map[string]stagedFiles{}
 }
 
+// FindOstreeDeployment returns the ostree deployment hash (the directory name
+// that bootc install actually wrote under <envRoot>/ostree/boot.1/<stateroot>/).
+// Returns ("", nil) if the env isn't ostree-backed (e.g. composefs).
+//
+// bootc install writes the kernel argument as
+//   ostree=/ostree/boot.1/<stateroot>/<bootcsum>/0
+// where <bootcsum> is a 64-char hex SHA. Tacklebox previously hardcoded
+// `current` instead, which doesn't exist and broke ostree-prepare-root at
+// switch_root time.
+func FindOstreeDeployment(envRoot, stateroot string) (string, error) {
+	dir := filepath.Join(envRoot, "ostree", "boot.1", stateroot)
+	entries, err := readDirSudo(dir)
+	if err != nil {
+		// Not ostree-backed (composefs envs don't have this path).
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("scan %s: %w", dir, err)
+	}
+	for _, name := range entries {
+		// bootc writes exactly one directory here per deployment. We pick
+		// the first that contains a `0/` subdir (the canonical deployment
+		// index).
+		if _, err := os.Stat(filepath.Join(dir, name, "0")); err == nil {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("no deployment under %s", dir)
+}
+
+// readDirSudo is a fallback when the host user can't list the directory
+// directly (the TBOX_STORE mount is owned by root and may be mode 0700).
+func readDirSudo(dir string) ([]string, error) {
+	out, err := runner.Output("sudo", "ls", "-1", dir)
+	if err != nil {
+		// Try without sudo too — covers the test/dev case.
+		entries, e2 := os.ReadDir(dir)
+		if e2 != nil {
+			return nil, err
+		}
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		return names, nil
+	}
+	var names []string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			names = append(names, line)
+		}
+	}
+	return names, nil
+}
+
 // ExtractBootFiles copies vmlinuz + initramfs from the per-image staging
 // cache into destDir. The first call for a given image runs podman once;
 // subsequent calls are just `cp` operations from the staging dir.

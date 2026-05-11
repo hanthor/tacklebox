@@ -435,11 +435,12 @@ func installEnvBootc(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt t
 	}
 
 	envRoot := filepath.Join(storeMount, "tbox-install", env.ID)
-	runner.Run("sudo", "rm", "-rf", envRoot)
+	if err := track("clear:"+env.ID, func() error { return install.ClearEnvDir(envRoot) }); err != nil {
+		return fmt.Errorf("clear env dir for %s: %w", env.ID, err)
+	}
 	if err := runner.Run("sudo", "mkdir", "-p", envRoot); err != nil {
 		return fmt.Errorf("create env root for %s: %w", env.ID, err)
 	}
-	fmt.Printf(">>> Installing %s (backend=%s)\n", env.ID, backend)
 	if err := track("install:"+env.ID, func() error {
 		return install.PullAndInstall(env.Image, envRoot, env.ID, backend)
 	}); err != nil {

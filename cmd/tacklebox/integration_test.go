@@ -70,29 +70,44 @@ func TestVerify_Help(t *testing.T) {
 	}
 }
 
-// TestBuild_FixtureSmoke is the heavy one: builds a real 10 G loop
-// image from fixtures/smoke-2env.json and asserts verify passes.
+// TestUpdate_Help confirms the update subcommand is registered and
+// exposes the expected flags. Fast — no I/O.
+func TestUpdate_Help(t *testing.T) {
+	bin := buildTacklebox(t)
+	out, err := exec.Command(bin, "update", "--help").CombinedOutput()
+	if err != nil {
+		t.Fatalf("update --help failed: %v\n%s", err, out)
+	}
+	for _, want := range []string{"RECIPE", "TARGET", "--yes", "PERSIST", "HOST"} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("update --help missing %q\nfull output:\n%s", want, out)
+		}
+	}
+}
+
+// TestUpdate_FixtureSmoke is the heavy E2E test for `tacklebox update`:
 //
-// Skipped automatically when:
-//   - sudo isn't usable non-interactively (CI runners have it; dev
-//     boxes vary)
-//   - any required tool is missing (we'd hit a less-clear error later)
+//  1. Builds a 10 G two-env loop image from fixtures/smoke-2env.json.
+//  2. Runs `tacklebox update --yes fixtures/smoke-2env.json <image>`
+//     (same recipe, effectively a full re-install).
+//  3. Runs `tacklebox verify` to confirm all envs are distinct and
+//     all BLS entries still resolve correctly.
 //
-// Mirrors the verify-smoke GHA job; the value of having this in Go is
-// being able to run the same case interactively with `go test -run`.
-func TestBuild_FixtureSmoke(t *testing.T) {
+// Skipped when required tools are absent or sudo -n doesn't work
+// (same conditions as TestBuild_FixtureSmoke).
+func TestUpdate_FixtureSmoke(t *testing.T) {
 	for _, tool := range []string{"sudo", "podman", "xorriso", "mksquashfs", "mcopy", "mkfs.fat", "sgdisk", "bootctl"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			t.Skipf("required tool %q not found in PATH", tool)
 		}
 	}
 	if err := exec.Command("sudo", "-n", "true").Run(); err != nil {
-		t.Skip("sudo -n unavailable; skipping fixture smoke")
+		t.Skip("sudo -n unavailable; skipping update fixture smoke")
 	}
 
 	bin := buildTacklebox(t)
 	work := t.TempDir()
-	out := filepath.Join(work, "tacklebox.img")
+	imgPath := filepath.Join(work, "tacklebox.img")
 
 	moduleRoot, _ := filepath.Abs(filepath.Join("..", ".."))
 	recipe := filepath.Join(moduleRoot, "fixtures", "smoke-2env.json")
@@ -100,21 +115,36 @@ func TestBuild_FixtureSmoke(t *testing.T) {
 		t.Skipf("fixture recipe missing: %v", err)
 	}
 
+	// Step 1: build initial image.
+	t.Log("building initial 2-env image…")
 	build := exec.Command("sudo", "-E", bin, "build", recipe, "-b", work)
 	build.Stdout = os.Stdout
 	build.Stderr = os.Stderr
 	if err := build.Run(); err != nil {
-		t.Fatalf("build failed: %v", err)
+		t.Fatalf("initial build failed: %v", err)
+	}
+	if _, err := os.Stat(imgPath); err != nil {
+		t.Fatalf("expected image %s not produced: %v", imgPath, err)
 	}
 
-	if _, err := os.Stat(out); err != nil {
-		t.Fatalf("expected output %s missing: %v", out, err)
+	// Step 2: run update with the same recipe.
+	// This re-installs both envs without reformatting the disk.
+	updateWork := filepath.Join(work, "update-scratch")
+	t.Log("running tacklebox update on the built image…")
+	upd := exec.Command("sudo", "-E", bin, "update", "--yes", recipe, imgPath, "-b", updateWork)
+	upd.Stdout = os.Stdout
+	upd.Stderr = os.Stderr
+	if err := upd.Run(); err != nil {
+		t.Fatalf("tacklebox update failed: %v", err)
 	}
 
-	verify := exec.Command("sudo", "-E", bin, "verify", out)
+	// Step 3: verify the updated image.
+	t.Log("verifying updated image…")
+	verify := exec.Command("sudo", "-E", bin, "verify", imgPath)
 	verify.Stdout = os.Stdout
 	verify.Stderr = os.Stderr
 	if err := verify.Run(); err != nil {
-		t.Fatalf("verify failed: %v", err)
+		t.Fatalf("verify after update failed: %v", err)
 	}
+	t.Log("PASS: build → update → verify all succeeded")
 }

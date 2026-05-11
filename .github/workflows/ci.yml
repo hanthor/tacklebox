@@ -24,10 +24,8 @@ jobs:
       - name: go test
         run: go test ./...
 
-      # Integration tests are gated by -tags=integration and rely on
-      # podman/sudo/etc. The non-fixture cases just exec the built
-      # binary with --help to confirm CLI surface is intact; the
-      # fixture-smoke case auto-skips when sudo/tools aren't available.
+      # Integration-tag help checks: builds the binary and execs --help
+      # for every subcommand. Confirms the CLI surface matches what CI depends on.
       - name: go test (integration tag, help-only)
         run: go test -tags=integration -run='Help' ./...
 
@@ -60,20 +58,20 @@ jobs:
           additional_files: src/dracut/95tbox-root/module-setup.sh src/dracut/95tbox-root/tbox-root-mount.sh
           severity: warning
 
-  # ── Stage 3: two-env disk-build smoke + verify ──────────────────────────────
+  # ── Stage 3: two-env disk-build smoke, verify, update, and boot ────────────
   # Builds a 10 GB loop image with two distinct upstream bootc images and
   # asserts `tacklebox verify` passes (each env must end up with a distinct
   # ostree commit hash — the regression check for the 2026-05-11 cross-env
-  # collision bug).
+  # collision bug). Then runs `tacklebox update` to re-install all envs
+  # without reformatting, and verifies again — regression check for the
+  # USB pre-flight unmount and the update command.
   #
-  # Uses /mnt (~75 GB NVMe on free runners) for build artefacts; jlumbroso/
-  # free-disk-space recovers another ~30 GB on / by stripping pre-installed
-  # toolchains we don't use.
+  # Also exercises the UnmountDevice loop-device smoke at the integration
+  # level: creates a loop partition, mounts it, calls UnmountDevice, asserts
+  # the mount is gone.
   #
-  # Boot-in-QEMU smoke (Stage 4) is intentionally not here yet — it needs
-  # our custom live container (with dmsquash-live in the initramfs), and
-  # building that adds ~5 min per env. Will land separately once we either
-  # publish a pre-built fixture container to GHCR or accept the time.
+  # Uses /mnt (~75 GB NVMe on free runners); jlumbroso/free-disk-space
+  # recovers ~30 GB on / first.
   verify-smoke:
     runs-on: ubuntu-latest
     needs: lint-test
@@ -122,6 +120,30 @@ jobs:
 
       - name: tacklebox status check
         run: sudo ./tacklebox status /mnt/tbx/tacklebox.img
+
+      # ── Stage 3b: update smoke ───────────────────────────────────────────
+      # Re-installs both envs on the already-built image using
+      # `tacklebox update`. This exercises:
+      #   - loop-image attach (resolveDevice)
+      #   - pre-flight unmount (UnmountDevice) on a loop device with
+      #     no existing mounts — should be a clean no-op
+      #   - full bootc re-install → BLS rewrite pipeline
+      #   - verify that the result still passes after update
+      - name: tacklebox update (re-install same recipe)
+        run: |
+          sudo mkdir -p /mnt/tbx-update
+          sudo ./tacklebox update --yes fixtures/smoke-2env.json \
+            /mnt/tbx/tacklebox.img -b /mnt/tbx-update
+
+      - name: tacklebox verify (post-update)
+        run: sudo ./tacklebox verify /mnt/tbx/tacklebox.img
+
+      # ── Stage 3c: UnmountDevice loop smoke (integration test) ────────────
+      # Runs the Go integration test that creates a loop device, mounts a
+      # partition, and asserts UnmountDevice clears it. Faster than the full
+      # build smoke and directly exercises the new pre-flight unmount code.
+      - name: UnmountDevice loop smoke (integration)
+        run: go test -tags=integration -v -run=TestUnmountDevice_LoopSmoke ./internal/blockdev/...
 
       # Stage 4: Boot smoke. We use TCG (no KVM on free runners) so it's
       # slow (~3 min to login).

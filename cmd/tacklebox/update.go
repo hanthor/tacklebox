@@ -253,8 +253,9 @@ func updateEnvBootc(env recipe.BootableEnvironment, r recipe.MediaRecipe, storeM
 	}
 
 	envRoot := filepath.Join(storeMount, "tbox-install", env.ID)
-	fmt.Printf(">>> Removing old deployment: %s\n", envRoot)
-	runner.Run("sudo", "rm", "-rf", envRoot)
+	if err := track("clear:"+env.ID, func() error { return install.ClearEnvDir(envRoot) }); err != nil {
+		return fmt.Errorf("clear env dir for %s: %w", env.ID, err)
+	}
 	if err := runner.Run("sudo", "mkdir", "-p", envRoot); err != nil {
 		return fmt.Errorf("create env root for %s: %w", env.ID, err)
 	}

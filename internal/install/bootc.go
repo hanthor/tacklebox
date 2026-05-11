@@ -17,6 +17,48 @@ const (
 	BackendComposefs Backend = "composefs"
 )
 
+// ClearEnvDir removes an existing env deployment directory, handling the
+// immutable-bit complication: ostree sets `chattr +i` on each deployment
+// directory (e.g. `ostree/deploy/<stateroot>/deploy/<hash>.0`). That makes
+// `rm -rf` silently skip it (exits 0 but leaves immutable dirs behind), which
+// causes the next `bootc install to-filesystem` to fail with:
+//
+//	"Verifying empty rootfs: Found entry in <hash>.0: bin"
+//
+// The fix is to recursively find all directories under envRoot and clear the
+// immutable bit BEFORE rm -rf. find can still DESCEND into immutable dirs
+// (immutable prevents modification of directory entries, not traversal), so
+// this walk always succeeds even on a deeply nested ostree deployment.
+//
+// If dir doesn't exist the function is a no-op (returns nil).
+func ClearEnvDir(dir string) error {
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		return nil
+	}
+	fmt.Printf(">>> Clearing env dir (may include immutable ostree deployment): %s\n", dir)
+
+	// Walk all directories and strip the immutable bit. Errors from chattr
+	// are best-effort: the bit might not exist on all FS types (tmpfs,
+	// btrfs subvols, etc.) and chattr exits non-zero in those cases.
+	// We ignore those failures and let the subsequent rm detect any real
+	// permission problem.
+	//
+	// Using `find -type d -exec chattr -i {} +` is faster than a Go
+	// os.WalkDir because we avoid the Go→syscall overhead per-directory.
+	// The `+` terminator batches as many paths as fit on one command line.
+	_ = runner.Run("sudo", "find", dir, "-type", "d", "-exec", "chattr", "-i", "{}", "+")
+
+	// Now remove everything.
+	if out, err := runner.RunCombined("sudo", "rm", "-rf", dir); err != nil {
+		return fmt.Errorf("rm -rf %s: %w\n%s", dir, err, out)
+	}
+	// Confirm the directory is actually gone.
+	if _, err := os.Stat(dir); err == nil {
+		return fmt.Errorf("rm -rf %s appeared to succeed but directory still exists", dir)
+	}
+	return nil
+}
+
 // Pull warms the local containers-storage so the install step doesn't pay
 // per-image network/transport time. Safe to invoke concurrently for distinct
 // images: podman pull takes a per-image lock but parallel pulls of different

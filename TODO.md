@@ -76,34 +76,48 @@ PR.
 - Parse every `examples/*.json` through tacklebox's loader; fail on
   any rejection.
 
-### Stage 3 — Disk-build smoke against fixture (every PR, ~5 min, ubuntu-latest)
-- Build (or pull) a tiny fixture bootc image (e.g. minimal
-  `quay.io/centos-bootc/centos-bootc:stream10`, or a purpose-built
-  ~1 GB image we maintain in this repo).
-- `tacklebox build fixtures/smoke.json` to a ~6 GB loop image.
-- `tacklebox verify` against the result.
-- Needs `sudo` + loop devices on the runner — both available on
-  hosted Linux runners with the right setup.
+### Stage 3 — Two-env disk-build smoke (every PR, ~10 min, ubuntu-latest)
+- Two-env fixture recipe (`fixtures/smoke-2env.json`) using minimal
+  bootc images — e.g. `quay.io/centos-bootc/centos-bootc:stream10`
+  twice with different stateroots, or two distinct minimal images.
+  Two envs is the *minimum* useful E2E — it catches the kind of
+  cross-env content-collision bug we hit on 2026-05-11.
+- `tacklebox build fixtures/smoke-2env.json` to a ~30 GB loop image.
+- `tacklebox verify` — must assert each env's ostree commit hash
+  is distinct.
 
-### Stage 4 — QEMU boot smoke (every PR, ~3 min, ubuntu-latest with /dev/kvm)
+**Disk budget on free `ubuntu-latest` (~14 GB workspace + ~75 GB on `/mnt`):**
+- Run `jlumbroso/free-disk-space` first to recover ~30 GB on `/`
+  (Android SDK, .NET, Haskell, etc.).
+- Use `/mnt` as the build output base (`tacklebox build -b /mnt/tb`)
+  so the 30 GB loop image lives on the NVMe.
+- Containers-storage on `/mnt` too (`STORAGE_DRIVER=overlay` with
+  `graphroot=/mnt/containers`).
+- Total expected workspace: ~40–50 GB. Fits.
+
+### Stage 4 — QEMU boot smoke (every PR, ~5 min, ubuntu-latest with /dev/kvm)
 - Boot the Stage 3 image headless under KVM, capture serial log.
-- Grep for `tbox-root.service: ... finished` and `Welcome to`.
-- On failure, upload the serial log + ESP contents as a CI artifact
-  so triage doesn't require re-running locally.
+- Grep for `tbox-root.service: ... finished`, `ostree-prepare-root.service:
+  ... finished`, and `Welcome to`.
+- Boot **both** envs by editing `loader.conf` between runs (or by
+  passing `systemd.unit=...` / boot-entry selection via QEMU OVMF)
+  — confirms each env actually boots its own content, not just the
+  alphabetically-first one.
+- On failure, upload the serial log + ESP contents as a CI artifact.
 
-### Stage 5 — Nightly full regression (self-hosted)
-- Real `examples/all-test.json` build (bazzite + aurora + dakota,
-  60 GB) + boot. Catches issues that only show up with real upstream
-  images (e.g. today's bootc cross-env collision). Won't fit on free
-  GHA runners — needs a self-hosted runner or an ephemeral cloud
-  box spun up from the workflow.
+### Stage 5 — Nightly full regression (optional, larger runner)
+- Real `examples/all-test.json` (bazzite + aurora + dakota, 60 GB).
+  Doesn't fit the two-env smoke budget — needs either a `ubuntu-latest-large`
+  paid runner, a self-hosted runner, or an ephemeral cloud box spun up
+  from the workflow. Mostly catches issues with the *real* upstream
+  ublue images that the minimal fixtures don't exercise.
 
 ### Workflow file
 `.github/workflows/ci.yml` (stages 1–4) + `.github/workflows/nightly.yml`
 (stage 5, `schedule:` + `workflow_dispatch:`).
 
 ### Test fixtures
-- `fixtures/smoke.json` — single-env recipe pointing at the minimal
-  bootc image, ~6 GB shared store, 1 GB ESP.
-- Either pull the fixture image from a public registry, or build it
+- `fixtures/smoke-2env.json` — two-env recipe (minimum useful for
+  catching cross-env regressions), ~30 GB shared store, 1 GB ESP.
+- Either pull fixture images from a public registry, or build them
   in-repo and push to GHCR on main.

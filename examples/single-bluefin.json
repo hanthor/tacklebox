@@ -1,0 +1,16 @@
+{
+  "media_name": "Tacklebox-Single-Bluefin",
+  "size": "20G",
+  "shared_store": {
+    "format": "ext4",
+    "compression": "zstd"
+  },
+  "bootable_environments": [
+    {
+      "id": "bluefin",
+      "image": "localhost/superiso-live-bluefin:latest",
+      "desktop": "gnome",
+      "modes": ["live", "persistent"]
+    }
+  ]
+}

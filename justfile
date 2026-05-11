@@ -16,6 +16,10 @@ test:
 provision-usb device="/dev/sda" recipe=recipe_path: build
     sudo ./tacklebox build {{recipe}} {{device}} -b {{output_base}}-usb
 
+# Refresh an existing USB/image without wiping the PERSIST partition
+update device="/dev/sda" recipe=recipe_path: build
+    sudo ./tacklebox update {{recipe}} {{device}} -b {{output_base}}-usb
+
 # Verify the generated image (partitions and boot entries)
 verify-test image=image_path:
     #!/usr/bin/env bash

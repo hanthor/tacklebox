@@ -96,6 +96,12 @@ func (b *BlockTarget) Prepare(track Track) (*Mountpoints, error) {
 		})
 	} else {
 		b.targetDev = b.DeviceArg
+		// Clear any automounts before we start partitioning. Lazy-unmounts
+		// are non-fatal (the desktop automounts /dev/sdb1 etc. on insert);
+		// we only fail hard if we can't actually format afterwards.
+		if err := blockdev.UnmountDevice(b.DeviceArg); err != nil {
+			fmt.Printf(">>> warning: pre-flight unmount: %v\n", err)
+		}
 	}
 
 	if err := track("partition", func() error { return blockdev.FormatDisk(b.targetDev, b.Partitions) }); err != nil {

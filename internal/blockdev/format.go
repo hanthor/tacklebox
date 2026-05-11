@@ -1,7 +1,9 @@
 package blockdev
 
 import (
+	"bufio"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/tuna-os/tacklebox/internal/runner"
@@ -52,6 +54,89 @@ func sgdiskTolerant(args ...string) error {
 		return nil
 	}
 	return fmt.Errorf("sgdisk %s failed: %w\noutput: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+}
+
+// UnmountDevice lazily unmounts every filesystem whose source device starts
+// with device (e.g. /dev/sdb covers /dev/sdb1, /dev/sdb2). This clears
+// automounts set by the desktop session before we format the disk.
+//
+// Only acts on /dev/* paths — silently skips loop images so the caller
+// doesn't have to gate on the device type.
+//
+// Uses `umount -l` (lazy) so the unmount succeeds even if a file manager
+// is still holding the mount busy. All encountered errors are collected
+// and returned together so every partition gets an unmount attempt.
+func UnmountDevice(device string) error {
+	// Only real block devices need this; loop images are never automounted.
+	if !strings.HasPrefix(device, "/dev/") {
+		return nil
+	}
+
+	mounts, err := readMounts()
+	if err != nil {
+		// Non-fatal: /proc/mounts should always be readable, but if it
+		// isn't we'll discover the real error at mkfs time.
+		fmt.Printf(">>> warning: cannot read /proc/mounts: %v (skipping auto-unmount)\n", err)
+		return nil
+	}
+
+	var targets []string
+	for _, m := range mounts {
+		// Match the device itself and any partition under it.
+		// /dev/sdb → matches /dev/sdb, /dev/sdb1, /dev/sdb2 …
+		// /dev/nvme0n1 → matches /dev/nvme0n1, /dev/nvme0n1p1 …
+		if m.source == device || strings.HasPrefix(m.source, device) {
+			targets = append(targets, m.target)
+		}
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+
+	fmt.Printf(">>> Unmounting %d partition(s) on %s before format\n", len(targets), device)
+	var errs []string
+	for _, t := range targets {
+		fmt.Printf(">>>   umount -l %s\n", t)
+		if err := runner.Run("sudo", "umount", "-l", t); err != nil {
+			errs = append(errs, fmt.Sprintf("umount %s: %v", t, err))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("unmount errors: %s", strings.Join(errs, "; "))
+	}
+	// Give udev a moment to settle after the unmounts.
+	runner.Run("udevadm", "settle", "--timeout=5")
+	return nil
+}
+
+// mount represents a single line from /proc/mounts.
+type mount struct {
+	source string // e.g. /dev/sdb1
+	target string // e.g. /media/james/USB
+}
+
+// mountsFile is the path to read mount information from. Overridable in
+// tests to avoid reading the real /proc/mounts.
+var mountsFile = "/proc/mounts"
+
+// readMounts parses /proc/mounts and returns the source→target pairs.
+func readMounts() ([]mount, error) {
+	f, err := os.Open(mountsFile)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var mounts []mount
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 2 {
+			continue
+		}
+		mounts = append(mounts, mount{source: fields[0], target: fields[1]})
+	}
+	return mounts, scanner.Err()
 }
 
 func FormatDisk(device string, partitions []Partition) error {

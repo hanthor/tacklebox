@@ -393,9 +393,17 @@ func buildLiveKernelCmdline(envID, label string) string {
 	// dies with "Failed to allocate manager object: Permission denied"
 	// before reaching userspace. SuperISO's existing build-iso.sh sets
 	// the same flag for the same reason.
+	// rd.live.overlay.size=8192: size in MiB for the tmpfs that backs
+	// the live overlay upper layer. The default (~half of RAM) is often
+	// only 1-2 GiB on 8 GiB machines. The offline bootc installer
+	// (fisherman / podman run) writes container layers to the overlay
+	// root before they can be redirected to the target disk, filling
+	// it and aborting the install. 8 GiB is large enough for any
+	// single bazzite/aurora/bluefin image pull without exceeding
+	// the 16 GiB machines this ISO targets.
 	return fmt.Sprintf(
 		"root=live:CDLABEL=%s rd.live.image rd.live.dir=LiveOS rd.live.squashimg=%s.rootfs.sfs"+
-			" rd.live.overlay.overlayfs=1 enforcing=0"+
+			" rd.live.overlay.overlayfs=1 rd.live.overlay.size=8192 enforcing=0"+
 			" tacklebox.env=%s console=ttyS0,115200n8",
 		label, envID, envID,
 	)

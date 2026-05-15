@@ -135,14 +135,13 @@ func copyLocalImageToOfflineStore(img, storeRoot, storeRunRoot string) error {
 	dest := fmt.Sprintf("containers-storage:[overlay@%s+%s]%s", storeRoot, storeRunRoot, img)
 	fmt.Printf(">>> [offline-store] copying %s from local containers-storage -> embedded store\n", img)
 
-	skopeo := UserCommandPrefix("timeout")
-	args := append(skopeo[1:],
-		fmt.Sprintf("%d", timeoutSeconds),
-		"skopeo", "copy",
-		"--remove-signatures",
-		"containers-storage:"+img,
-		dest)
-	if err := runner.Run(skopeo[0], args...); err != nil {
+	script := fmt.Sprintf(
+		"timeout %d skopeo copy --remove-signatures %s %s",
+		timeoutSeconds,
+		shellEsc("containers-storage:"+img),
+		shellEsc(dest),
+	)
+	if err := RunUnshare(script); err != nil {
 		return fmt.Errorf("copy %s into offline store from local containers-storage: %w", img, err)
 	}
 	return nil

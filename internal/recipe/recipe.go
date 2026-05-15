@@ -35,6 +35,7 @@ type MediaRecipe struct {
 	Size                 string                `json:"size"`
 	SharedStore          SharedStore           `json:"shared_store"`
 	Partitions           Partitions            `json:"partitions,omitempty"`
+	DefaultBoot          string                `json:"default_boot,omitempty"`
 	BootableEnvironments []BootableEnvironment `json:"bootable_environments"`
 	OfflinePayloads      []string              `json:"offline_payloads"`
 }

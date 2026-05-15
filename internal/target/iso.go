@@ -50,6 +50,9 @@ type IsoTarget struct {
 	// Finalize. Defaults to the first env's image; set explicitly if
 	// none of the envs ship sd-boot.
 	EFISource string
+	// DefaultBootEntry is a loader entry filename or glob understood by
+	// systemd-boot. Empty falls back to automatic selection.
+	DefaultBootEntry string
 
 	// Resolved during Prepare:
 	root       string // <OutputBase>/iso
@@ -63,15 +66,20 @@ type IsoTarget struct {
 	disarmed bool
 }
 
-func NewIsoTarget(outputBase, outputIso, label, efiSource string) *IsoTarget {
+func NewIsoTarget(outputBase, outputIso, label, efiSource string, defaultBootEntry ...string) *IsoTarget {
 	if label == "" {
 		label = "TACKLEBOX"
+	}
+	defaultEntry := ""
+	if len(defaultBootEntry) > 0 {
+		defaultEntry = defaultBootEntry[0]
 	}
 	return &IsoTarget{
 		OutputBase: outputBase,
 		OutputIso:  outputIso,
 		Label:      label,
 		EFISource:  efiSource,
+		DefaultBootEntry: defaultEntry,
 	}
 }
 
@@ -116,7 +124,11 @@ func (i *IsoTarget) Prepare(_ Track) (*Mountpoints, error) {
 	// loader.conf — same shape as BlockTarget's, but written here directly
 	// since for an ISO we don't use bootctl install (host bootctl writes
 	// to a real ESP, which we don't have at Prepare time).
-	loaderConf := "timeout 5\ndefault *\nconsole-mode max\neditor no\n"
+	defaultBoot := i.DefaultBootEntry
+	if defaultBoot == "" {
+		defaultBoot = "*"
+	}
+	loaderConf := fmt.Sprintf("timeout 5\ndefault %s\nconsole-mode max\neditor no\n", defaultBoot)
 	if err := os.WriteFile(filepath.Join(i.espStaging, "loader", "loader.conf"), []byte(loaderConf), 0644); err != nil {
 		return nil, fmt.Errorf("write loader.conf: %w", err)
 	}

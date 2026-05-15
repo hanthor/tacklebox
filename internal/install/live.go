@@ -251,6 +251,9 @@ func ExtractBootFiles(image string, destDir string) (string, error) {
 	if err := runner.Run("sudo", "mkdir", "-p", destDir); err != nil {
 		return "", err
 	}
+	if err := runner.Run("sudo", "chmod", "0755", destDir); err != nil {
+		return "", fmt.Errorf("chmod boot dir %s: %w", destDir, err)
+	}
 	s, err := fetchToStaging(image)
 	if err != nil {
 		return "", err
@@ -258,8 +261,14 @@ func ExtractBootFiles(image string, destDir string) (string, error) {
 	if err := runner.Run("sudo", "cp", filepath.Join(s.dir, "vmlinuz"), filepath.Join(destDir, "vmlinuz")); err != nil {
 		return "", fmt.Errorf("copy vmlinuz from staging: %w", err)
 	}
+	if err := runner.Run("sudo", "chmod", "0644", filepath.Join(destDir, "vmlinuz")); err != nil {
+		return "", fmt.Errorf("chmod vmlinuz in dest: %w", err)
+	}
 	if err := runner.Run("sudo", "cp", filepath.Join(s.dir, "initrd.img"), filepath.Join(destDir, "initrd.img")); err != nil {
 		return "", fmt.Errorf("copy initrd from staging: %w", err)
+	}
+	if err := runner.Run("sudo", "chmod", "0644", filepath.Join(destDir, "initrd.img")); err != nil {
+		return "", fmt.Errorf("chmod initrd in dest: %w", err)
 	}
 	return s.kver, nil
 }

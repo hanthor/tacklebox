@@ -174,7 +174,11 @@ func runBuild(cmd *cobra.Command, args []string) error {
 		// live containers ship systemd-boot under
 		// /usr/lib/systemd/boot/efi/ — see live/Containerfile.generic.
 		efiSource := r.BootableEnvironments[0].Image
-		isoTgt := target.NewIsoTarget(outputBase, isoOut, r.MediaName, efiSource)
+		defaultBoot := r.DefaultBoot
+		if defaultBoot != "" && !strings.HasSuffix(defaultBoot, ".conf") {
+			defaultBoot += ".conf"
+		}
+		isoTgt := target.NewIsoTarget(outputBase, isoOut, r.MediaName, efiSource, defaultBoot)
 		tgt = isoTgt
 	} else {
 		// Block target: derive GPT partition layout from recipe size.
@@ -495,6 +499,9 @@ func installEnvBootc(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt t
 	if err := runner.Run("sudo", "mkdir", "-p", bootDir); err != nil {
 		return fmt.Errorf("create boot dir %s: %w", bootDir, err)
 	}
+	if err := runner.Run("sudo", "chmod", "0755", bootDir); err != nil {
+		return fmt.Errorf("chmod boot dir %s: %w", bootDir, err)
+	}
 	var kver string
 	if err := track("extract:"+env.ID, func() error {
 		var err error
@@ -560,6 +567,9 @@ func installEnvLive(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt ta
 	bootDir := filepath.Join(espMount, "images", "pxeboot", env.ID)
 	if err := runner.Run("sudo", "mkdir", "-p", bootDir); err != nil {
 		return fmt.Errorf("create boot dir %s: %w", bootDir, err)
+	}
+	if err := runner.Run("sudo", "chmod", "0755", bootDir); err != nil {
+		return fmt.Errorf("chmod boot dir %s: %w", bootDir, err)
 	}
 	var kver string
 	if err := track("extract:"+env.ID, func() error {

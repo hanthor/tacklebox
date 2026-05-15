@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 
 	"github.com/tuna-os/tacklebox/internal/runner"
 )
@@ -18,29 +19,37 @@ import (
 // access.
 //
 // IsoTarget: caller writes to <isoRoot>/LiveOS/store.squashfs.img.
-//   dmsquash-live mounts the ISO at /run/initramfs/live, so the live container's
-//   superiso-store.mount finds it at
-//   /run/initramfs/live/LiveOS/store.squashfs.img  — already wired in
-//   live/src/systemd/superiso-store.mount.
+//
+//	dmsquash-live mounts the ISO at /run/initramfs/live, so the live container's
+//	superiso-store.mount finds it at
+//	/run/initramfs/live/LiveOS/store.squashfs.img  — already wired in
+//	live/src/systemd/superiso-store.mount.
 //
 // BlockTarget: caller writes to the root of TBOX_STORE as
-//   tbox-containers.squashfs. A provisioned systemd unit (see
-//   ProvisionStoreMountBlock) mounts it at /var/lib/superiso-store inside
-//   each deployed env via /sysroot (the physical-root mount point that ostree
-//   keeps live after switch_root).
+//
+//	tbox-containers.squashfs. A provisioned systemd unit (see
+//	ProvisionStoreMountBlock) mounts it at /var/lib/superiso-store inside
+//	each deployed env via /sysroot (the physical-root mount point that ostree
+//	keeps live after switch_root).
 func BuildOfflineStore(images []string, stagingRoot, dstSquashfs string) error {
 	if len(images) == 0 {
 		return nil
 	}
 
 	storeRoot := filepath.Join(stagingRoot, "tbox-offline-store")
-	storeRunRoot := filepath.Join(stagingRoot, "tbox-offline-run")
+	// Podman enforces a 50-character max runroot path on some runner builds.
+	// Keep runroot in /tmp to stay within that limit even when stagingRoot is long.
+	storeRunRoot, err := os.MkdirTemp("/tmp", "tbox-offrun-")
+	if err != nil {
+		return fmt.Errorf("create offline runroot: %w", err)
+	}
+	defer os.RemoveAll(storeRunRoot)
 
 	// Must be world-writable: tacklebox runs as root (sudo) so os.MkdirAll
 	// creates root-owned dirs, but the SUDO_USER running inside podman unshare
 	// needs write access. os.Chmod bypasses the process umask.
 	for _, d := range []string{storeRoot, storeRunRoot} {
-		if err := os.RemoveAll(d); err != nil {
+		if err := ClearEnvDir(d); err != nil {
 			return fmt.Errorf("clear %s: %w", d, err)
 		}
 		if err := os.MkdirAll(d, 0777); err != nil {
@@ -54,12 +63,8 @@ func BuildOfflineStore(images []string, stagingRoot, dstSquashfs string) error {
 	// Pull each image inside podman unshare: user-namespace overlay gives
 	// correct UID mappings and deduplication across shared base layers.
 	for _, img := range images {
-		fmt.Printf(">>> [offline-store] pulling %s (podman unshare)\n", img)
-		script := fmt.Sprintf(
-			"podman --root %s --runroot %s pull %s",
-			shellEsc(storeRoot), shellEsc(storeRunRoot), shellEsc(img))
-		if err := RunUnshare(script); err != nil {
-			return fmt.Errorf("pull %s into offline store: %w", img, err)
+		if err := copyLocalImageToOfflineStore(img, storeRoot, storeRunRoot); err != nil {
+			return err
 		}
 	}
 
@@ -107,6 +112,38 @@ func BuildOfflineStore(images []string, stagingRoot, dstSquashfs string) error {
 	}
 	if err := runner.Run("sudo", "mv", tmpPath, dstSquashfs); err != nil {
 		return fmt.Errorf("move store squashfs to %s: %w", dstSquashfs, err)
+	}
+	return nil
+}
+
+func copyLocalImageToOfflineStore(img, storeRoot, storeRunRoot string) error {
+	podman := UserPodmanPrefix()
+	podmanArgs := append(podman[1:], "image", "exists", img)
+	if err := runner.Run(podman[0], podmanArgs...); err != nil {
+		return fmt.Errorf("offline payload %s is not present in the builder podman store; pre-pull it before ISO assembly: %w", img, err)
+	}
+
+	timeoutSeconds := 1800
+	if raw := os.Getenv("TACKLEBOX_OFFLINE_COPY_TIMEOUT"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			return fmt.Errorf("invalid TACKLEBOX_OFFLINE_COPY_TIMEOUT %q", raw)
+		}
+		timeoutSeconds = parsed
+	}
+
+	dest := fmt.Sprintf("containers-storage:[overlay@%s+%s]%s", storeRoot, storeRunRoot, img)
+	fmt.Printf(">>> [offline-store] copying %s from local containers-storage -> embedded store\n", img)
+
+	skopeo := UserCommandPrefix("timeout")
+	args := append(skopeo[1:],
+		fmt.Sprintf("%d", timeoutSeconds),
+		"skopeo", "copy",
+		"--remove-signatures",
+		"containers-storage:"+img,
+		dest)
+	if err := runner.Run(skopeo[0], args...); err != nil {
+		return fmt.Errorf("copy %s into offline store from local containers-storage: %w", img, err)
 	}
 	return nil
 }

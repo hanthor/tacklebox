@@ -6,7 +6,7 @@ import (
 	"github.com/tuna-os/tacklebox/internal/runner"
 )
 
-// UserPodmanPrefix returns the command prefix for running podman as the
+// UserCommandPrefix returns the command prefix for running a command as the
 // original (non-root) user when tacklebox has been invoked via sudo.
 //
 // The problem it solves:
@@ -18,21 +18,34 @@ import (
 //
 // When SUDO_USER is set, this returns a prefix that drops back to that user:
 //
-//	["sudo", "-u", "<SUDO_USER>", "-H", "--preserve-env=PATH", "podman"]
+//	["sudo", "-u", "<SUDO_USER>", "-H", "--preserve-env=PATH", "<command>"]
 //
 // If SUDO_USER is not set (running as root directly, or as the target user
 // already) returns ["podman"] unchanged.
-func UserPodmanPrefix() []string {
+func UserCommandPrefix(command string) []string {
 	sudoUser := os.Getenv("SUDO_USER")
 	if sudoUser == "" || sudoUser == "root" {
-		return []string{"podman"}
+		return []string{command}
 	}
 	// -H   : set HOME to the target user's home so podman finds its config,
 	//        XDG_RUNTIME_DIR, and container storage correctly.
-	// --preserve-env=PATH : keep the caller's PATH so the user's podman
-	//        binary (e.g. linuxbrew) is found rather than /usr/bin/podman.
-	return []string{"sudo", "-u", sudoUser, "-H", "--preserve-env=PATH", "podman"}
+	// --preserve-env keeps caller-provided runtime/storage roots when building
+	// large media in constrained environments (e.g. /var/home nearly full).
+	// PATH is required so the user's podman binary (e.g. linuxbrew) is found.
+	// TMPDIR/XDG_* and CONTAINERS_STORAGE_CONF are optional but critical when
+	// callers intentionally redirect scratch/storage into /var/tmp.
+	return []string{
+		"sudo",
+		"-u", sudoUser,
+		"-H",
+		"--preserve-env=PATH,TMPDIR,XDG_RUNTIME_DIR,XDG_DATA_HOME,CONTAINERS_STORAGE_CONF",
+		command,
+	}
 }
+
+// UserPodmanPrefix returns the command prefix for running podman as the
+// original user.
+func UserPodmanPrefix() []string { return UserCommandPrefix("podman") }
 
 // RunUnshare executes a shell script inside `podman unshare` as the
 // original (non-root) user. This is required for:

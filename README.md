@@ -42,6 +42,23 @@ sudo tacklebox build recipe.json --xz
 sudo tacklebox build recipe.json /dev/sda
 ```
 
+### Refresh an Existing USB / Image
+Re-installs all environments from a recipe without wiping the `TBOX_PERSIST` partition.
+Useful when you add an env to the recipe, change image refs, or need to refresh stale deployments.
+```bash
+sudo tacklebox update recipe.json /dev/sda
+```
+
+### Check Installed Environments
+```bash
+# Auto-detect the TBOX_STORE partition (run from a booted tacklebox env)
+tacklebox status
+
+# Inspect a specific store mount or raw image file
+tacklebox status /mnt/tbx
+tacklebox status /path/to/tacklebox.img
+```
+
 ## 📋 Recipe Schema
 
 Tacklebox is driven by simple JSON recipes:

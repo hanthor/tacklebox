@@ -32,8 +32,10 @@ tacklebox/
 ├── cmd/tacklebox/             # CLI entry points (cobra subcommands)
 │   ├── main.go                # root command + persistent --output-base flag
 │   ├── build.go               # the `build` orchestrator
-│   ├── verify.go              # the `verify` regression-checker
-│   └── update_all.go          # boot-time cross-env updater
+│   ├── update.go              # the `update` command (host-side USB refresh)
+│   ├── update_all.go          # `update-all` boot-time cross-env updater
+│   ├── status.go              # the `status` command (inspect installed envs)
+│   └── verify.go              # the `verify` regression-checker
 ├── internal/
 │   ├── recipe/                # JSON recipe schema
 │   ├── target/                # Target interface + implementations
@@ -139,6 +141,21 @@ built artifact. Auto-detects type by `.iso` suffix:
 The distinctness check is the regression baseline for the cross-env
 collision bug (see TODO.md §Bugs). Two envs sharing one ostree commit
 hash → exit 1.
+
+## The `update` command
+
+`tacklebox update <recipe.json> <target>` (`cmd/tacklebox/update.go`) re-installs
+every bootable environment on an existing media **without** reformatting or wiping
+`TBOX_PERSIST`. The difference from `build`:
+
+- No partitioning (`sgdisk`, `mkfs`) — the ESP and STORE are mounted and reused.
+- Each env's `tbox-install/<id>` subtree is cleared and repopulated via the same
+  `bootc install to-filesystem` pipeline as `build`.
+- BLS entries for envs present in the recipe are overwritten; entries for envs NOT
+  in the recipe are left untouched (additive).
+
+Use this when you change an image ref in the recipe, add a new env, or want to
+refresh stale deployments without erasing user persistence data.
 
 ## Cross-env updates: the boot-time timer
 

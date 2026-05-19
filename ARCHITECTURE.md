@@ -45,6 +45,7 @@ tacklebox/
 │   ├── install/               # per-env install backends
 │   │   ├── bootc.go           # `bootc install to-filesystem` (block)
 │   │   ├── live.go            # podman image mount + mksquashfs (ISO)
+│   │   ├── initramfs.go       # initramfs preparation + dracut rebuild + cache
 │   │   └── bootloader.go      # systemd-boot install + BLS entry writer
 │   ├── blockdev/              # sgdisk + mkfs wrappers
 │   └── runner/                # subprocess wrapper (verbose toggle, sudo)
@@ -71,13 +72,22 @@ tacklebox/
    - BlockTarget: `truncate` + `losetup` + `sgdisk` + `mkfs` + `mount` ESP+STORE + `bootctl install`.
    - IsoTarget: scratch `iso-root/` + `esp-staging/` dirs.
 6. **Pre-pull** all unique image refs in parallel.
-7. **Per-env install loop** (`installEnv`), dispatched on `Target.InstallMode()`:
+7. **Initramfs preparation** (`install.PrepareInitramfs`), per env:
+   - Compute cache key from OCI image digest + required module set.
+   - **Cache hit** (`<output-base>/initramfs-cache/<key>.img`): use as-is, no rebuild.
+   - **Cache miss**: run `dracut` inside a privileged container derived from the
+     image, bind-mounting `src/dracut/95tbox-root/` in. Module set is determined
+     by target type — ISO: `[dmsquash-live, tbox-root]`; Block: `[tbox-root]`.
+     Write result to cache keyed by digest so subsequent builds are instant.
+   - Skipped entirely when `"skip_initramfs_rebuild": true` is set on the env
+     (use this for images that already ship the required modules).
+8. **Per-env install loop** (`installEnv`), dispatched on `Target.InstallMode()`:
    - `Bootc`: `podman run … <image> bootc install to-filesystem … --stateroot <env> /target`,
      followed by `ExtractBootFiles` (vmlinuz + initrd into the ESP).
    - `Live`: `podman image mount` + `mksquashfs` into `LiveOS/<env>.rootfs.sfs`,
      followed by `ExtractBootFiles` into `images/pxeboot/<env>/`.
    - Both: write a BLS entry under `loader/entries/<env>.conf`.
-8. **`Target.Finalize(track)`** returns the artifact path.
+9. **`Target.Finalize(track)`** returns the artifact path.
    - BlockTarget: unmount + detach loop. Returns the .img / device path.
    - IsoTarget: extract sd-boot from EFISource, mirror pxeboot to iso-root,
      `mkfs.fat` + mtools the ESP image, run `xorriso` to wrap iso-root.

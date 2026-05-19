@@ -11,9 +11,14 @@ UEFI-bootable ISO from one or more bootc container images using Tacklebox.
 
 1. Each bootable environment is packed into a squashfs file
    (`LiveOS/<id>.rootfs.sfs`) using `podman image mount` + `mksquashfs`.
-2. The systemd-boot EFI binary is extracted from the first image in your recipe
-   (it must ship `/usr/lib/systemd/boot/efi/systemd-bootx64.efi`).
-3. `xorriso` wraps everything into an ISO9660+El Torito image that boots on
+2. Before copying the initramfs to the ESP, Tacklebox checks whether the image's
+   initramfs contains the modules required for live ISO boot (`dmsquash-live`,
+   `tbox-root`). If not, it rebuilds the initramfs automatically by running
+   `dracut` inside a privileged container. The result is cached by OCI image
+   digest — the rebuild only happens on the **first** build or after an image
+   update.
+3. The systemd-boot EFI binary is extracted from the first image in your recipe.
+4. `xorriso` wraps everything into an ISO9660+El Torito image that boots on
    real hardware and QEMU.
 
 At runtime the ISO boots via `dmsquash-live`. Each env's squashfs is loop-mounted
@@ -21,54 +26,10 @@ and an overlayfs on top gives you a writable (but ephemeral) root. **No disk is
 written.** Persistent mode is not supported for ISO targets — use a block target
 (USB drive) if you need persistence.
 
----
-
-## Image requirement: the `95tbox-root` dracut module
-
-> **This is the single most important prerequisite.**
-
-Tacklebox does not patch the initramfs it finds inside your container image.
-For a multi-env ISO (more than one `bootable_environment`) the initramfs
-**must** include the `95tbox-root` dracut module so the kernel can pivot to the
-correct squashfs at boot. Without it, boot stalls at `initrd-switch-root`.
-
-You have two options:
-
-### Option A — Use pre-built superiso-live images (easiest)
-
-The `superiso` project publishes images that already include the module, e.g.:
-
-```
-ghcr.io/tuna-os/superiso-live-bluefin:latest
-ghcr.io/tuna-os/superiso-live-bazzite:latest
-ghcr.io/tuna-os/superiso-live-aurora:latest
-```
-
-Reference these directly in your recipe and you're done.
-
-### Option B — Bake the module into your own image
-
-Fork or derive from a bootc image and add a layer that installs the dracut
-module and rebuilds the initramfs. The superiso `live/Containerfile.generic`
-is the canonical example:
-
-```dockerfile
-FROM ghcr.io/ublue-os/bluefin:stable
-
-# Copy the tacklebox dracut module into the image
-COPY --from=ghcr.io/tuna-os/tacklebox:latest \
-     /usr/lib/dracut/modules.d/95tbox-root \
-     /usr/lib/dracut/modules.d/95tbox-root
-
-# Rebuild the initramfs with the new module
-RUN DRACUT_NO_XATTR=1 dracut -v --force --zstd --reproducible --no-hostonly \
-        --add 'dmsquash-live tbox-root' \
-        /usr/lib/modules/$(ls /usr/lib/modules)/initramfs.img \
-        $(ls /usr/lib/modules)
-```
-
-Build and push this image (e.g. `ghcr.io/your-org/my-live-image:latest`) then
-reference it in your recipe.
+**Performance note:** The first build is ~2–3 min slower per environment due to
+the dracut rebuild. Subsequent builds hit the cache and add no overhead. If your
+images already include `dmsquash-live` and `tbox-root`, set
+`"skip_initramfs_rebuild": true` in the env to skip the rebuild.
 
 ---
 
@@ -108,14 +69,20 @@ ISO recipes are identical to block recipes except:
   "bootable_environments": [
     {
       "id": "bluefin",
-      "image": "ghcr.io/tuna-os/superiso-live-bluefin:latest",
+      "image": "ghcr.io/ublue-os/bluefin:stable",
       "desktop": "gnome",
       "modes": ["live"]
     },
     {
       "id": "bazzite",
-      "image": "ghcr.io/tuna-os/superiso-live-bazzite:latest",
+      "image": "ghcr.io/ublue-os/bazzite:stable",
       "desktop": "kde",
+      "modes": ["live"]
+    },
+    {
+      "id": "bluefin-prepared",
+      "image": "ghcr.io/tuna-os/superiso-live-bluefin:latest",
+      "skip_initramfs_rebuild": true,
       "modes": ["live"]
     }
   ]
@@ -259,7 +226,7 @@ jobs:
 | Log in to GHCR | Allows pulling private or rate-limited container images |
 | Build tacklebox | Compiles the binary from source; pin to a tag for reproducibility |
 | Pre-pull images | Parallel pull so build step doesn't time out on network I/O |
-| Build ISO | Runs `tacklebox build --iso`; output lands in `/mnt` (more space) |
+| Build ISO | Runs `tacklebox build --iso`; initramfs rebuild is automatic if needed |
 | Verify ISO | Sanity-checks BLS entries and squashfs distinctness |
 | Upload artifact | ISO is available for 14 days from the Actions run |
 | Create release | Attaches the ISO to a GitHub Release when you push a tag |
@@ -302,9 +269,10 @@ Then in the workflow:
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Boot stalls at `initrd-switch-root` | `95tbox-root` module missing from initramfs | Use superiso-live images or bake the module in (Option B above) |
+| Boot stalls at `initrd-switch-root` | Image lacks `dracut`; initramfs rebuild failed silently | Check build logs for dracut errors; set `"skip_initramfs_rebuild": true` and provide a pre-prepared image if dracut is not available |
+| First build unexpectedly slow | Dracut initramfs rebuild running (normal on first build per image) | Expected; subsequent builds use the cache |
 | `tacklebox verify` fails: "same squashfs hash" | Two envs resolved to the identical container image | Use distinct image refs or check your registry tags |
 | `xorriso` not found | Missing dep | `sudo apt-get install xorriso` |
 | Build runs out of disk | squashfs staging fills `/` | Move output to `/mnt` with `-b /mnt/tbx`, or increase free disk |
-| Runner timeout | Large images, slow pull | Pre-pull with `podman pull` before build step; or increase `timeout-minutes` |
+| Runner timeout | Large images, slow pull or dracut rebuild | Pre-pull with `podman pull`; increase `timeout-minutes`; set `skip_initramfs_rebuild: true` for pre-prepared images |
 | `systemd-bootx64.efi` not found in image | Image doesn't ship `systemd-boot` | Ensure your base image includes the `systemd-boot` package |

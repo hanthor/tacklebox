@@ -16,13 +16,29 @@ Born from the `superiso` project, Tacklebox evolves the concept from static ISOs
 
 ## 🏗️ Architecture
 
-### `tbox-root` Dracut Module
-Tacklebox ships with a custom dracut module (`src/dracut/95tbox-root/`) that handles the heavy lifting of multi-tenancy. At boot time, it:
+### Automatic initramfs preparation
+Tacklebox ships with a custom dracut module (`src/dracut/95tbox-root/`) that handles multi-tenancy at boot time:
 1.  Locates the target OS subdirectory on the `TBOX_STORE` partition.
 2.  Bind-mounts it to `/sysroot`.
 3.  Sets up the persistent home overlay if requested.
 
-> **Image requirement:** Tacklebox does not patch the booted initramfs; it simply extracts whatever `/usr/lib/modules/<kver>/initramfs.img` is shipped inside the source bootc image. **For `switch_root` to succeed, the source image must already include the `95tbox-root` dracut module.** In the superiso parent project, `live/Containerfile.ublue` bakes this in via `--add tbox-root` during a Debian-stage dracut rebuild. Stock upstream images (`ghcr.io/ublue-os/bluefin:stable`, etc.) lack the module and will halt at `initrd-switch-root.service`. Use the transformed `localhost/superiso-live-*:latest` references in your recipes for fully-booting media.
+Before placing the initramfs on the ESP, Tacklebox checks whether the image's
+initramfs already contains the required modules. If not, it rebuilds it
+automatically by running `dracut` inside a privileged container derived from
+the source image — no pre-processing of your images required. The rebuilt
+initramfs is cached by OCI image digest, so the overhead only occurs on the
+first build or after an image update.
+
+**Modules injected automatically:**
+
+| Target type | Modules added |
+|---|---|
+| ISO (`--iso`) | `dmsquash-live`, `tbox-root` |
+| Block / USB | `tbox-root` |
+
+If your image already ships the required modules (e.g. pre-built `superiso-live`
+images), add `"skip_initramfs_rebuild": true` to the environment in your recipe
+to skip the rebuild and use the image's initramfs as-is.
 
 ### Composefs Support
 Tacklebox automatically handles the unique requirements of the Composefs backend, including:
@@ -78,14 +94,19 @@ Tacklebox is driven by simple JSON recipes:
   "bootable_environments": [
     {
       "id": "bluefin",
-      "image": "localhost/superiso-live-bluefin:latest",
+      "image": "ghcr.io/ublue-os/bluefin:stable",
       "modes": ["live", "persistent"]
     },
     {
-      "id": "dakota",
-      "image": "localhost/superiso-live-dakota:latest",
-      "backend": "composefs",
+      "id": "bazzite",
+      "image": "ghcr.io/ublue-os/bazzite:stable",
       "modes": ["live"]
+    },
+    {
+      "id": "bluefin-prepared",
+      "image": "ghcr.io/tuna-os/superiso-live-bluefin:latest",
+      "skip_initramfs_rebuild": true,
+      "modes": ["live", "persistent"]
     }
   ]
 }
@@ -94,6 +115,11 @@ Tacklebox is driven by simple JSON recipes:
 The `partitions` block is optional. By default Tacklebox uses ESP=1 GiB,
 Persist=2 GiB, and Store=remainder. Provide explicit sizes when you need a
 larger ESP (more kernels), more persistent space, or want to leave headroom.
+
+`skip_initramfs_rebuild` is optional (default `false`). Set it to `true` for
+images that already include `dmsquash-live` and `tbox-root` in their initramfs
+(e.g. pre-built `superiso-live` images) to skip the rebuild step and save
+2–3 minutes per environment on the first build.
 
 > **Sizing rule of thumb:** ostree-backed bootc deployments occupy ~10 GiB
 > each, composefs-backed ones ~5 GiB. A 30 GiB recipe is enough for one

@@ -40,7 +40,7 @@ func TestDefaultRun_VerboseFormat(t *testing.T) {
 	origStdout := os.Stdout
 	origStderr := os.Stderr
 	rOut, wOut, _ := os.Pipe()
-	rErr, wErr, _ := os.Pipe()
+	_, wErr, _ := os.Pipe()
 	os.Stdout = wOut
 	os.Stderr = wErr
 
@@ -79,7 +79,7 @@ func TestDefaultRun_QuietMode(t *testing.T) {
 	origStdout := os.Stdout
 	origStderr := os.Stderr
 	rOut, wOut, _ := os.Pipe()
-	rErr, wErr, _ := os.Pipe()
+	_, wErr, _ := os.Pipe()
 	os.Stdout = wOut
 	os.Stderr = wErr
 

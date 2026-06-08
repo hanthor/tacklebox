@@ -1,0 +1,106 @@
+package install
+
+import (
+	"os"
+	"reflect"
+	"testing"
+)
+
+func TestUserCommandPrefix_NoSudoUser(t *testing.T) {
+	// When SUDO_USER is not set, return the command unchanged.
+	os.Unsetenv("SUDO_USER")
+	got := UserCommandPrefix("podman")
+	want := []string{"podman"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("UserCommandPrefix = %v, want %v", got, want)
+	}
+}
+
+func TestUserCommandPrefix_SudoUserSet(t *testing.T) {
+	os.Setenv("SUDO_USER", "alice")
+	defer os.Unsetenv("SUDO_USER")
+
+	got := UserCommandPrefix("podman")
+	if len(got) < 6 {
+		t.Fatalf("expected at least 6 elements, got %d: %v", len(got), got)
+	}
+	if got[0] != "sudo" {
+		t.Errorf("first arg = %q, want sudo", got[0])
+	}
+	if got[1] != "-u" {
+		t.Errorf("second arg = %q, want -u", got[1])
+	}
+	if got[2] != "alice" {
+		t.Errorf("user arg = %q, want alice", got[2])
+	}
+	if got[3] != "-H" {
+		t.Errorf("fourth arg = %q, want -H", got[3])
+	}
+	if got[len(got)-1] != "podman" {
+		t.Errorf("last arg = %q, want podman", got[len(got)-1])
+	}
+
+	// --preserve-env must be present with the expected env vars.
+	found := false
+	for _, a := range got {
+		if a == "--preserve-env=PATH,TMPDIR,XDG_RUNTIME_DIR,XDG_DATA_HOME,CONTAINERS_STORAGE_CONF" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("--preserve-env not found in %v", got)
+	}
+}
+
+func TestUserCommandPrefix_SudoUserIsRoot(t *testing.T) {
+	os.Setenv("SUDO_USER", "root")
+	defer os.Unsetenv("SUDO_USER")
+
+	got := UserCommandPrefix("podman")
+	want := []string{"podman"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("UserCommandPrefix with SUDO_USER=root = %v, want %v", got, want)
+	}
+}
+
+func TestUserCommandPrefix_EmptySudoUser(t *testing.T) {
+	os.Setenv("SUDO_USER", "")
+	defer os.Unsetenv("SUDO_USER")
+
+	got := UserCommandPrefix("podman")
+	want := []string{"podman"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("UserCommandPrefix with empty SUDO_USER = %v, want %v", got, want)
+	}
+}
+
+func TestUserPodmanPrefix(t *testing.T) {
+	os.Unsetenv("SUDO_USER")
+	got := UserPodmanPrefix()
+	want := []string{"podman"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("UserPodmanPrefix = %v, want %v", got, want)
+	}
+}
+
+func TestUserPodmanPrefix_WithSudoUser(t *testing.T) {
+	os.Setenv("SUDO_USER", "bob")
+	defer os.Unsetenv("SUDO_USER")
+
+	got := UserPodmanPrefix()
+	// Should be UserCommandPrefix("podman").
+	if len(got) < 6 || got[len(got)-1] != "podman" {
+		t.Errorf("UserPodmanPrefix = %v, last element should be podman", got)
+	}
+}
+
+func TestUserCommandPrefix_ArbitraryCommand(t *testing.T) {
+	os.Setenv("SUDO_USER", "carol")
+	defer os.Unsetenv("SUDO_USER")
+
+	got := UserCommandPrefix("skopeo")
+	if got[len(got)-1] != "skopeo" {
+		t.Errorf("last arg = %q, want skopeo", got[len(got)-1])
+	}
+}

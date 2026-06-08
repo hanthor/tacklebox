@@ -116,7 +116,7 @@ func TestDefaultRun_ErrorReturned(t *testing.T) {
 	defer func() { Verbose = savedVerbose }()
 
 	origStdout := os.Stdout
-	rOut, wOut, _ := os.Pipe()
+	_, wOut, _ := os.Pipe()
 	os.Stdout = wOut
 	defer func() { os.Stdout = origStdout }()
 

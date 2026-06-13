@@ -234,93 +234,98 @@ func TestIsoTarget_Finalize_WithEFISource(t *testing.T) {
 	tmp := t.TempDir()
 	it := NewIsoTarget(tmp, filepath.Join(tmp, "test.iso"), "TBX", "some-image:latest")
 
-	// Fill in Prepare-level fields that Finalize expects.
-	it.root = filepath.Join(tmp, "iso")
-	it.isoRoot = filepath.Join(tmp, "iso", "iso-root")
-	it.espStaging = filepath.Join(tmp, "iso", "esp-staging")
-
-	// Create required dirs + a fake env pxeboot entry.
-	os.MkdirAll(filepath.Join(it.espStaging, "images", "pxeboot", "testenv"), 0755)
-	os.MkdirAll(filepath.Join(it.espStaging, "EFI", "BOOT"), 0755)
-	// Write a fake EFI binary
-	os.WriteFile(filepath.Join(it.espStaging, "EFI", "BOOT", "BOOTX64.EFI"), []byte("fake"), 0644)
-
-	// Create the minimal isoRoot structure.
-	os.MkdirAll(filepath.Join(it.isoRoot, "EFI", "BOOT"), 0755)
-	os.MkdirAll(filepath.Join(it.isoRoot, "images", "pxeboot"), 0755)
-
+	// Prepare sets up the required directory structure and internal state.
 	oldRunFn := runner.RunFn
-	oldOutputFn := runner.OutputFn
-	defer func() {
-		runner.RunFn = oldRunFn
-		runner.OutputFn = oldOutputFn
-	}()
+	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
+	defer func() { runner.RunFn = oldRunFn }()
 
-	runner.OutputFn = func(name string, args ...string) ([]byte, error) {
-		if name == "sudo" && len(args) >= 1 && args[0] == "du" {
-			return []byte("1024\t/path\n"), nil
-		}
-		return nil, nil
+	_, err := it.Prepare(nil)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
 	}
 
-	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
-
-	// Will fail at ExtractEFIBinary since we don't have a real container.
-	// This tests that Finalize validates EFI extraction before proceeding.
-	_, err := it.Finalize(nil)
+	// Finalize will fail at ExtractEFIBinary — we don't have a real
+	// container to extract from. But it should fail with a clear error,
+	// not a nil-pointer crash.
+	_, err = it.Finalize(nil)
 	if err == nil {
-		t.Log("Finalize succeeded (unexpected without real skopeo)")
-	} else {
-		t.Logf("Finalize error (expected): %v", err)
+		t.Fatal("expected error from Finalize without real EFI source")
+	}
+	// The error should mention the missing EFI binary, not an internal
+	// failure like nil deref.
+	if !strings.Contains(err.Error(), "EFI") && !strings.Contains(err.Error(), "systemd-boot") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 
+// TestIsoTarget_AssembleEspImage is a smoke test for the ESP image assembly
+// pipeline. It calls the unexported assembleEspImage directly because the
+// full Finalize path requires a real container runtime for EFI extraction.
+// The integration-level verification of the full pipeline lives in
+// verify-smoke CI.
 func TestIsoTarget_AssembleEspImage(t *testing.T) {
 	tmp := t.TempDir()
 	it := NewIsoTarget(tmp, filepath.Join(tmp, "test.iso"), "TBX", "")
 
-	it.espStaging = filepath.Join(tmp, "esp-staging")
-	it.isoRoot = filepath.Join(tmp, "iso-root")
-
-	// Create staging content.
-	os.MkdirAll(filepath.Join(it.espStaging, "EFI", "BOOT"), 0755)
-	os.WriteFile(filepath.Join(it.espStaging, "EFI", "BOOT", "BOOTX64.EFI"), []byte("fake-efi"), 0644)
-
-	os.MkdirAll(filepath.Join(it.isoRoot, "EFI"), 0755)
-
 	oldRunFn := runner.RunFn
-	oldOutputFn := runner.OutputFn
-	defer func() {
-		runner.RunFn = oldRunFn
-		runner.OutputFn = oldOutputFn
-	}()
+	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
+	defer func() { runner.RunFn = oldRunFn }()
 
+	mps, err := it.Prepare(nil)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	// Write a fake EFI binary under the ESP staging area (which is mps.EspMount).
+	bootDir := filepath.Join(mps.EspMount, "EFI", "BOOT")
+	if err := os.WriteFile(filepath.Join(bootDir, "BOOTX64.EFI"), []byte("fake-efi"), 0644); err != nil {
+		t.Fatalf("write fake EFI: %v", err)
+	}
+
+	// isoRoot = parent of StoreMount (StoreMount is isoRoot/LiveOS).
+	isoRoot := filepath.Dir(mps.StoreMount)
+	if err := os.MkdirAll(filepath.Join(isoRoot, "EFI"), 0755); err != nil {
+		t.Fatalf("mkdir EFI: %v", err)
+	}
+
+	oldOutputFn := runner.OutputFn
 	runner.OutputFn = func(name string, args ...string) ([]byte, error) {
 		return []byte("512\n"), nil
 	}
-	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
+	defer func() { runner.OutputFn = oldOutputFn }()
 
-	err := it.assembleEspImage()
+	err = it.assembleEspImage()
 	if err != nil {
 		t.Fatalf("assembleEspImage: %v", err)
 	}
 }
 
+// TestIsoTarget_AssembleIso is a smoke test for the xorriso assembly
+// pipeline. Like AssembleEspImage, it calls the unexported assembleIso
+// directly because the full Finalize path requires EFI extraction.
 func TestIsoTarget_AssembleIso(t *testing.T) {
 	tmp := t.TempDir()
 	isoPath := filepath.Join(tmp, "test.iso")
 	it := NewIsoTarget(tmp, isoPath, "MYISO", "")
-	it.isoRoot = filepath.Join(tmp, "fake-root")
-
-	// Create the isoRoot dir so xorriso -map doesn't fail before it even starts.
-	os.MkdirAll(it.isoRoot, 0755)
 
 	oldRunFn := runner.RunFn
+	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
 	defer func() { runner.RunFn = oldRunFn }()
 
-	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
+	mps, err := it.Prepare(nil)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
 
-	err := it.assembleIso()
+	// isoRoot = parent of StoreMount.
+	isoRoot := filepath.Dir(mps.StoreMount)
+
+	// assembleIso maps isoRoot into the ISO via xorriso -map.
+	// The directory was already created by Prepare, so we just
+	// need the mock in place.
+	_ = isoRoot
+
+	err = it.assembleIso()
 	if err != nil {
 		t.Fatalf("assembleIso: %v", err)
 	}

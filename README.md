@@ -1,5 +1,7 @@
 # 🧰 Tacklebox
 
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
 **Tacklebox** is a high-performance orchestrator for `bootc` that provisions multi-tenant, updatable, and deduplicated bootable media (USB drives, SD cards, or raw disk images).
 
 Born from the `superiso` project, Tacklebox evolves the concept from static ISOs to dynamic, writable GPT disks with a unified bootloader.
@@ -68,9 +70,13 @@ sudo tacklebox update recipe.json /dev/sda
 ### Check Installed Environments
 ```bash
 # Auto-detect the TBOX_STORE partition (run from a booted tacklebox env)
+
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 tacklebox status
 
 # Inspect a specific store mount or raw image file
+
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 tacklebox status /mnt/tbx
 tacklebox status /path/to/tacklebox.img
 ```
@@ -151,12 +157,18 @@ Tacklebox uses `just` for common development tasks:
 
 ```bash
 # Build the binary
+
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 just build
 
 # Provision a test USB drive
+
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 just provision-usb device=/dev/sda recipe=examples/multi-test.json
 
 # Build a compressed distribution image
+
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 just build-xz
 ```
 

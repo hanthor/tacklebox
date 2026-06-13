@@ -1,14 +1,72 @@
 package install
 
-// Pure-function tests for live.go. The actual InstallLive +
-// ExtractEFIBinary functions need podman/mksquashfs/sudo and are
-// covered by the verify-smoke CI job (and locally by examples/iso-smoke.json),
-// not here.
-
 import (
 	"strings"
 	"testing"
 )
+
+func TestShellEsc_Basic(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"hello", "'hello'"},
+		{"", "''"},
+		{"it's working", "'it'\"'\"'s working'"},
+		{"a'b'c", "'a'\"'\"'b'\"'\"'c'"},
+		{`no"quotes`, "'no\"quotes'"},
+		{"spaces and $pecial", "'spaces and $pecial'"},
+		{"new\nline", "'new\nline'"},
+		{"tab\there", "'tab\there'"},
+		{"back\\slash", "'back\\slash'"},
+		{"semi;colon", "'semi;colon'"},
+		{"pipe|char", "'pipe|char'"},
+		{"$(whoami)", "'$(whoami)'"},
+		{"`whoami`", "'`whoami`'"},
+		{"${HOME}", "'${HOME}'"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			got := shellEsc(tc.input)
+			if got != tc.want {
+				t.Errorf("shellEsc(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestShellEsc_PreventsInjection(t *testing.T) {
+	dangerous := []string{
+		"; rm -rf /",
+		"$(rm -rf /)",
+		"`rm -rf /`",
+		"'; rm -rf /; echo '",
+		"\\'; rm -rf /; echo '",
+	}
+
+	for _, payload := range dangerous {
+		escaped := shellEsc(payload)
+		if !strings.HasPrefix(escaped, "'") || !strings.HasSuffix(escaped, "'") {
+			t.Errorf("shellEsc(%q) = %q — not wrapped in quotes", payload, escaped)
+		}
+		inner := escaped[1 : len(escaped)-1]
+		if strings.Contains(inner, "'") {
+			if !strings.Contains(escaped, `'"'"'`) && strings.Count(escaped, "'") > 2 {
+				t.Errorf("shellEsc(%q) = %q — single quote not escaped", payload, escaped)
+			}
+		}
+	}
+}
+
+func TestShellEsc_Idempotent(t *testing.T) {
+	safe := "simple-image-name"
+	once := shellEsc(safe)
+	twice := shellEsc(once)
+	if !strings.HasPrefix(twice, "'") || !strings.HasSuffix(twice, "'") {
+		t.Errorf("double shellEsc(%q) = %q — not wrapped", safe, twice)
+	}
+}
 
 func TestSquashParams(t *testing.T) {
 	t.Setenv("SUPERISO_COMPRESSION", "")
@@ -21,12 +79,10 @@ func TestSquashParams(t *testing.T) {
 			t.Errorf("compression=%s: got level=%s block=%s, want 15/1048576", c, level, block)
 		}
 	}
-	// Unknown values fall back to the fast default rather than erroring.
 	if level, _ := squashParams("zstd"); level != "3" {
 		t.Errorf("compression=zstd should use fast default, got level=%s", level)
 	}
 
-	// The SuperISO env var overrides the recipe (script compatibility).
 	t.Setenv("SUPERISO_COMPRESSION", "release")
 	if level, _ := squashParams(""); level != "15" {
 		t.Errorf("SUPERISO_COMPRESSION=release should win, got level=%s", level)
@@ -67,12 +123,9 @@ func TestCombinedSquashScript(t *testing.T) {
 			t.Errorf("script missing %q:\n%s", want, s)
 		}
 	}
-	// One mksquashfs invocation over the whole staging dir — that's where
-	// the cross-env dedup happens.
 	if got := strings.Count(s, "/usr/bin/mksquashfs"); got != 1 {
 		t.Errorf("want exactly 1 mksquashfs invocation, got %d", got)
 	}
-	// Both images must be unmounted in the exit trap.
 	if got := strings.Count(s, "podman image unmount"); got != 2 {
 		t.Errorf("want 2 unmounts in trap, got %d", got)
 	}

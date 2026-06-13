@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -39,9 +40,13 @@ func TestClearEnvDir_NoExist(t *testing.T) {
 	}
 }
 
-// TestClearEnvDir_NormalDir verifies ClearEnvDir removes a plain directory tree
-// (no immutable bits — simulates the fresh-build case).
+// TestClearEnvDir_NormalDir verifies ClearEnvDir removes a plain directory tree.
+// Requires sudo (for chattr + rm -rf). Skipped when sudo is not available.
 func TestClearEnvDir_NormalDir(t *testing.T) {
+	// ClearEnvDir uses RunCombined for the rm -rf step, which bypasses the
+	// runner mock. Skip if sudo is not available in the test environment.
+	skipIfNoSudo(t)
+
 	base := t.TempDir()
 	dir := filepath.Join(base, "env")
 	if err := os.MkdirAll(filepath.Join(dir, "sub1", "sub2"), 0755); err != nil {
@@ -58,6 +63,14 @@ func TestClearEnvDir_NormalDir(t *testing.T) {
 	}
 }
 
+// skipIfNoSudo skips the test when sudo is not found in PATH.
+func skipIfNoSudo(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("sudo"); err != nil {
+		t.Skip("sudo not available in test environment")
+	}
+}
+
 // TestPullUser_TargetsUserStore verifies PullUser pulls into the invoking
 // user's rootless store (via the SUDO_USER drop-back prefix), not root's
 // store — the regression guard for ISO builds double-pulling images.
@@ -69,9 +82,6 @@ func TestPullUser_TargetsUserStore(t *testing.T) {
 	var calls [][]string
 	runner.RunFn = func(_ io.Reader, name string, args ...string) error {
 		calls = append(calls, append([]string{name}, args...))
-		// First call is `… image exists …`; report "not present" so
-		// PullUser proceeds to pull. The podman subcommand is buried after
-		// the `sudo -u alice …` drop-back prefix, so match anywhere.
 		if contains(args, "exists") {
 			return errors.New("not present")
 		}
@@ -84,7 +94,6 @@ func TestPullUser_TargetsUserStore(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("want 2 calls (exists, pull), got %d: %#v", len(calls), calls)
 	}
-	// Both calls must drop back to alice's store via `sudo -u alice`.
 	for _, c := range calls {
 		if c[0] != "sudo" || c[1] != "-u" || c[2] != "alice" {
 			t.Errorf("call did not target user store: %#v", c)
@@ -101,7 +110,7 @@ func TestPullUser_RejectsMissingLocalhost(t *testing.T) {
 	defer func() { runner.RunFn = oldRunFn }()
 
 	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error {
-		return errors.New("not present") // image exists → false
+		return errors.New("not present")
 	}
 	err := PullUser("localhost/tbox-iso-alpha:latest")
 	if err == nil || !strings.Contains(err.Error(), "not found in the invoking user's podman store") {

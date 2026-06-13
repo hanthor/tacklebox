@@ -99,7 +99,7 @@ fi
 # shellcheck disable=SC2054
 QEMU_CMD=(
     qemu-system-x86_64
-    -m 4G
+    -m 2G
     -smp 2
     -accel "$ACCEL"
     -cpu "$CPU"

@@ -338,20 +338,47 @@ jobs:
           fi
           echo "6-env/dedup2 ratio: $(echo "scale=2; $dedup6 / $dedup2" | bc)"
 
-      - name: boot smoke, 6-env dedup ISO (env gamma + tbox-root pivot)
+      # ── offline store smoke ─────────────────────────────────────────────
+      # Builds a dedup ISO with offline_payloads that embeds container images
+      # as a separate store.squashfs.img in /LiveOS. The boot-time
+      # tbox-offline-store.mount unit picks this up for air-gapped installs.
+      - name: build offline-store ISO
         run: |
-          QEMU_LOG=qemu-iso-6env.log ./scripts/test-boot.sh /mnt/tbx/dedup-6env.iso 600 \
-            "tacklebox.env=gamma" "Tacklebox: rebased OK"
+          sudo ./tacklebox build fixtures/iso-offline.json \
+            --iso /mnt/tbx/offline.iso -b /mnt/tbx
 
-      - name: boot smoke, per-env ISO (env beta)
-        run: |
-          QEMU_LOG=qemu-iso-perenv.log ./scripts/test-boot.sh /mnt/tbx/smoke.iso 600 \
-            "tacklebox.env=beta"
+      - name: verify offline-store ISO
+        run: ./tacklebox verify /mnt/tbx/offline.iso
 
-      - name: boot smoke, dedup ISO (env alpha + tbox-root pivot)
+      # Boot all three ISOs in parallel to keep CI time under the 60-min
+      # budget. Each QEMU VM gets 2G RAM (enough for a non-interactive
+      # boot to login prompt). Output tee'd to step log + per-ISO file.
+      - name: boot smoke, all ISOs (parallel)
         run: |
-          QEMU_LOG=qemu-iso-dedup.log ./scripts/test-boot.sh /mnt/tbx/dedup.iso 600 \
-            "tacklebox.env=alpha" "Tacklebox: rebased OK"
+          fail=0
+
+          # 6-env dedup ISO: gamma env with tbox-root pivot
+          ( QEMU_LOG=qemu-iso-6env.log ./scripts/test-boot.sh /mnt/tbx/dedup-6env.iso 600 \
+              "tacklebox.env=gamma" "Tacklebox: rebased OK" \
+              2>&1 | tee -a qemu-iso-6env.out ) &
+          pid1=$!
+
+          # per-env ISO: beta env (non-dedup path)
+          ( QEMU_LOG=qemu-iso-perenv.log ./scripts/test-boot.sh /mnt/tbx/smoke.iso 600 \
+              "tacklebox.env=beta" \
+              2>&1 | tee -a qemu-iso-perenv.out ) &
+          pid2=$!
+
+          # dedup ISO: alpha env with tbox-root pivot
+          ( QEMU_LOG=qemu-iso-dedup.log ./scripts/test-boot.sh /mnt/tbx/dedup.iso 600 \
+              "tacklebox.env=alpha" "Tacklebox: rebased OK" \
+              2>&1 | tee -a qemu-iso-dedup.out ) &
+          pid3=$!
+
+          wait $pid1 || { echo "::error::6-env dedup ISO boot failed"; fail=1; }
+          wait $pid2 || { echo "::error::per-env ISO boot failed"; fail=1; }
+          wait $pid3 || { echo "::error::dedup ISO boot failed"; fail=1; }
+          exit $fail
 
       - name: upload boot logs
         if: failure()

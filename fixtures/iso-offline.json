@@ -1,0 +1,27 @@
+{
+  "media_name": "TBX_ISO_OFFLINE",
+  "size": "30G",
+  "default_boot": "alpha",
+  "offline_payloads": [
+    "localhost/tbox-iso-alpha:latest",
+    "localhost/tbox-iso-beta:latest"
+  ],
+  "shared_store": {
+    "format": "ext4",
+    "dedup": true
+  },
+  "bootable_environments": [
+    {
+      "id": "alpha",
+      "image": "localhost/tbox-iso-alpha:latest",
+      "title": "Fixture Alpha",
+      "modes": ["live"]
+    },
+    {
+      "id": "beta",
+      "image": "localhost/tbox-iso-beta:latest",
+      "title": "Fixture Beta",
+      "modes": ["live"]
+    }
+  ]
+}

@@ -74,11 +74,30 @@ func TestBuildOfflineStore_EmptyImages(t *testing.T) {
 }
 
 func TestBuildOfflineStore_CreatesWorldWritableDirs(t *testing.T) {
+	// BuildOfflineStore calls ClearEnvDir which uses RunCombined (unmockable).
+	// Skip if sudo is not available.
+	skipIfNoSudo(t)
+
 	tmp := t.TempDir()
 	stagingRoot := filepath.Join(tmp, "staging")
 
-	// We create an image that will fail at the skopeo copy stage (no podman).
-	// But before that, dirs must be created world-writable.
+	oldRunFn := runner.RunFn
+	defer func() { runner.RunFn = oldRunFn }()
+
+	runner.RunFn = func(_ io.Reader, name string, args ...string) error {
+		// Handle sudo mkdir, sudo rm, and podman operations
+		if name == "sudo" && len(args) >= 2 && args[0] == "mkdir" && args[1] == "-p" {
+			return os.MkdirAll(args[2], 0755)
+		}
+		if name == "sudo" && len(args) >= 2 && args[0] == "rm" {
+			return os.RemoveAll(args[len(args)-1])
+		}
+		if name == "podman" && len(args) >= 2 && args[0] == "image" && args[1] == "exists" {
+			return fmt.Errorf("image not found")
+		}
+		return nil
+	}
+
 	err := BuildOfflineStore([]string{"example.com/os:latest"}, stagingRoot, filepath.Join(tmp, "out.squashfs"))
 	if err == nil {
 		t.Skip("skopeo succeeded unexpectedly")
@@ -96,15 +115,25 @@ func TestBuildOfflineStore_CreatesWorldWritableDirs(t *testing.T) {
 }
 
 func TestBuildOfflineStore_ImageNotPresent(t *testing.T) {
+	// BuildOfflineStore calls ClearEnvDir which uses RunCombined (unmockable).
+	// Skip if sudo is not available.
+	skipIfNoSudo(t)
+
 	tmp := t.TempDir()
 
 	oldRunFn := runner.RunFn
 	defer func() { runner.RunFn = oldRunFn }()
 
-	// Simulate podman image exists failing.
+	// Simulate podman image exists failing, and handle sudo mkdir/rm calls.
 	runner.RunFn = func(_ io.Reader, name string, args ...string) error {
 		if len(args) >= 2 && args[0] == "image" && args[1] == "exists" {
 			return fmt.Errorf("image not found")
+		}
+		if name == "sudo" && len(args) >= 2 && args[0] == "mkdir" && args[1] == "-p" {
+			return os.MkdirAll(args[2], 0755)
+		}
+		if name == "sudo" && len(args) >= 2 && args[0] == "rm" {
+			return os.RemoveAll(args[len(args)-1])
 		}
 		return nil
 	}
@@ -119,6 +148,7 @@ func TestBuildOfflineStore_ImageNotPresent(t *testing.T) {
 }
 
 func TestBuildOfflineStore_DefaultTimeout(t *testing.T) {
+	skipIfNoSudo(t)
 	tmp := t.TempDir()
 	t.Setenv("SUDO_USER", "")
 	// Unset the override so default (1800) is used.
@@ -158,7 +188,7 @@ func TestProvisionStoreMountBlock_CreatesMountUnit(t *testing.T) {
 	oldRunFn := runner.RunFn
 	defer func() { runner.RunFn = oldRunFn }()
 
-	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
+	runner.RunFn = mockSudoMkdirMv
 
 	err := ProvisionStoreMountBlock(tmp)
 	if err != nil {
@@ -189,7 +219,7 @@ func TestProvisionStoreMountBlock_CreatesWantsSymlink(t *testing.T) {
 	oldRunFn := runner.RunFn
 	defer func() { runner.RunFn = oldRunFn }()
 
-	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
+	runner.RunFn = mockSudoMkdirMv
 
 	err := ProvisionStoreMountBlock(tmp)
 	if err != nil {
@@ -209,7 +239,7 @@ func TestProvisionStoreMountBlock_CreatesStorageDropin(t *testing.T) {
 	oldRunFn := runner.RunFn
 	defer func() { runner.RunFn = oldRunFn }()
 
-	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
+	runner.RunFn = mockSudoMkdirMv
 
 	err := ProvisionStoreMountBlock(tmp)
 	if err != nil {
@@ -229,5 +259,39 @@ func TestProvisionStoreMountBlock_CreatesStorageDropin(t *testing.T) {
 	if !strings.Contains(s, "/var/lib/superiso-store") {
 		t.Errorf("drop-in missing store path: %s", s)
 	}
+}
+
+// mockSudoMkdirMv handles sudo mkdir and sudo cp by performing the actual
+// filesystem operations in the test environment (no real sudo needed).
+func mockSudoMkdirMv(_ io.Reader, name string, args ...string) error {
+	if name != "sudo" || len(args) < 2 {
+		return nil
+	}
+	switch args[0] {
+	case "mkdir":
+		if len(args) >= 3 && args[1] == "-p" {
+			return os.MkdirAll(args[2], 0755)
+		}
+	case "cp":
+		if len(args) >= 3 {
+			// writeFileAsSudo writes content to a temp file, then runs
+			// sudo cp <tmp> <dest>. args = [cp, <tmp>, <dest>]
+			src, dst := args[1], args[2]
+			if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+				return err
+			}
+			data, err := os.ReadFile(src)
+			if err != nil {
+				return err
+			}
+			return os.WriteFile(dst, data, 0644)
+		}
+	case "ln":
+		if len(args) >= 4 && args[1] == "-sf" {
+			// runner.Run("sudo", "ln", "-sf", src, dst)
+			return os.Symlink(args[2], args[3])
+		}
+	}
+	return nil
 }
 

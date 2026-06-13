@@ -3,6 +3,7 @@ package target
 import (
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,6 +11,14 @@ import (
 	"github.com/tuna-os/tacklebox/internal/blockdev"
 	"github.com/tuna-os/tacklebox/internal/runner"
 )
+
+// needsSgdisk skips the test if sgdisk is not in PATH.
+func needsSgdisk(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("sgdisk"); err != nil {
+		t.Skip("sgdisk not available in test environment")
+	}
+}
 
 func TestNewBlockTarget_LoopImage(t *testing.T) {
 	parts := []blockdev.Partition{
@@ -150,6 +159,7 @@ func TestBlockTarget_Finalize_RealDevice(t *testing.T) {
 }
 
 func TestBlockTarget_Prepare_LoopImage(t *testing.T) {
+	needsSgdisk(t)
 	tmp := t.TempDir()
 	parts := []blockdev.Partition{
 		{Size: "+1G", FS: "vfat", Label: "ESP"},
@@ -157,6 +167,8 @@ func TestBlockTarget_Prepare_LoopImage(t *testing.T) {
 		{Size: "0", FS: "ext4", Label: "TBOX_PERSIST"},
 	}
 	bt := NewBlockTarget(tmp, "", "2G", parts)
+
+	noopTrack := func(name string, fn func() error) error { return fn() }
 
 	oldRunFn := runner.RunFn
 	oldOutput := runner.Output
@@ -190,7 +202,7 @@ func TestBlockTarget_Prepare_LoopImage(t *testing.T) {
 		return nil
 	}
 
-	mps, err := bt.Prepare(nil)
+	mps, err := bt.Prepare(noopTrack)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -220,6 +232,7 @@ func TestBlockTarget_Prepare_LoopImage(t *testing.T) {
 }
 
 func TestBlockTarget_Prepare_RealDevice(t *testing.T) {
+	needsSgdisk(t)
 	tmp := t.TempDir()
 	parts := []blockdev.Partition{
 		{Size: "+1G", FS: "vfat", Label: "ESP"},
@@ -233,7 +246,10 @@ func TestBlockTarget_Prepare_RealDevice(t *testing.T) {
 
 	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
 
-	_, err := bt.Prepare(nil)
+	// no-op tracker to avoid nil pointer dereference
+	noopTrack := func(name string, fn func() error) error { return fn() }
+
+	_, err := bt.Prepare(noopTrack)
 	if err != nil {
 		t.Fatalf("Prepare real device: %v", err)
 	}
@@ -250,6 +266,9 @@ func TestBlockTarget_Prepare_RealDevice(t *testing.T) {
 }
 
 func TestBlockTarget_Prepare_LosupFailure(t *testing.T) {
+	// sgdiskTolerant uses RunCombined which is not mockable.
+	needsSgdisk(t)
+
 	tmp := t.TempDir()
 	parts := []blockdev.Partition{{Size: "+1G", FS: "vfat"}}
 	bt := NewBlockTarget(tmp, "", "2G", parts)
@@ -263,13 +282,14 @@ func TestBlockTarget_Prepare_LosupFailure(t *testing.T) {
 
 	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
 	runner.Output = func(name string, args ...string) ([]byte, error) {
-		if args[1] == "losetup" {
+		if len(args) >= 2 && args[1] == "losetup" {
 			return nil, io.ErrUnexpectedEOF
 		}
 		return nil, nil
 	}
 
-	_, err := bt.Prepare(nil)
+	noopTrack := func(name string, fn func() error) error { return fn() }
+	_, err := bt.Prepare(noopTrack)
 	if err == nil {
 		t.Fatal("expected error from losetup failure")
 	}

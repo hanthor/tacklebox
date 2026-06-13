@@ -2,6 +2,7 @@ package install
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -34,9 +35,13 @@ func TestClearEnvDir_NoExist(t *testing.T) {
 	}
 }
 
-// TestClearEnvDir_NormalDir verifies ClearEnvDir removes a plain directory tree
-// (no immutable bits — simulates the fresh-build case).
+// TestClearEnvDir_NormalDir verifies ClearEnvDir removes a plain directory tree.
+// Requires sudo (for chattr + rm -rf). Skipped when sudo is not available.
 func TestClearEnvDir_NormalDir(t *testing.T) {
+	// ClearEnvDir uses RunCombined for the rm -rf step, which bypasses the
+	// runner mock. Skip if sudo is not available in the test environment.
+	skipIfNoSudo(t)
+
 	base := t.TempDir()
 	dir := filepath.Join(base, "env")
 	if err := os.MkdirAll(filepath.Join(dir, "sub1", "sub2"), 0755); err != nil {
@@ -50,5 +55,13 @@ func TestClearEnvDir_NormalDir(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); err == nil {
 		t.Errorf("directory still exists after ClearEnvDir")
+	}
+}
+
+// skipIfNoSudo skips the test when sudo is not found in PATH.
+func skipIfNoSudo(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("sudo"); err != nil {
+		t.Skip("sudo not available in test environment")
 	}
 }

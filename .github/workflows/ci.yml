@@ -168,9 +168,15 @@ jobs:
       # Stage 4: Boot smoke. We use TCG (no KVM on free runners) so it's
       # slow (~3 min to login).
       - name: tacklebox boot smoke (Stage 4)
-        run: |
-          chmod +x scripts/test-boot.sh
-          sudo ./scripts/test-boot.sh /mnt/tbx/tacklebox.img 600
+        run: sudo ./scripts/test-boot.sh /mnt/tbx/tacklebox.img 600
+
+      - name: upload boot log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verify-smoke-boot-log
+          path: qemu-boot.log
+          if-no-files-found: ignore
 
       - name: artifact summary
         if: always()
@@ -303,7 +309,6 @@ jobs:
 
       - name: boot smoke, per-env ISO (env beta)
         run: |
-          chmod +x scripts/test-boot.sh
           QEMU_LOG=qemu-iso-perenv.log ./scripts/test-boot.sh /mnt/tbx/smoke.iso 600 \
             "tacklebox.env=beta"
 

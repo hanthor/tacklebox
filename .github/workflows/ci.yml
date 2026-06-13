@@ -190,6 +190,9 @@ jobs:
       - name: tacklebox verify (post-add, 3 envs)
         run: sudo ./tacklebox verify /mnt/tbx/tacklebox.img
 
+      - name: tacklebox status (post-add)
+        run: sudo ./tacklebox status /mnt/tbx/tacklebox.img
+
       - name: tacklebox remove (the added env)
         run: |
           sudo ./tacklebox remove centos-add \

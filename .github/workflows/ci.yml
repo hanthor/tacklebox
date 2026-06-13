@@ -198,7 +198,7 @@ jobs:
   iso-smoke:
     runs-on: ubuntu-latest
     needs: lint-test
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -236,6 +236,14 @@ jobs:
             --build-arg MARKER=alpha -t localhost/tbox-iso-alpha:latest fixtures
           podman build -f fixtures/iso-smoke.Containerfile \
             --build-arg MARKER=beta -t localhost/tbox-iso-beta:latest fixtures
+          podman build -f fixtures/iso-smoke.Containerfile \
+            --build-arg MARKER=gamma -t localhost/tbox-iso-gamma:latest fixtures
+          podman build -f fixtures/iso-smoke.Containerfile \
+            --build-arg MARKER=delta -t localhost/tbox-iso-delta:latest fixtures
+          podman build -f fixtures/iso-smoke.Containerfile \
+            --build-arg MARKER=epsilon -t localhost/tbox-iso-epsilon:latest fixtures
+          podman build -f fixtures/iso-smoke.Containerfile \
+            --build-arg MARKER=zeta -t localhost/tbox-iso-zeta:latest fixtures
 
       - name: build per-env ISO
         run: |
@@ -265,6 +273,34 @@ jobs:
             exit 1
           fi
 
+      # ── 6-env dedup smoke ────────────────────────────
+
+      - name: build 6-env dedup ISO
+        run: sudo ./tacklebox build fixtures/iso-dedup-6env.json --iso /mnt/tbx/dedup-6env.iso -b /mnt/tbx
+
+      - name: verify 6-env dedup ISO
+        run: ./tacklebox verify /mnt/tbx/dedup-6env.iso
+
+      # 6 nearly-identical envs should produce an ISO barely larger than 2.
+      # Bound: 6-env < 2 × 2-env (very conservative, real ratio is much
+      # tighter — each additional env adds only a marker file worth of
+      # unique content).
+      - name: assert 6-env dedup scales
+        run: |
+          dedup2=$(stat -c%s /mnt/tbx/dedup.iso)
+          dedup6=$(stat -c%s /mnt/tbx/dedup-6env.iso)
+          echo "2-env dedup ISO: ${dedup2} bytes; 6-env dedup ISO: ${dedup6} bytes"
+          if [ "$dedup6" -ge $((dedup2 * 2)) ]; then
+            echo "::error::6-env ISO (${dedup6}) is too large — expected ≤ 2× 2-env (${dedup2})"
+            exit 1
+          fi
+          echo "6-env/dedup2 ratio: $(echo "scale=2; $dedup6 / $dedup2" | bc)"
+
+      - name: boot smoke, 6-env dedup ISO (env gamma + tbox-root pivot)
+        run: |
+          QEMU_LOG=qemu-iso-6env.log ./scripts/test-boot.sh /mnt/tbx/dedup-6env.iso 600 \
+            "tacklebox.env=gamma" "Tacklebox: rebased OK"
+
       - name: boot smoke, per-env ISO (env beta)
         run: |
           chmod +x scripts/test-boot.sh
@@ -289,7 +325,7 @@ jobs:
         run: |
           echo '## iso-smoke artefacts' >> "$GITHUB_STEP_SUMMARY"
           ls -lh /mnt/tbx/*.iso 2>/dev/null | awk '{print "- `" $NF "` (" $5 ")"}' >> "$GITHUB_STEP_SUMMARY"
-          for log in qemu-iso-perenv.log qemu-iso-dedup.log; do
+          for log in qemu-iso-perenv.log qemu-iso-dedup.log qemu-iso-6env.log; do
             if [ -f "$log" ]; then
               echo "### $log (tail)" >> "$GITHUB_STEP_SUMMARY"
               echo '```' >> "$GITHUB_STEP_SUMMARY"

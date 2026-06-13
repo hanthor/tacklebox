@@ -44,17 +44,22 @@ func SetupBootloader(espMount string) error {
 	return nil
 }
 
-func WriteBLSEntry(espMount string, id string, title string, kernelPath string, initrdPath string, options string) error {
+func WriteBLSEntry(espMount string, id string, title string, kernelPath string, initrdPath string, options string, isDefault bool) error {
 	entryDir := filepath.Join(espMount, "loader", "entries")
 	if err := os.MkdirAll(entryDir, 0755); err != nil {
 		return err
 	}
 
-	// sort-key prefix `0-tbox-` ensures our entries outrank bootc's own
-	// auto-generated entries (which use `bootc-*` sort keys) so the default
-	// boot is one of the ones we actually configured.
-	content := fmt.Sprintf("title %s\nsort-key 0-tbox-%s\nlinux %s\ninitrd %s\noptions %s\n",
-		title, id, kernelPath, initrdPath, options)
+	// sort-key prefix ensures our entries outrank bootc's own
+	// auto-generated entries (which use `bootc-*` sort keys). The default
+	// boot entry gets `00-tbox-` so it sorts FIRST in the menu; other
+	// entries get `0-tbox-`.
+	sortPrefix := "0-tbox-"
+	if isDefault {
+		sortPrefix = "00-tbox-"
+	}
+	content := fmt.Sprintf("title %s\nsort-key %s%s\nlinux %s\ninitrd %s\noptions %s\n",
+		title, sortPrefix, id, kernelPath, initrdPath, options)
 
 	entryFile := filepath.Join(entryDir, id+".conf")
 	fmt.Printf(">>> Writing BLS entry: %s\n", entryFile)

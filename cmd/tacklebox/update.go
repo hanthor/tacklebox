@@ -307,7 +307,8 @@ func updateEnvBootc(env recipe.BootableEnvironment, r recipe.MediaRecipe, storeM
 	for _, mode := range env.Modes {
 		id := fmt.Sprintf("%s-%s", env.ID, mode)
 		options := buildKernelCmdline(env.ID, mode, backend, blockdev.UsbSafe, ostreeBootcsum)
-		if err := install.WriteBLSEntry(espMount, id, envTitle(env, string(mode)), "/EFI/"+env.ID+"/vmlinuz", "/EFI/"+env.ID+"/initrd.img", options); err != nil {
+		isDefault := env.ID == r.DefaultBoot
+		if err := install.WriteBLSEntry(espMount, id, envTitle(env, string(mode)), "/EFI/"+env.ID+"/vmlinuz", "/EFI/"+env.ID+"/initrd.img", options, isDefault); err != nil {
 			return err
 		}
 	}

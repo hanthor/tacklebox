@@ -1,0 +1,47 @@
+{
+  "media_name": "TBX_ISO_DEDUP_6ENV",
+  "size": "30G",
+  "default_boot": "alpha",
+  "shared_store": {
+    "format": "ext4",
+    "dedup": true
+  },
+  "bootable_environments": [
+    {
+      "id": "alpha",
+      "image": "localhost/tbox-iso-alpha:latest",
+      "title": "Fixture Alpha",
+      "modes": ["live"]
+    },
+    {
+      "id": "beta",
+      "image": "localhost/tbox-iso-beta:latest",
+      "title": "Fixture Beta",
+      "modes": ["live"]
+    },
+    {
+      "id": "gamma",
+      "image": "localhost/tbox-iso-gamma:latest",
+      "title": "Fixture Gamma",
+      "modes": ["live"]
+    },
+    {
+      "id": "delta",
+      "image": "localhost/tbox-iso-delta:latest",
+      "title": "Fixture Delta",
+      "modes": ["live"]
+    },
+    {
+      "id": "epsilon",
+      "image": "localhost/tbox-iso-epsilon:latest",
+      "title": "Fixture Epsilon",
+      "modes": ["live"]
+    },
+    {
+      "id": "zeta",
+      "image": "localhost/tbox-iso-zeta:latest",
+      "title": "Fixture Zeta",
+      "modes": ["live"]
+    }
+  ]
+}

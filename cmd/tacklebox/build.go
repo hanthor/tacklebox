@@ -584,7 +584,8 @@ func installEnvBootc(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt t
 	for _, mode := range env.Modes {
 		id := fmt.Sprintf("%s-%s", env.ID, mode)
 		options := buildKernelCmdline(env.ID, mode, backend, blockdev.UsbSafe, ostreeBootcsum)
-		if err := install.WriteBLSEntry(espMount, id, envTitle(env, string(mode)), tgt.KernelPath(env.ID), tgt.InitrdPath(env.ID), options); err != nil {
+		isDefault := env.ID == r.DefaultBoot
+		if err := install.WriteBLSEntry(espMount, id, envTitle(env, string(mode)), tgt.KernelPath(env.ID), tgt.InitrdPath(env.ID), options, isDefault); err != nil {
 			return err
 		}
 	}
@@ -649,7 +650,8 @@ func installEnvLive(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt ta
 	}
 
 	options := buildLiveKernelCmdline(env.ID, label)
-	if err := install.WriteBLSEntry(espMount, env.ID, envTitle(env, "live"), tgt.KernelPath(env.ID), tgt.InitrdPath(env.ID), options); err != nil {
+	isDefault := env.ID == r.DefaultBoot
+	if err := install.WriteBLSEntry(espMount, env.ID, envTitle(env, "live"), tgt.KernelPath(env.ID), tgt.InitrdPath(env.ID), options, isDefault); err != nil {
 		return err
 	}
 	fmt.Printf(">>> Finished environment: %s (kernel=%s)\n", env.ID, kver)
@@ -713,7 +715,8 @@ func installEnvsLiveCombined(r recipe.MediaRecipe, tgt target.Target, storeMount
 		}
 
 		options := buildLiveKernelCmdlineCombined(env.ID, label)
-		if err := install.WriteBLSEntry(espMount, env.ID, envTitle(env, "live"), tgt.KernelPath(env.ID), tgt.InitrdPath(env.ID), options); err != nil {
+		isDefault := env.ID == r.DefaultBoot
+		if err := install.WriteBLSEntry(espMount, env.ID, envTitle(env, "live"), tgt.KernelPath(env.ID), tgt.InitrdPath(env.ID), options, isDefault); err != nil {
 			return err
 		}
 		fmt.Printf(">>> Finished environment: %s (kernel=%s, combined)\n", env.ID, kver)

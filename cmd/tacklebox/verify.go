@@ -133,6 +133,23 @@ func verifyIso(path string) []checkResult {
 	if err != nil {
 		return append(results, checkResult{"list /LiveOS in ISO", err})
 	}
+	sfsSet := make(map[string]bool, len(sfsList))
+	for _, name := range sfsList {
+		sfsSet[name] = true
+	}
+
+	// Every BLS entry must reference a squashfs image that exists.
+	// A missing file means the ISO will fail at boot even if verify passes.
+	for _, e := range entries {
+		if img := blsOption(e.options, "rd.live.squashimg"); img != "" {
+			if !sfsSet[img] {
+				results = append(results, checkResult{
+					"squashfs referenced by BLS entry",
+					fmt.Errorf("%s references %s but file not found in /LiveOS", e.name, img),
+				})
+			}
+		}
+	}
 	var hasOfflineStore bool
 	hashes := map[string][]string{}
 	for _, name := range sfsList {

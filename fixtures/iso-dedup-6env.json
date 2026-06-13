@@ -1,7 +1,7 @@
 {
   "media_name": "TBX_ISO_DEDUP_6ENV",
   "size": "30G",
-  "default_boot": "alpha",
+  "default_boot": "gamma",
   "shared_store": {
     "format": "ext4",
     "dedup": true

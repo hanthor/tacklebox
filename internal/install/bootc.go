@@ -88,6 +88,34 @@ func Pull(image string) error {
 	return nil
 }
 
+// PullUser warms the invoking user's rootless store — the store every
+// live-pipeline consumer reads from (podman unshare image mount for the
+// squash, the extract container, the dracut rebuild container). Without
+// this, registry images for ISO builds land in root's store via Pull and
+// each consumer auto-pulls a SECOND copy into the user's store — double
+// download, double disk.
+//
+// localhost/ images can't be pulled; they must already be in the user's
+// store (plain `podman build` puts them there).
+func PullUser(image string) error {
+	upodman := UserPodmanPrefix()
+	exists := append(upodman[1:], "image", "exists", image)
+	if err := runner.Run(upodman[0], exists...); err == nil {
+		fmt.Printf(">>> Skip pull (already present in user store): %s\n", image)
+		return nil
+	}
+	if strings.HasPrefix(image, "localhost/") {
+		return fmt.Errorf(
+			"localhost image %q not found in the invoking user's podman store; build it with plain `podman build` (not sudo) first", image)
+	}
+	fmt.Printf(">>> Pulling %s (user store)\n", image)
+	pull := append(upodman[1:], "pull", image)
+	if err := runner.Run(upodman[0], pull...); err != nil {
+		return fmt.Errorf("pull %s: %w", image, err)
+	}
+	return nil
+}
+
 func PullAndInstall(image string, targetDir string, stateroot string, backend Backend) error {
 	fmt.Printf(">>> Installing image: %s (stateroot=%s, backend=%s)\n", image, stateroot, backend)
 

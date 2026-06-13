@@ -9,7 +9,11 @@
       "id": "bazzite",
       "image": "localhost/superiso-live-bazzite:latest",
       "desktop": "kde",
-      "modes": ["live"]
+      "modes": [
+        "live"
+      ],
+      "title": "Bazzite (KDE, live)",
+      "skip_initramfs_rebuild": true
     }
   ]
 }

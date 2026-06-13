@@ -1,0 +1,24 @@
+{
+  "media_name": "TBX_DEDUP",
+  "size": "30G",
+  "shared_store": {
+    "format": "ext4",
+    "dedup": true
+  },
+  "bootable_environments": [
+    {
+      "id": "bluefin",
+      "image": "ghcr.io/ublue-os/bluefin:stable",
+      "title": "Bluefin (GNOME)",
+      "desktop": "gnome",
+      "modes": ["live"]
+    },
+    {
+      "id": "bazzite",
+      "image": "ghcr.io/ublue-os/bazzite:stable",
+      "title": "Bazzite (KDE)",
+      "desktop": "kde",
+      "modes": ["live"]
+    }
+  ]
+}

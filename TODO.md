@@ -4,10 +4,6 @@ Tracked items not yet implemented. Roughly ordered by value / blocking-ness.
 
 ## Features
 
-### `tacklebox add <env>` / `tacklebox remove <env>`
-Mutate an existing media in place: add a fourth env to a built image,
-or drop one. Today the only way is to rebuild from scratch.
-
 ### Per-stateroot greenboot / rollback
 Each env boots independently with its own stateroot, so health-check
 + auto-rollback should be wired per-env, not globally.
@@ -19,15 +15,15 @@ module, but there's no story for:
 - Garbage collection when an env is removed.
 - Migration if the recipe's env list changes between builds.
 
-### USB pre-flight: unmount busy partitions
-`final-attempt.log` shows `mkfs.vfat` failing because `/dev/sdb1` was
-auto-mounted by the desktop. `internal/blockdev` should sweep
-`/dev/<target>*` mounts before format. Only matters for `/dev/*`
-targets, not loop images.
-
 ### Multi-env ISO: ARM64 support
-`shared_store.dedup` ISOs currently assume x86_64 (sd-boot EFI binary).
-ARM64 images need aarch64 sd-boot + OVMF for QEMU testing.
+Partially there: `install.ExtractEFIBinary` (`live.go:283`) already probes
+for both `systemd-bootx64.efi` → `BOOTX64.EFI` and `systemd-bootaa64.efi`
+→ `BOOTAA64.EFI`. Remaining gaps:
+- The ISO9660-root EFI fallback is hardcoded to `BOOTX64.EFI` (`iso.go`);
+  needs to use the arch-appropriate basename.
+- aarch64 sd-boot path selection end-to-end through the ISO assembly.
+- OVMF (aarch64) for QEMU smoke testing in CI.
+Needs an ARM test environment to validate.
 
 ## Bugs
 
@@ -41,6 +37,26 @@ Root cause likely in bootc's install-source resolution. Not yet fixed
 upstream. ISO targets (Live mode) are unaffected.
 
 ## Done ✓
+
+### `tacklebox add` / `tacklebox remove` ✓
+Mutate an existing media in place without reformatting or touching other
+envs / TBOX_PERSIST. `add RECIPE TARGET [--env ID]` installs new env(s) via
+`updateEnvBootc` with an ESP-fit pre-check (`checkESPFit`); `remove ENV... TARGET`
+drops the subtree (`ClearEnvDir`), the `/EFI/<id>` boot dir, and the env's BLS
+entries, re-promoting `default_boot` to a surviving env when needed. Both
+rewrite the embedded `recipe.json` across all surviving envs so `update-all`
+tracks the new roster. Block targets only — ISOs are rejected (rebuild).
+`cmd/tacklebox/add.go`, `remove.go`, shared helpers in `media.go`.
+
+NOTE: `remove`'s subtree teardown is the GC entry point for the
+persist-partition lifecycle item above (per-env garbage collection).
+
+### USB pre-flight: unmount busy partitions ✓
+`blockdev.UnmountDevice` (`internal/blockdev/format.go`) lazily sweeps every
+mount whose source starts with `/dev/<target>` before format, fixing the
+`mkfs.vfat`-on-busy-`/dev/sdb1` failure. Wired into the block install path
+(`internal/target/block.go`), skips non-`/dev/` (loop image) targets, and
+covered by unit + loop-smoke integration tests.
 
 ### `tacklebox update <recipe.json>` ✓
 Re-pulls recipe images and replays `bootc install` into existing per-env

@@ -162,3 +162,7 @@ just build-xz
 
 ---
 *Part of the [Tuna OS](https://github.com/tuna-os) ecosystem.*
+
+---
+
+Part of the [TunaOS](https://tunaos.org) ecosystem. [Docs](https://tunaos.org) · [Contributing](CONTRIBUTING.md)

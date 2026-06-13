@@ -83,8 +83,17 @@ touch "$LOG"
 # We use -display none -serial stdio and redirect to log.
 # We use -accel kvm if available, else tcg.
 ACCEL="tcg"
+# CPU model MUST expose at least x86-64-v3: CentOS Stream 10 (el10) glibc
+# aborts init with "Fatal glibc error: CPU does not support x86-64-v3" on a
+# baseline CPU, which the kernel then reports as a panic (init exit 127).
+# QEMU's default under KVM is the qemu64 model (x86-64-v1 only), so we must
+# pass an explicit model in BOTH cases:
+#   - tcg: 'max' emulates every feature, including v3+.
+#   - kvm: 'host' passes the real host CPU straight through.
+CPU="max"
 if [ -e /dev/kvm ] && [ -w /dev/kvm ]; then
     ACCEL="kvm"
+    CPU="host"
 fi
 
 # shellcheck disable=SC2054
@@ -93,6 +102,7 @@ QEMU_CMD=(
     -m 4G
     -smp 2
     -accel "$ACCEL"
+    -cpu "$CPU"
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
     -drive "if=pflash,format=raw,file=$VARS"
     -drive "$DRIVE_OPTS"
@@ -100,11 +110,6 @@ QEMU_CMD=(
     -serial "file:$LOG"
     -display none
 )
-
-# If not in KVM, we might need more time or a lighter CPU
-if [ "$ACCEL" == "tcg" ]; then
-    QEMU_CMD+=(-cpu max)
-fi
 
 # Start QEMU in background
 "${QEMU_CMD[@]}" &

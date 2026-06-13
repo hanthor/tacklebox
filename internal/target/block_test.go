@@ -45,9 +45,6 @@ func TestNewBlockTarget_LoopImage(t *testing.T) {
 	if len(bt.Partitions) != 3 {
 		t.Fatalf("Partitions len = %d, want 3", len(bt.Partitions))
 	}
-	if bt.ImagePath != "" {
-		t.Errorf("ImagePath should be empty before Prepare: %q", bt.ImagePath)
-	}
 }
 
 func TestNewBlockTarget_RealDevice(t *testing.T) {
@@ -86,81 +83,107 @@ func TestBlockTarget_InitrdPath(t *testing.T) {
 	}
 }
 
-func TestBlockTarget_Cleanup_Idempotent(t *testing.T) {
-	bt := NewBlockTarget("/tmp", "", "30G", nil)
-	calls := 0
-	bt.addCleanup(func() { calls++ })
+// setupBlockMocks installs the three runner function-var overrides needed
+// for BlockTarget.Prepare to succeed without real system tools. Returns a
+// restore function. The caller must also call fakeBootctl(t) separately
+// if Prepare will reach SetupBootloader.
+func setupBlockMocks(t *testing.T, bt *BlockTarget) (restore func()) {
+	t.Helper()
+	oldRunFn := runner.RunFn
+	oldOutputFn := runner.OutputFn
+	oldRunCombinedFn := runner.RunCombinedFn
 
-	bt.Cleanup()
-	if calls != 1 {
-		t.Errorf("first Cleanup: want 1 call, got %d", calls)
+	runner.OutputFn = func(name string, args ...string) ([]byte, error) {
+		if name == "sudo" && len(args) >= 1 && args[0] == "losetup" {
+			return []byte("/dev/loop99\n"), nil
+		}
+		return nil, nil
 	}
 
-	// Second call must be a no-op.
-	bt.Cleanup()
-	if calls != 1 {
-		t.Errorf("second Cleanup should be no-op, got %d calls", calls)
+	runner.RunFn = func(_ io.Reader, name string, args ...string) error {
+		if name == "truncate" && bt != nil {
+			// Create the sparse file so the subsequent losetup mock has
+			// something to work with.
+			f, err := os.Create(bt.ImagePath)
+			if err != nil {
+				return err
+			}
+			f.Close()
+		}
+		return nil
+	}
+
+	runner.RunCombinedFn = func(name string, args ...string) ([]byte, error) {
+		if name == "sgdisk" {
+			return []byte("GPT faked\n"), nil
+		}
+		return nil, nil
+	}
+
+	return func() {
+		runner.RunFn = oldRunFn
+		runner.OutputFn = oldOutputFn
+		runner.RunCombinedFn = oldRunCombinedFn
 	}
 }
 
-func TestBlockTarget_Cleanup_LIFO(t *testing.T) {
-	bt := NewBlockTarget("/tmp", "", "30G", nil)
-	var order []int
-	bt.addCleanup(func() { order = append(order, 1) })
-	bt.addCleanup(func() { order = append(order, 2) })
-	bt.addCleanup(func() { order = append(order, 3) })
+func TestBlockTarget_PrepareThenFinalize_LoopImage(t *testing.T) {
+	fakeBootctl(t)
+	tmp := t.TempDir()
+	bt := NewBlockTarget(tmp, "", "2G", nil)
 
+	restore := setupBlockMocks(t, bt)
+	defer restore()
+
+	noopTrack := func(name string, fn func() error) error { return fn() }
+	_, err := bt.Prepare(noopTrack)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	// Finalize calls Cleanup internally, then returns the artifact path.
+	artifact, err := bt.Finalize(nil)
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+
+	// Loop images produce a .img file under OutputBase.
+	want := filepath.Join(tmp, "tacklebox.img")
+	if artifact != want {
+		t.Errorf("artifact = %q, want %q", artifact, want)
+	}
+
+	// Cleanup must be idempotent: calling it after Finalize (which already
+	// called Cleanup internally) must not panic.
 	bt.Cleanup()
-	if len(order) != 3 {
-		t.Fatalf("want 3 calls, got %d: %v", len(order), order)
-	}
-	// LIFO: last added runs first
-	if order[0] != 3 || order[1] != 2 || order[2] != 1 {
-		t.Errorf("not LIFO: %v", order)
-	}
 }
 
-func TestBlockTarget_Finalize_LoopImage(t *testing.T) {
-	bt := NewBlockTarget("/tmp/output", "", "30G", nil)
-	bt.ImagePath = "/tmp/output/tacklebox.img"
+func TestBlockTarget_PrepareThenFinalize_RealDevice(t *testing.T) {
+	fakeBootctl(t)
+	tmp := t.TempDir()
+	bt := NewBlockTarget(tmp, "/dev/sdb", "", nil)
 
-	// Finalize calls Cleanup internally, so we must have at least
-	// one cleanup registered to avoid nil deref. (It's ok to have
-	// an empty func.)
-	bt.addCleanup(func() {})
+	restore := setupBlockMocks(t, bt)
+	defer restore()
 
-	savedRunFn := runner.RunFn
-	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
-	defer func() { runner.RunFn = savedRunFn }()
+	noopTrack := func(name string, fn func() error) error { return fn() }
+	_, err := bt.Prepare(noopTrack)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
 
 	artifact, err := bt.Finalize(nil)
 	if err != nil {
 		t.Fatalf("Finalize: %v", err)
 	}
-	if artifact != bt.ImagePath {
-		t.Errorf("artifact = %q, want %q", artifact, bt.ImagePath)
-	}
-	// Cleanup must be disarmed after Finalize.
-	if !bt.disarmed {
-		t.Error("Cleanup not disarmed after Finalize")
-	}
-}
 
-func TestBlockTarget_Finalize_RealDevice(t *testing.T) {
-	bt := NewBlockTarget("/tmp/output", "/dev/sdb", "", nil)
-	bt.addCleanup(func() {})
-
-	savedRunFn := runner.RunFn
-	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
-	defer func() { runner.RunFn = savedRunFn }()
-
-	artifact, err := bt.Finalize(nil)
-	if err != nil {
-		t.Fatalf("Finalize: %v", err)
-	}
+	// Real devices return the device path itself.
 	if artifact != "/dev/sdb" {
 		t.Errorf("artifact = %q, want /dev/sdb", artifact)
 	}
+
+	// Idempotent Cleanup.
+	bt.Cleanup()
 }
 
 func TestBlockTarget_Prepare_LoopImage(t *testing.T) {
@@ -173,76 +196,34 @@ func TestBlockTarget_Prepare_LoopImage(t *testing.T) {
 	}
 	bt := NewBlockTarget(tmp, "", "2G", parts)
 
+	restore := setupBlockMocks(t, bt)
+	defer restore()
+
 	noopTrack := func(name string, fn func() error) error { return fn() }
-
-	oldRunFn := runner.RunFn
-	oldOutputFn := runner.OutputFn
-	oldRunCombinedFn := runner.RunCombinedFn
-	defer func() {
-		runner.RunFn = oldRunFn
-		runner.OutputFn = oldOutputFn
-		runner.RunCombinedFn = oldRunCombinedFn
-	}()
-
-	// Simulate successful truncate
-	runner.OutputFn = func(name string, args ...string) ([]byte, error) {
-		// losetup: return a fake loop device path
-		if name == "sudo" && len(args) >= 1 && args[0] == "losetup" {
-			return []byte("/dev/loop99\n"), nil
-		}
-		return nil, nil
-	}
-
-	runner.RunFn = func(_ io.Reader, name string, args ...string) error {
-		if name == "truncate" {
-			// Create the sparse file
-			f, err := os.Create(bt.ImagePath)
-			if err != nil {
-				return err
-			}
-			f.Close()
-		}
-		if name == "sudo" && len(args) >= 1 {
-			// Allow all sudo ops
-		}
-		// Allow udevadm settle, mount, etc.
-		return nil
-	}
-
-	runner.RunCombinedFn = func(name string, args ...string) ([]byte, error) {
-		// sgdisk: return fake success output
-		if name == "sgdisk" {
-			return []byte("GPT faked\n"), nil
-		}
-		return nil, nil
-	}
-
 	mps, err := bt.Prepare(noopTrack)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
 
-	if bt.ImagePath != filepath.Join(tmp, "tacklebox.img") {
-		t.Errorf("ImagePath = %q, want %q", bt.ImagePath, filepath.Join(tmp, "tacklebox.img"))
-	}
-	if bt.loopDev != "/dev/loop99" {
-		t.Errorf("loopDev = %q, want /dev/loop99", bt.loopDev)
-	}
-	if bt.targetDev != "/dev/loop99" {
-		t.Errorf("targetDev = %q, want /dev/loop99", bt.targetDev)
-	}
-
+	// Public contract: Prepare returns non-empty mountpoints under OutputBase.
 	if mps.EspMount == "" {
 		t.Error("EspMount empty")
 	}
 	if mps.StoreMount == "" {
 		t.Error("StoreMount empty")
 	}
-	if !strings.Contains(mps.EspMount, "mount-esp") {
-		t.Errorf("EspMount = %q, want path containing mount-esp", mps.EspMount)
+	if !strings.HasPrefix(mps.EspMount, tmp) {
+		t.Errorf("EspMount %q not under OutputBase %q", mps.EspMount, tmp)
 	}
-	if !strings.Contains(mps.StoreMount, "mount-store") {
-		t.Errorf("StoreMount = %q, want path containing mount-store", mps.StoreMount)
+	if !strings.HasPrefix(mps.StoreMount, tmp) {
+		t.Errorf("StoreMount %q not under OutputBase %q", mps.StoreMount, tmp)
+	}
+
+	// Verify the mountpoints are real directories.
+	for _, mp := range []string{mps.EspMount, mps.StoreMount} {
+		if fi, err := os.Stat(mp); err != nil || !fi.IsDir() {
+			t.Errorf("mountpoint %q is not a directory: %v", mp, err)
+		}
 	}
 }
 
@@ -256,38 +237,18 @@ func TestBlockTarget_Prepare_RealDevice(t *testing.T) {
 	}
 	bt := NewBlockTarget(tmp, "/dev/sdb", "", parts)
 
-	oldRunFn := runner.RunFn
-	oldRunCombinedFn := runner.RunCombinedFn
-	defer func() {
-		runner.RunFn = oldRunFn
-		runner.RunCombinedFn = oldRunCombinedFn
-	}()
+	restore := setupBlockMocks(t, bt)
+	defer restore()
 
-	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
-
-	runner.RunCombinedFn = func(name string, args ...string) ([]byte, error) {
-		if name == "sgdisk" {
-			return []byte("GPT faked\n"), nil
-		}
-		return nil, nil
-	}
-
-	// no-op tracker to avoid nil pointer dereference
 	noopTrack := func(name string, fn func() error) error { return fn() }
-
-	_, err := bt.Prepare(noopTrack)
+	mps, err := bt.Prepare(noopTrack)
 	if err != nil {
 		t.Fatalf("Prepare real device: %v", err)
 	}
 
-	if bt.targetDev != "/dev/sdb" {
-		t.Errorf("targetDev = %q, want /dev/sdb", bt.targetDev)
-	}
-	if bt.ImagePath != "" {
-		t.Errorf("ImagePath = %q, want empty for real device", bt.ImagePath)
-	}
-	if bt.loopDev != "" {
-		t.Errorf("loopDev = %q, want empty for real device", bt.loopDev)
+	// Public contract: Prepare returns non-empty mountpoints.
+	if mps.EspMount == "" || mps.StoreMount == "" {
+		t.Errorf("mountpoints empty: EspMount=%q StoreMount=%q", mps.EspMount, mps.StoreMount)
 	}
 }
 

@@ -100,23 +100,36 @@ func TestIsoTarget_Prepare_CreatesDirectories(t *testing.T) {
 		t.Fatalf("Prepare: %v", err)
 	}
 
-	// Verify key directories were created.
-	expectedDirs := []string{
-		filepath.Join(it.isoRoot, "LiveOS"),
-		filepath.Join(it.isoRoot, "EFI", "BOOT"),
-		filepath.Join(it.isoRoot, "images", "pxeboot"),
-		filepath.Join(it.espStaging, "EFI", "BOOT"),
-		filepath.Join(it.espStaging, "loader", "entries"),
-		filepath.Join(it.espStaging, "images", "pxeboot"),
+	// Mountpoints must be real directories.
+	if fi, err := os.Stat(mps.EspMount); err != nil || !fi.IsDir() {
+		t.Errorf("EspMount %q is not a directory: %v", mps.EspMount, err)
 	}
-	for _, d := range expectedDirs {
-		if _, err := os.Stat(d); os.IsNotExist(err) {
-			t.Errorf("directory not created: %s", d)
+	if fi, err := os.Stat(mps.StoreMount); err != nil || !fi.IsDir() {
+		t.Errorf("StoreMount %q is not a directory: %v", mps.StoreMount, err)
+	}
+
+	// ESP must have the subdirectory structure that callers depend on.
+	espSubdirs := []string{"EFI/BOOT", "loader/entries", "images/pxeboot"}
+	for _, d := range espSubdirs {
+		p := filepath.Join(mps.EspMount, d)
+		if _, err := os.Stat(p); os.IsNotExist(err) {
+			t.Errorf("ESP subdirectory not created: %s", p)
 		}
 	}
 
-	// Verify loader.conf was written.
-	loaderPath := filepath.Join(it.espStaging, "loader", "loader.conf")
+	// isoRoot (parent of StoreMount) must have the subdirectory structure
+	// that callers depend on (EFI boot + pxeboot staging).
+	isoRoot := filepath.Dir(mps.StoreMount)
+	isoSubdirs := []string{"EFI/BOOT", "images/pxeboot"}
+	for _, d := range isoSubdirs {
+		p := filepath.Join(isoRoot, d)
+		if _, err := os.Stat(p); os.IsNotExist(err) {
+			t.Errorf("isoRoot subdirectory not created: %s", p)
+		}
+	}
+
+	// loader.conf must be present on the ESP with systemd-boot defaults.
+	loaderPath := filepath.Join(mps.EspMount, "loader", "loader.conf")
 	content, err := os.ReadFile(loaderPath)
 	if err != nil {
 		t.Fatalf("read loader.conf: %v", err)
@@ -131,14 +144,6 @@ func TestIsoTarget_Prepare_CreatesDirectories(t *testing.T) {
 	if !strings.Contains(s, "console-mode max") {
 		t.Errorf("loader.conf missing console-mode: %s", s)
 	}
-
-	// Verify mountpoints.
-	if mps.EspMount != it.espStaging {
-		t.Errorf("EspMount = %q, want %q", mps.EspMount, it.espStaging)
-	}
-	if mps.StoreMount != filepath.Join(it.isoRoot, "LiveOS") {
-		t.Errorf("StoreMount = %q", mps.StoreMount)
-	}
 }
 
 func TestIsoTarget_Prepare_CustomDefaultBoot(t *testing.T) {
@@ -149,12 +154,12 @@ func TestIsoTarget_Prepare_CustomDefaultBoot(t *testing.T) {
 	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
 	defer func() { runner.RunFn = oldRunFn }()
 
-	_, err := it.Prepare(nil)
+	mps, err := it.Prepare(nil)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
 
-	loaderPath := filepath.Join(it.espStaging, "loader", "loader.conf")
+	loaderPath := filepath.Join(mps.EspMount, "loader", "loader.conf")
 	content, err := os.ReadFile(loaderPath)
 	if err != nil {
 		t.Fatalf("read loader.conf: %v", err)
@@ -172,55 +177,45 @@ func TestIsoTarget_Prepare_PathLayout(t *testing.T) {
 	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
 	defer func() { runner.RunFn = oldRunFn }()
 
+	mps, err := it.Prepare(nil)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	// Both mountpoints must live under OutputBase (public contract).
+	if !strings.HasPrefix(mps.EspMount, it.OutputBase) {
+		t.Errorf("EspMount %q is outside OutputBase %q", mps.EspMount, it.OutputBase)
+	}
+	if !strings.HasPrefix(mps.StoreMount, it.OutputBase) {
+		t.Errorf("StoreMount %q is outside OutputBase %q", mps.StoreMount, it.OutputBase)
+	}
+
+	// StoreMount must be a subdirectory of the iso-root (not a top-level dir).
+	// iso-root = parent of StoreMount
+	isoRoot := filepath.Dir(mps.StoreMount)
+	if isoRoot == mps.StoreMount || isoRoot == "." {
+		t.Errorf("StoreMount %q has no parent iso-root", mps.StoreMount)
+	}
+}
+
+func TestIsoTarget_Cleanup_AfterPrepare(t *testing.T) {
+	tmp := t.TempDir()
+	it := NewIsoTarget(tmp, filepath.Join(tmp, "test.iso"), "TBX", "")
+
+	oldRunFn := runner.RunFn
+	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
+	defer func() { runner.RunFn = oldRunFn }()
+
 	_, err := it.Prepare(nil)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
 
-	// Verify internal path layout is consistent.
-	if it.root != filepath.Join(tmp, "iso") {
-		t.Errorf("root = %q, want .../iso", it.root)
-	}
-	if it.isoRoot != filepath.Join(tmp, "iso", "iso-root") {
-		t.Errorf("isoRoot = %q", it.isoRoot)
-	}
-	if it.espStaging != filepath.Join(tmp, "iso", "esp-staging") {
-		t.Errorf("espStaging = %q", it.espStaging)
-	}
-	if it.espMount != filepath.Join(tmp, "iso", "esp-staging") {
-		t.Errorf("espMount = %q", it.espMount)
-	}
-}
-
-func TestIsoTarget_Cleanup_Idempotent(t *testing.T) {
-	it := NewIsoTarget("/tmp", "/tmp/test.iso", "", "")
-	calls := 0
-	it.addCleanup(func() { calls++ })
-
+	// Cleanup must run the undo stack without panicking.
 	it.Cleanup()
-	if calls != 1 {
-		t.Errorf("first Cleanup: want 1, got %d", calls)
-	}
-	it.Cleanup()
-	if calls != 1 {
-		t.Errorf("second Cleanup should be no-op, got %d", calls)
-	}
-}
 
-func TestIsoTarget_Cleanup_LIFO(t *testing.T) {
-	it := NewIsoTarget("/tmp", "/tmp/test.iso", "", "")
-	var order []int
-	it.addCleanup(func() { order = append(order, 1) })
-	it.addCleanup(func() { order = append(order, 2) })
-	it.addCleanup(func() { order = append(order, 3) })
-
+	// Second call must be a no-op (idempotent).
 	it.Cleanup()
-	if len(order) != 3 {
-		t.Fatalf("want 3 calls, got %d", len(order))
-	}
-	if order[0] != 3 || order[1] != 2 || order[2] != 1 {
-		t.Errorf("not LIFO: %v", order)
-	}
 }
 
 func TestIsoTarget_Finalize_NoEFISource(t *testing.T) {

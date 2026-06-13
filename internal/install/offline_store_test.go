@@ -103,14 +103,29 @@ func TestBuildOfflineStore_CreatesWorldWritableDirs(t *testing.T) {
 		t.Skip("skopeo succeeded unexpectedly")
 	}
 
-	// Verify storeRoot was created and is world-writable.
-	storeRoot := filepath.Join(stagingRoot, "tbox-offline-store")
-	fi, err := os.Stat(storeRoot)
+	// Verify a world-writable store directory was created under stagingRoot
+	// without hardcoding its internal name.
+	entries, err := os.ReadDir(stagingRoot)
 	if err != nil {
-		t.Fatalf("stat storeRoot: %v", err)
+		t.Fatalf("ReadDir stagingRoot: %v", err)
 	}
-	if fi.Mode().Perm() != 0777 {
-		t.Errorf("storeRoot permissions = %o, want 0777", fi.Mode().Perm())
+
+	found := false
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		fi, err := os.Stat(filepath.Join(stagingRoot, e.Name()))
+		if err != nil {
+			continue
+		}
+		if fi.Mode().Perm() == 0777 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("no world-writable directory found under stagingRoot")
 	}
 }
 

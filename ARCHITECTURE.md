@@ -247,10 +247,14 @@ the serial log (e.g. `tacklebox.env=alpha`, `Tacklebox: rebased OK`), and
 
 `.github/workflows/poc-artifacts.yml` (manual `workflow_dispatch` +
 weekly cron) builds the PoC ISOs — the fixture pair in both layouts, or a
-caller-supplied registry recipe — verifies them, and uploads to
-Cloudflare R2 (S3-compatible API) under `tacklebox/poc/<date>-<sha>/` plus
-a `latest/` server-side copy. Gated on `R2_*` repo secrets; absent them
-(forks) it still builds + verifies and just skips the upload.
+caller-supplied registry recipe — verifies them, and publishes to
+Cloudflare R2 with `rclone`, using the org-wide secrets
+(`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT`, `R2_BUCKET`)
+and the same convention as `dakota-iso`/`ubuntu-26.04-iso`: under the
+`tacklebox/` prefix as `<name>-<date>-<sha>.iso` plus a rolling
+`<name>-latest.iso`, served from `https://download.tunaos.org/tacklebox/`.
+Upload is skipped on PRs, on the `skip_upload` dry-run input, and on forks
+with no `R2_BUCKET`; build + verify always run.
 
 ## Key invariants
 

@@ -288,39 +288,46 @@ jobs:
 
 GitHub Actions artifacts expire and are awkward to share. For a stable
 download URL, push the ISO to an object store. R2 has no egress fees,
-which suits multi-GB ISOs. R2 exposes an S3-compatible API, so the
-standard `aws` CLI works — point it at the R2 endpoint.
+which suits multi-GB ISOs.
 
-Add four repo secrets — `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
-`R2_SECRET_ACCESS_KEY`, `R2_BUCKET` — then append this step:
+The tuna-os org publishes ISOs with **rclone** against the org-wide R2
+secrets — `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT`,
+`R2_BUCKET` — the same pattern as `dakota-iso` and `ubuntu-26.04-iso`.
+Each repo uploads under its own prefix in the shared bucket and serves
+from `https://download.tunaos.org/<prefix>/…`:
 
 ```yaml
-      - name: Upload ISO to R2
+      - name: Install rclone
+        run: sudo apt-get update && sudo apt-get install -y rclone
+
+      - name: Upload ISO to Cloudflare R2
+        if: ${{ github.event_name != 'pull_request' }}
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          # R2 predates aws-cli's default integrity checksums; keep the cli
-          # on the compatible path or uploads 501/400.
-          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
-          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_REGION: auto
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
-          ENDPOINT="https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
-          STAMP="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
-          aws s3 cp "/mnt/tbx/$ISO_NAME" \
-            "s3://${{ secrets.R2_BUCKET }}/iso/${STAMP}/$ISO_NAME" \
-            --endpoint-url "$ENDPOINT" --no-progress
+          DATED="my-iso-$(date -u +%Y%m%d)-${GITHUB_SHA::7}.iso"
+          BUCKET="${{ secrets.R2_BUCKET }}"
+          rclone copyto --checksum --s3-no-check-bucket \
+            "/mnt/tbx/$ISO_NAME" "R2:${BUCKET}/my-iso/${DATED}"
+          rclone copyto --s3-no-check-bucket \
+            "/mnt/tbx/$ISO_NAME" "R2:${BUCKET}/my-iso/my-iso-latest.iso"
 ```
 
-The two `AWS_*_CHECKSUM_*` vars are the usual gotcha: without them recent
-`aws-cli` versions send checksum headers R2 rejects.
+`--s3-no-check-bucket` skips the bucket-existence probe (the R2 token is
+usually scoped to one bucket and can't list); `--checksum` on the dated
+upload makes re-runs idempotent.
 
 This repo's own `.github/workflows/poc-artifacts.yml` is a complete,
 pinned example — it builds both ISO layouts (per-env + dedup), verifies
-them, writes a `SHA256SUMS`, and uploads to
-`tacklebox/poc/<date>-<sha>/` plus a `latest/` copy. It degrades
-gracefully: with the `R2_*` secrets unset (forks), it still builds and
-verifies and just skips the upload.
+them, writes a `SHA256SUMS`, and uploads each ISO as
+`tacklebox/<name>-<date>-<sha>.iso` plus a rolling `…-latest.iso`. It
+skips the upload on PRs, on the `skip_upload` dry-run input, and on forks
+where `R2_BUCKET` is unset — build + verify still run in all cases.
 
 ---
 

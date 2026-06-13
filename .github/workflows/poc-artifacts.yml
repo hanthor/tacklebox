@@ -1,17 +1,16 @@
 # Builds proof-of-concept multi-boot ISOs (per-env layout + cross-env-dedup
-# layout) and uploads them to Cloudflare R2.
+# layout) and publishes them to Cloudflare R2.
 #
-# Required repository secrets for the R2 upload (S3-compatible API):
-#   R2_ACCOUNT_ID         Cloudflare account ID (forms the endpoint URL)
-#   R2_ACCESS_KEY_ID      R2 API token key ID
-#   R2_SECRET_ACCESS_KEY  R2 API token secret
-#   R2_BUCKET             target bucket name
-# When the secrets are absent (forks, dry runs) the build and verify still
-# run; only the upload step is skipped.
+# Uses the org-wide R2 secrets and the same rclone pattern as the other
+# tuna-os ISO repos (dakota-iso, ubuntu-26.04-iso):
+#   R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ENDPOINT, R2_BUCKET
+# Artifacts land flat under the repo's prefix in the shared bucket:
+#   <bucket>/tacklebox/<name>-<YYYYMMDD>-<sha7>.iso   immutable, per-run
+#   <bucket>/tacklebox/<name>-latest.iso              rolling latest
+# Published at https://download.tunaos.org/tacklebox/<name>-latest.iso
 #
-# Objects land under:
-#   tacklebox/poc/<YYYYMMDD>-<sha7>/   immutable, per-run
-#   tacklebox/poc/latest/              server-side copy of the newest run
+# Upload is skipped on PRs, on the skip_upload dry-run input, and on forks
+# where R2_BUCKET is unset — the build + verify still run in all cases.
 name: poc-artifacts
 
 on:
@@ -25,6 +24,11 @@ on:
           prepared initramfs).
         required: false
         default: ""
+      skip_upload:
+        description: 'Build ISOs but skip uploading to R2 (dry run)'
+        required: false
+        default: false
+        type: boolean
   schedule:
     # Weekly, Monday 05:00 UTC — keeps the PoC artifacts fresh against
     # upstream image updates without burning runners daily.
@@ -41,8 +45,8 @@ jobs:
     permissions:
       contents: read
     env:
-      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      # Mapped to env so the upload step's `if:` can detect a fork with no
+      # secrets (secrets aren't available in job-level `if:` directly).
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -67,7 +71,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             xorriso mtools squashfs-tools dosfstools \
-            systemd-boot systemd-boot-efi podman
+            systemd-boot systemd-boot-efi podman rclone
 
       - name: build tacklebox
         run: go build -o tacklebox ./cmd/tacklebox
@@ -125,37 +129,36 @@ jobs:
           cat SHA256SUMS
 
       - name: upload to R2
-        if: env.R2_ACCESS_KEY_ID != '' && env.R2_BUCKET != ''
+        if: ${{ inputs.skip_upload != true && github.event_name != 'pull_request' && env.R2_BUCKET != '' }}
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          # R2 predates the aws-cli v2.23+ default integrity checksums;
-          # when_required keeps the cli on the compatible code path.
-          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
-          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_REGION: auto
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
-          ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           STAMP="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
-          for f in /mnt/tbx/*.iso /mnt/tbx/SHA256SUMS; do
-            name=$(basename "$f")
-            aws s3 cp "$f" "s3://${R2_BUCKET}/tacklebox/poc/${STAMP}/${name}" \
-              --endpoint-url "$ENDPOINT" --no-progress
-            # latest/ is a server-side copy — no second upload.
-            aws s3 cp "s3://${R2_BUCKET}/tacklebox/poc/${STAMP}/${name}" \
-              "s3://${R2_BUCKET}/tacklebox/poc/latest/${name}" \
-              --endpoint-url "$ENDPOINT" --no-progress
-          done
+          PREFIX="R2:${R2_BUCKET}/tacklebox"
           {
             echo "## PoC artifacts uploaded to R2"
-            echo "- \`tacklebox/poc/${STAMP}/\`"
-            echo "- \`tacklebox/poc/latest/\`"
           } >> "$GITHUB_STEP_SUMMARY"
+          for iso in /mnt/tbx/*.iso; do
+            base=$(basename "$iso" .iso)
+            echo "==> Uploading ${base} (dated + latest) ..."
+            rclone copyto --log-level INFO --checksum --s3-no-check-bucket \
+              "$iso" "${PREFIX}/${base}-${STAMP}.iso"
+            rclone copyto --log-level INFO --s3-no-check-bucket \
+              "$iso" "${PREFIX}/${base}-latest.iso"
+            echo "- https://download.tunaos.org/tacklebox/${base}-latest.iso" >> "$GITHUB_STEP_SUMMARY"
+          done
+          rclone copyto --log-level INFO --s3-no-check-bucket \
+            /mnt/tbx/SHA256SUMS "${PREFIX}/SHA256SUMS-${STAMP}"
 
       - name: note skipped upload
-        if: env.R2_ACCESS_KEY_ID == '' || env.R2_BUCKET == ''
+        if: ${{ inputs.skip_upload == true || github.event_name == 'pull_request' || env.R2_BUCKET == '' }}
         run: |
-          echo '## R2 upload skipped (R2_* secrets not configured)' >> "$GITHUB_STEP_SUMMARY"
+          echo '## R2 upload skipped (dry run, PR, or R2 secrets unset)' >> "$GITHUB_STEP_SUMMARY"
 
       - name: artifact summary
         if: always()

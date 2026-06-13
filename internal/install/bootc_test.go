@@ -1,10 +1,15 @@
 package install
 
 import (
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/tuna-os/tacklebox/internal/runner"
 )
 
 func TestParseBackend(t *testing.T) {
@@ -64,4 +69,60 @@ func skipIfNoSudo(t *testing.T) {
 	if _, err := exec.LookPath("sudo"); err != nil {
 		t.Skip("sudo not available in test environment")
 	}
+}
+
+// TestPullUser_TargetsUserStore verifies PullUser pulls into the invoking
+// user's rootless store (via the SUDO_USER drop-back prefix), not root's
+// store — the regression guard for ISO builds double-pulling images.
+func TestPullUser_TargetsUserStore(t *testing.T) {
+	t.Setenv("SUDO_USER", "alice")
+	oldRunFn := runner.RunFn
+	defer func() { runner.RunFn = oldRunFn }()
+
+	var calls [][]string
+	runner.RunFn = func(_ io.Reader, name string, args ...string) error {
+		calls = append(calls, append([]string{name}, args...))
+		if contains(args, "exists") {
+			return errors.New("not present")
+		}
+		return nil
+	}
+
+	if err := PullUser("ghcr.io/x/y:latest"); err != nil {
+		t.Fatalf("PullUser: %v", err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("want 2 calls (exists, pull), got %d: %#v", len(calls), calls)
+	}
+	for _, c := range calls {
+		if c[0] != "sudo" || c[1] != "-u" || c[2] != "alice" {
+			t.Errorf("call did not target user store: %#v", c)
+		}
+	}
+	if last := calls[1]; last[len(last)-1] != "ghcr.io/x/y:latest" || !contains(last, "pull") {
+		t.Errorf("second call is not a pull of the image: %#v", last)
+	}
+}
+
+func TestPullUser_RejectsMissingLocalhost(t *testing.T) {
+	t.Setenv("SUDO_USER", "")
+	oldRunFn := runner.RunFn
+	defer func() { runner.RunFn = oldRunFn }()
+
+	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error {
+		return errors.New("not present")
+	}
+	err := PullUser("localhost/tbox-iso-alpha:latest")
+	if err == nil || !strings.Contains(err.Error(), "not found in the invoking user's podman store") {
+		t.Fatalf("want localhost-not-found error, got %v", err)
+	}
+}
+
+func contains(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }

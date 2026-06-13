@@ -26,6 +26,9 @@ import (
 //                                   firmware that ignores El Torito
 //   /images/pxeboot/<env>/{vmlinuz,initrd.img}    loopback boot copies
 //   /LiveOS/<env>.rootfs.sfs        per-env rootfs squashfs
+//   /LiveOS/combined.rootfs.sfs     (shared_store.dedup) ONE squashfs,
+//                                   one subtree per env, instead of the
+//                                   per-env files above
 //
 // During Prepare we hand the orchestrator:
 //   EspMount   = <OutputBase>/iso/esp-staging   (becomes efi.img later)

@@ -344,3 +344,34 @@ func TestComputePartitions(t *testing.T) {
 		}
 	})
 }
+
+func TestEnvTitle(t *testing.T) {
+	withTitle := recipe.BootableEnvironment{ID: "bluefin", Title: "Bluefin (GNOME)"}
+	if got := envTitle(withTitle, "live"); got != "Bluefin (GNOME) (live)" {
+		t.Errorf("envTitle with title = %q", got)
+	}
+	noTitle := recipe.BootableEnvironment{ID: "bazzite"}
+	if got := envTitle(noTitle, "persistent"); got != "bazzite (persistent)" {
+		t.Errorf("envTitle without title = %q", got)
+	}
+}
+
+func TestBuildLiveKernelCmdlineCombined(t *testing.T) {
+	got := buildLiveKernelCmdlineCombined("bazzite", "TBX_ISO")
+	for _, want := range []string{
+		"root=live:CDLABEL=TBX_ISO",
+		"rd.live.squashimg=combined.rootfs.sfs",
+		"tacklebox.root=bazzite",
+		"tacklebox.env=bazzite",
+		"rd.live.overlay.overlayfs=1",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("combined cmdline missing %q: %s", want, got)
+		}
+	}
+	// The plain per-env variant must NOT carry the pivot arg — tbox-root
+	// would try to rebase /sysroot onto a subdir that doesn't exist.
+	if plain := buildLiveKernelCmdline("bazzite", "TBX_ISO"); strings.Contains(plain, "tacklebox.root=") {
+		t.Errorf("per-env cmdline must not set tacklebox.root: %s", plain)
+	}
+}

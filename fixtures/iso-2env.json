@@ -1,0 +1,22 @@
+{
+  "media_name": "TBX_ISO_SMOKE",
+  "size": "20G",
+  "default_boot": "beta",
+  "shared_store": {
+    "format": "ext4"
+  },
+  "bootable_environments": [
+    {
+      "id": "alpha",
+      "image": "localhost/tbox-iso-alpha:latest",
+      "title": "Fixture Alpha",
+      "modes": ["live"]
+    },
+    {
+      "id": "beta",
+      "image": "localhost/tbox-iso-beta:latest",
+      "title": "Fixture Beta",
+      "modes": ["live"]
+    }
+  ]
+}

@@ -119,6 +119,11 @@ func verifyIso(path string) []checkResult {
 		results = append(results, checkBLSResolves(e, fatFiles, "ESP"))
 	}
 
+	// Combined-squashfs layout (shared_store.dedup): every entry points
+	// at the same rd.live.squashimg and per-env distinctness lives in the
+	// tacklebox.root= pivot instead of separate squashfs files.
+	results = append(results, checkCombinedPivots(entries)...)
+
 	// Per-env squashfs distinctness. We hash the first 1 MiB of each
 	// /LiveOS/<env>.rootfs.sfs (full hash would mean reading 5+ GB through
 	// xorriso for a multi-env ISO; the first MiB diverges the moment
@@ -285,11 +290,13 @@ func verifyBlock(path string) []checkResult {
 	return results
 }
 
-// blsEntry is a minimal parse — we only care about linux + initrd lines.
+// blsEntry is a minimal parse — linux + initrd for resolution checks,
+// options for the combined-squashfs pivot checks.
 type blsEntry struct {
-	name   string
-	linux  string
-	initrd string
+	name    string
+	linux   string
+	initrd  string
+	options string
 }
 
 func parseBLSEntry(body string) blsEntry {
@@ -304,9 +311,73 @@ func parseBLSEntry(body string) blsEntry {
 			e.linux = fields[1]
 		case "initrd":
 			e.initrd = fields[1]
+		case "options":
+			e.options = strings.Join(fields[1:], " ")
 		}
 	}
 	return e
+}
+
+// blsOption pulls a single key=value off an options line ("" if absent).
+func blsOption(options, key string) string {
+	for _, f := range strings.Fields(options) {
+		if strings.HasPrefix(f, key+"=") {
+			return strings.TrimPrefix(f, key+"=")
+		}
+	}
+	return ""
+}
+
+// checkCombinedPivots validates the combined-squashfs layout: when
+// multiple BLS entries share one rd.live.squashimg, each must carry a
+// distinct tacklebox.root= so the tbox-root module pivots every entry
+// into its own subtree. Two entries sharing a pivot would boot identical
+// content — the combined-layout analogue of the squashfs-hash collision.
+// Returns nil for non-combined (per-env squashimg) ISOs.
+func checkCombinedPivots(entries []blsEntry) []checkResult {
+	squashimgs := map[string]bool{}
+	for _, e := range entries {
+		if v := blsOption(e.options, "rd.live.squashimg"); v != "" {
+			squashimgs[v] = true
+		}
+	}
+	if len(squashimgs) != 1 || len(entries) < 2 {
+		return nil
+	}
+
+	var results []checkResult
+	pivots := map[string][]string{}
+	var missing []string
+	for _, e := range entries {
+		root := blsOption(e.options, "tacklebox.root")
+		if root == "" {
+			missing = append(missing, e.name)
+			continue
+		}
+		pivots[root] = append(pivots[root], e.name)
+	}
+	if len(missing) > 0 {
+		results = append(results, checkResult{
+			"combined squashfs entries carry tacklebox.root=",
+			fmt.Errorf("entries missing the pivot arg: %v", missing),
+		})
+	}
+	collisions := 0
+	for root, names := range pivots {
+		if len(names) > 1 {
+			collisions++
+			results = append(results, checkResult{
+				"combined squashfs per-env pivot distinct",
+				fmt.Errorf("%d entries share tacklebox.root=%s: %v", len(names), root, names),
+			})
+		}
+	}
+	if collisions == 0 && len(missing) == 0 {
+		results = append(results, checkResult{
+			fmt.Sprintf("combined squashfs: %d entries pivot to %d distinct env roots", len(entries), len(pivots)), nil,
+		})
+	}
+	return results
 }
 
 func checkBLSResolves(e blsEntry, files map[string]bool, label string) checkResult {

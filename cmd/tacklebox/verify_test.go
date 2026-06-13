@@ -88,3 +88,59 @@ func TestCheckBLSResolves(t *testing.T) {
 		})
 	}
 }
+
+func TestBLSOption(t *testing.T) {
+	opts := "root=live:CDLABEL=X rd.live.squashimg=combined.rootfs.sfs tacklebox.root=bluefin"
+	if got := blsOption(opts, "rd.live.squashimg"); got != "combined.rootfs.sfs" {
+		t.Errorf("squashimg = %q", got)
+	}
+	if got := blsOption(opts, "tacklebox.root"); got != "bluefin" {
+		t.Errorf("tacklebox.root = %q", got)
+	}
+	// Prefix must not match a longer key (tacklebox.root vs tacklebox.rootflags).
+	if got := blsOption("tacklebox.rootflags=x", "tacklebox.root"); got != "" {
+		t.Errorf("prefix collision: got %q, want empty", got)
+	}
+}
+
+func TestCheckCombinedPivots(t *testing.T) {
+	combined := func(name, root string) blsEntry {
+		return blsEntry{name: name, options: "rd.live.squashimg=combined.rootfs.sfs tacklebox.root=" + root}
+	}
+
+	// Healthy combined layout: distinct pivots, one OK result.
+	rs := checkCombinedPivots([]blsEntry{combined("a.conf", "bluefin"), combined("b.conf", "bazzite")})
+	if len(rs) != 1 || rs[0].err != nil {
+		t.Errorf("healthy combined: got %+v", rs)
+	}
+
+	// Shared pivot = collision.
+	rs = checkCombinedPivots([]blsEntry{combined("a.conf", "bluefin"), combined("b.conf", "bluefin")})
+	if len(rs) == 0 || rs[len(rs)-1].err == nil {
+		t.Errorf("shared pivot should fail: %+v", rs)
+	}
+
+	// Missing pivot arg on one entry.
+	rs = checkCombinedPivots([]blsEntry{
+		combined("a.conf", "bluefin"),
+		{name: "b.conf", options: "rd.live.squashimg=combined.rootfs.sfs"},
+	})
+	var failed bool
+	for _, r := range rs {
+		if r.err != nil {
+			failed = true
+		}
+	}
+	if !failed {
+		t.Errorf("missing tacklebox.root should fail: %+v", rs)
+	}
+
+	// Per-env layout (distinct squashimgs): not combined, no results.
+	perEnv := []blsEntry{
+		{name: "a.conf", options: "rd.live.squashimg=bluefin.rootfs.sfs"},
+		{name: "b.conf", options: "rd.live.squashimg=bazzite.rootfs.sfs"},
+	}
+	if rs := checkCombinedPivots(perEnv); rs != nil {
+		t.Errorf("per-env layout should be skipped: %+v", rs)
+	}
+}

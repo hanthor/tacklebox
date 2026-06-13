@@ -15,7 +15,7 @@ func TestWriteBLSEntry(t *testing.T) {
 	initrdPath := "EFI/test-env/initrd.img"
 	options := "root=LABEL=TBOX_STORE rw"
 
-	err := WriteBLSEntry(tmp, id, title, kernelPath, initrdPath, options)
+	err := WriteBLSEntry(tmp, id, title, kernelPath, initrdPath, options, false)
 	if err != nil {
 		t.Fatalf("WriteBLSEntry failed: %v", err)
 	}
@@ -45,12 +45,10 @@ func TestWriteBLSEntry(t *testing.T) {
 }
 
 func TestWriteBLSEntry_SortKeyPrefix(t *testing.T) {
-	// The sort-key must use the 0-tbox- prefix so entries outrank
-	// bootc's own auto-generated entries (which use bootc-* keys).
 	tmp := t.TempDir()
 
 	id := "aurora"
-	err := WriteBLSEntry(tmp, id, "Aurora", "EFI/aurora/vmlinuz", "EFI/aurora/initrd.img", "rw")
+	err := WriteBLSEntry(tmp, id, "Aurora", "EFI/aurora/vmlinuz", "EFI/aurora/initrd.img", "rw", false)
 	if err != nil {
 		t.Fatalf("WriteBLSEntry failed: %v", err)
 	}
@@ -66,14 +64,33 @@ func TestWriteBLSEntry_SortKeyPrefix(t *testing.T) {
 	}
 }
 
+func TestWriteBLSEntry_DefaultEntry(t *testing.T) {
+	tmp := t.TempDir()
+
+	err := WriteBLSEntry(tmp, "bluefin", "Bluefin", "EFI/bluefin/vmlinuz", "EFI/bluefin/initrd.img", "rw", true)
+	if err != nil {
+		t.Fatalf("WriteBLSEntry failed: %v", err)
+	}
+
+	entryPath := filepath.Join(tmp, "loader", "entries", "bluefin.conf")
+	content, err := os.ReadFile(entryPath)
+	if err != nil {
+		t.Fatalf("read entry: %v", err)
+	}
+
+	if !strings.Contains(string(content), "sort-key 00-tbox-bluefin") {
+		t.Errorf("default entry missing 00-tbox- prefix: %s", string(content))
+	}
+}
+
 func TestWriteBLSEntry_MultipleEntries(t *testing.T) {
 	tmp := t.TempDir()
 
-	err := WriteBLSEntry(tmp, "bluefin-live", "bluefin (live)", "EFI/bluefin/vmlinuz", "EFI/bluefin/initrd.img", "rw")
+	err := WriteBLSEntry(tmp, "bluefin-live", "bluefin (live)", "EFI/bluefin/vmlinuz", "EFI/bluefin/initrd.img", "rw", false)
 	if err != nil {
 		t.Fatalf("first entry failed: %v", err)
 	}
-	err = WriteBLSEntry(tmp, "bluefin-persistent", "bluefin (persistent)", "EFI/bluefin/vmlinuz", "EFI/bluefin/initrd.img", "rw persist")
+	err = WriteBLSEntry(tmp, "bluefin-persistent", "bluefin (persistent)", "EFI/bluefin/vmlinuz", "EFI/bluefin/initrd.img", "rw persist", false)
 	if err != nil {
 		t.Fatalf("second entry failed: %v", err)
 	}
@@ -90,9 +107,8 @@ func TestWriteBLSEntry_MultipleEntries(t *testing.T) {
 
 func TestWriteBLSEntry_CreatesEntryDir(t *testing.T) {
 	tmp := t.TempDir()
-	// Only tmp exists — no loader/entries yet.
 
-	err := WriteBLSEntry(tmp, "test", "Test", "vmlinuz", "initrd", "rw")
+	err := WriteBLSEntry(tmp, "test", "Test", "vmlinuz", "initrd", "rw", false)
 	if err != nil {
 		t.Fatalf("WriteBLSEntry failed: %v", err)
 	}

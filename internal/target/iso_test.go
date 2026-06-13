@@ -255,13 +255,13 @@ func TestIsoTarget_Finalize_WithEFISource(t *testing.T) {
 	os.MkdirAll(filepath.Join(it.isoRoot, "images", "pxeboot"), 0755)
 
 	oldRunFn := runner.RunFn
-	oldOutput := runner.Output
+	oldOutputFn := runner.OutputFn
 	defer func() {
 		runner.RunFn = oldRunFn
-		runner.Output = oldOutput
+		runner.OutputFn = oldOutputFn
 	}()
 
-	runner.Output = func(name string, args ...string) ([]byte, error) {
+	runner.OutputFn = func(name string, args ...string) ([]byte, error) {
 		if name == "sudo" && len(args) >= 2 && args[1] == "du" {
 			return []byte("1024\t/path\n"), nil
 		}
@@ -294,13 +294,13 @@ func TestIsoTarget_AssembleEspImage(t *testing.T) {
 	os.MkdirAll(filepath.Join(it.isoRoot, "EFI"), 0755)
 
 	oldRunFn := runner.RunFn
-	oldOutput := runner.Output
+	oldOutputFn := runner.OutputFn
 	defer func() {
 		runner.RunFn = oldRunFn
-		runner.Output = oldOutput
+		runner.OutputFn = oldOutputFn
 	}()
 
-	runner.Output = func(name string, args ...string) ([]byte, error) {
+	runner.OutputFn = func(name string, args ...string) ([]byte, error) {
 		return []byte("512\n"), nil
 	}
 	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }

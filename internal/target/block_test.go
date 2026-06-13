@@ -171,14 +171,14 @@ func TestBlockTarget_Prepare_LoopImage(t *testing.T) {
 	noopTrack := func(name string, fn func() error) error { return fn() }
 
 	oldRunFn := runner.RunFn
-	oldOutput := runner.Output
+	oldOutputFn := runner.OutputFn
 	defer func() {
 		runner.RunFn = oldRunFn
-		runner.Output = oldOutput
+		runner.OutputFn = oldOutputFn
 	}()
 
 	// Simulate successful truncate
-	runner.Output = func(name string, args ...string) ([]byte, error) {
+	runner.OutputFn = func(name string, args ...string) ([]byte, error) {
 		// losetup: return a fake loop device path
 		if name == "sudo" && len(args) >= 2 && args[1] == "losetup" {
 			return []byte("/dev/loop99\n"), nil
@@ -274,14 +274,14 @@ func TestBlockTarget_Prepare_LosupFailure(t *testing.T) {
 	bt := NewBlockTarget(tmp, "", "2G", parts)
 
 	oldRunFn := runner.RunFn
-	oldOutput := runner.Output
+	oldOutputFn := runner.OutputFn
 	defer func() {
 		runner.RunFn = oldRunFn
-		runner.Output = oldOutput
+		runner.OutputFn = oldOutputFn
 	}()
 
 	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
-	runner.Output = func(name string, args ...string) ([]byte, error) {
+	runner.OutputFn = func(name string, args ...string) ([]byte, error) {
 		if len(args) >= 2 && args[1] == "losetup" {
 			return nil, io.ErrUnexpectedEOF
 		}

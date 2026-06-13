@@ -68,7 +68,13 @@ func RunWithStdin(stdin io.Reader, name string, args ...string) error {
 	return RunFn(stdin, name, args...)
 }
 
+var OutputFn = outputImpl
+
 func Output(name string, args ...string) ([]byte, error) {
+	return OutputFn(name, args...)
+}
+
+func outputImpl(name string, args ...string) ([]byte, error) {
 	name, args = HostArgs(name, args)
 	cmd := exec.Command(name, args...)
 	var stderrBuf bytes.Buffer
@@ -84,10 +90,16 @@ func Output(name string, args ...string) ([]byte, error) {
 	return out, nil
 }
 
+var RunCombinedFn = runCombinedImpl
+
 // RunCombined runs a command and returns combined stdout+stderr regardless of
 // exit status, plus the error. Useful for commands like sgdisk where the
 // caller wants to inspect output to decide whether a non-zero exit is fatal.
 func RunCombined(name string, args ...string) ([]byte, error) {
+	return RunCombinedFn(name, args...)
+}
+
+func runCombinedImpl(name string, args ...string) ([]byte, error) {
 	name, args = HostArgs(name, args)
 	cmd := exec.Command(name, args...)
 	if Verbose {

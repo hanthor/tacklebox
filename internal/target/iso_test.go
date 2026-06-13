@@ -262,7 +262,7 @@ func TestIsoTarget_Finalize_WithEFISource(t *testing.T) {
 	}()
 
 	runner.OutputFn = func(name string, args ...string) ([]byte, error) {
-		if name == "sudo" && len(args) >= 2 && args[1] == "du" {
+		if name == "sudo" && len(args) >= 1 && args[0] == "du" {
 			return []byte("1024\t/path\n"), nil
 		}
 		return nil, nil

@@ -3,7 +3,6 @@ package target
 import (
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,12 +11,18 @@ import (
 	"github.com/tuna-os/tacklebox/internal/runner"
 )
 
-// needsSgdisk skips the test if sgdisk is not in PATH.
-func needsSgdisk(t *testing.T) {
+// fakeBootctl creates a stub bootctl executable in a temp dir and prepends
+// it to PATH so exec.LookPath("bootctl") succeeds. Returns the original PATH.
+func fakeBootctl(t *testing.T) (restore func()) {
 	t.Helper()
-	if _, err := exec.LookPath("sgdisk"); err != nil {
-		t.Skip("sgdisk not available in test environment")
+	d := t.TempDir()
+	// Write a no-op shell script so any real invocation exits cleanly.
+	if err := os.WriteFile(filepath.Join(d, "bootctl"), []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("create fake bootctl: %v", err)
 	}
+	orig := os.Getenv("PATH")
+	t.Setenv("PATH", d+":"+orig)
+	return func() { os.Setenv("PATH", orig) }
 }
 
 func TestNewBlockTarget_LoopImage(t *testing.T) {
@@ -159,7 +164,7 @@ func TestBlockTarget_Finalize_RealDevice(t *testing.T) {
 }
 
 func TestBlockTarget_Prepare_LoopImage(t *testing.T) {
-	needsSgdisk(t)
+	fakeBootctl(t)
 	tmp := t.TempDir()
 	parts := []blockdev.Partition{
 		{Size: "+1G", FS: "vfat", Label: "ESP"},
@@ -172,15 +177,17 @@ func TestBlockTarget_Prepare_LoopImage(t *testing.T) {
 
 	oldRunFn := runner.RunFn
 	oldOutputFn := runner.OutputFn
+	oldRunCombinedFn := runner.RunCombinedFn
 	defer func() {
 		runner.RunFn = oldRunFn
 		runner.OutputFn = oldOutputFn
+		runner.RunCombinedFn = oldRunCombinedFn
 	}()
 
 	// Simulate successful truncate
 	runner.OutputFn = func(name string, args ...string) ([]byte, error) {
 		// losetup: return a fake loop device path
-		if name == "sudo" && len(args) >= 2 && args[1] == "losetup" {
+		if name == "sudo" && len(args) >= 1 && args[0] == "losetup" {
 			return []byte("/dev/loop99\n"), nil
 		}
 		return nil, nil
@@ -200,6 +207,14 @@ func TestBlockTarget_Prepare_LoopImage(t *testing.T) {
 		}
 		// Allow udevadm settle, mount, etc.
 		return nil
+	}
+
+	runner.RunCombinedFn = func(name string, args ...string) ([]byte, error) {
+		// sgdisk: return fake success output
+		if name == "sgdisk" {
+			return []byte("GPT faked\n"), nil
+		}
+		return nil, nil
 	}
 
 	mps, err := bt.Prepare(noopTrack)
@@ -232,7 +247,7 @@ func TestBlockTarget_Prepare_LoopImage(t *testing.T) {
 }
 
 func TestBlockTarget_Prepare_RealDevice(t *testing.T) {
-	needsSgdisk(t)
+	fakeBootctl(t)
 	tmp := t.TempDir()
 	parts := []blockdev.Partition{
 		{Size: "+1G", FS: "vfat", Label: "ESP"},
@@ -242,9 +257,20 @@ func TestBlockTarget_Prepare_RealDevice(t *testing.T) {
 	bt := NewBlockTarget(tmp, "/dev/sdb", "", parts)
 
 	oldRunFn := runner.RunFn
-	defer func() { runner.RunFn = oldRunFn }()
+	oldRunCombinedFn := runner.RunCombinedFn
+	defer func() {
+		runner.RunFn = oldRunFn
+		runner.RunCombinedFn = oldRunCombinedFn
+	}()
 
 	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
+
+	runner.RunCombinedFn = func(name string, args ...string) ([]byte, error) {
+		if name == "sgdisk" {
+			return []byte("GPT faked\n"), nil
+		}
+		return nil, nil
+	}
 
 	// no-op tracker to avoid nil pointer dereference
 	noopTrack := func(name string, fn func() error) error { return fn() }
@@ -266,23 +292,29 @@ func TestBlockTarget_Prepare_RealDevice(t *testing.T) {
 }
 
 func TestBlockTarget_Prepare_LosupFailure(t *testing.T) {
-	// sgdiskTolerant uses RunCombined which is not mockable.
-	needsSgdisk(t)
-
+	fakeBootctl(t)
 	tmp := t.TempDir()
 	parts := []blockdev.Partition{{Size: "+1G", FS: "vfat"}}
 	bt := NewBlockTarget(tmp, "", "2G", parts)
 
 	oldRunFn := runner.RunFn
 	oldOutputFn := runner.OutputFn
+	oldRunCombinedFn := runner.RunCombinedFn
 	defer func() {
 		runner.RunFn = oldRunFn
 		runner.OutputFn = oldOutputFn
+		runner.RunCombinedFn = oldRunCombinedFn
 	}()
 
 	runner.RunFn = func(_ io.Reader, _ string, _ ...string) error { return nil }
+	runner.RunCombinedFn = func(name string, args ...string) ([]byte, error) {
+		if name == "sgdisk" {
+			return []byte("GPT faked\n"), nil
+		}
+		return nil, nil
+	}
 	runner.OutputFn = func(name string, args ...string) ([]byte, error) {
-		if len(args) >= 2 && args[1] == "losetup" {
+		if name == "sudo" && len(args) >= 1 && args[0] == "losetup" {
 			return nil, io.ErrUnexpectedEOF
 		}
 		return nil, nil

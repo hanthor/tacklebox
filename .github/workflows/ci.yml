@@ -124,9 +124,21 @@ jobs:
             tbox-build-cache-
 
       - name: pre-pull fixture images
+        # Quay CDN occasionally drops blobs mid-transfer (unexpected EOF).
+        # Retry up to 3 times with exponential backoff.
         run: |
-          sudo podman pull quay.io/centos-bootc/centos-bootc:stream10
-          sudo podman pull quay.io/fedora/fedora-bootc:44
+          for img in quay.io/centos-bootc/centos-bootc:stream10 quay.io/fedora/fedora-bootc:44; do
+            ok=0
+            for i in 1 2 3; do
+              echo ">>> pull $img (attempt $i/3)"
+              if sudo podman pull "$img"; then ok=1; break; fi
+              sleep $((i * 10))
+            done
+            if [ "$ok" -eq 0 ]; then
+              echo "::error::failed to pull $img after 3 attempts"
+              exit 1
+            fi
+          done
 
       - name: tacklebox build (2-env block image)
         run: |

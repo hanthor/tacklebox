@@ -177,6 +177,27 @@ jobs:
       - name: UnmountDevice loop smoke (integration)
         run: go test -tags=integration -v -run=TestUnmountDevice_LoopSmoke ./internal/blockdev/...
 
+      # ── Stage 3d: add / remove smoke ────────────────────────────────────
+      # Adds a third env (using the already-pulled centos-bootc image) to
+      # the 2-env image, verifies the 3-env result, then removes the added
+      # env and verifies the image is back to 2-env. Exercises the full
+      # add/remove mutation pipeline without reformatting.
+      - name: tacklebox add (3rd env)
+        run: |
+          sudo ./tacklebox add fixtures/smoke-add.json \
+            /mnt/tbx/tacklebox.img --yes -b /mnt/tbx
+
+      - name: tacklebox verify (post-add, 3 envs)
+        run: sudo ./tacklebox verify /mnt/tbx/tacklebox.img
+
+      - name: tacklebox remove (the added env)
+        run: |
+          sudo ./tacklebox remove centos-add \
+            /mnt/tbx/tacklebox.img --yes -b /mnt/tbx
+
+      - name: tacklebox verify (post-remove, back to 2 envs)
+        run: sudo ./tacklebox verify /mnt/tbx/tacklebox.img
+
       # Stage 4: Boot smoke. We use TCG (no KVM on free runners) so it's
       # slow (~3 min to login).
       - name: tacklebox boot smoke (Stage 4)

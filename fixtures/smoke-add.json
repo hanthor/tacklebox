@@ -1,0 +1,14 @@
+{
+  "media_name": "TBX_SMOKE_ADD",
+  "size": "10G",
+  "shared_store": {
+    "format": "ext4"
+  },
+  "bootable_environments": [
+    {
+      "id": "centos-add",
+      "image": "quay.io/centos-bootc/centos-bootc:stream10",
+      "modes": ["live"]
+    }
+  ]
+}

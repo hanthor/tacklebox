@@ -12,7 +12,7 @@
     },
     {
       "id": "fedora",
-      "image": "quay.io/fedora/fedora-bootc:42",
+      "image": "quay.io/fedora/fedora-bootc:44",
       "modes": ["live"]
     }
   ]

@@ -1,14 +1,25 @@
 #!/bin/bash
-# test-boot.sh <image> [timeout_sec]
+# test-boot.sh <image> [timeout_sec] [required-pattern ...]
 #
-# Boots a tacklebox image in QEMU and asserts that it reaches userspace.
+# Boots a tacklebox image or ISO in QEMU and asserts that it reaches
+# userspace. Any extra arguments are literal strings that must ALSO appear
+# in the serial log before the timeout — use them to assert which env
+# booted ("tacklebox.env=alpha" shows up in the kernel's command-line echo)
+# or that the dedup pivot ran ("Tacklebox: rebased OK").
+#
+# QEMU_LOG overrides the serial log filename (default qemu-boot.log) so
+# multiple boots in one CI job keep separate logs.
+#
 # Requires qemu-system-x86_64 and OVMF.
 
 set -euo pipefail
 
 IMG="$1"
 TIMEOUT="${2:-300}"
-LOG="qemu-boot.log"
+shift
+if [ $# -gt 0 ]; then shift; fi
+REQUIRED=("$@")
+LOG="${QEMU_LOG:-qemu-boot.log}"
 VARS="OVMF_VARS_test.fd"
 
 if [ ! -f "$IMG" ]; then
@@ -132,6 +143,9 @@ while true; do
     
     if [ "$ELAPSED" -gt "$TIMEOUT" ]; then
         echo ">>> ERROR: Timeout reached after ${ELAPSED}s"
+        for req in ${REQUIRED[@]+"${REQUIRED[@]}"}; do
+            grep -qF "$req" "$LOG" || echo ">>> missing required pattern: $req"
+        done
         echo ">>> Last 20 lines of $LOG:"
         tail -n 20 "$LOG"
         exit 1
@@ -144,11 +158,21 @@ while true; do
         exit 1
     fi
 
-    # Check for success (we want to see at least 'Welcome to' or 'login:')
+    # Check for success: at least one userspace pattern AND every
+    # caller-required literal must be present.
     if grep -qE "$PATTERN_REGEX" "$LOG"; then
-        echo ">>> SUCCESS: Reached expected pattern after ${ELAPSED}s"
-        SUCCESS=1
-        break
+        ALL_REQUIRED=1
+        for req in ${REQUIRED[@]+"${REQUIRED[@]}"}; do
+            if ! grep -qF "$req" "$LOG"; then
+                ALL_REQUIRED=0
+                break
+            fi
+        done
+        if [ "$ALL_REQUIRED" -eq 1 ]; then
+            echo ">>> SUCCESS: Reached expected pattern after ${ELAPSED}s"
+            SUCCESS=1
+            break
+        fi
     fi
 
     sleep 2

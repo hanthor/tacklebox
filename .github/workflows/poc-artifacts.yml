@@ -1,0 +1,169 @@
+# Builds proof-of-concept multi-boot ISOs (per-env layout + cross-env-dedup
+# layout) and uploads them to Cloudflare R2.
+#
+# Required repository secrets for the R2 upload (S3-compatible API):
+#   R2_ACCOUNT_ID         Cloudflare account ID (forms the endpoint URL)
+#   R2_ACCESS_KEY_ID      R2 API token key ID
+#   R2_SECRET_ACCESS_KEY  R2 API token secret
+#   R2_BUCKET             target bucket name
+# When the secrets are absent (forks, dry runs) the build and verify still
+# run; only the upload step is skipped.
+#
+# Objects land under:
+#   tacklebox/poc/<YYYYMMDD>-<sha7>/   immutable, per-run
+#   tacklebox/poc/latest/              server-side copy of the newest run
+name: poc-artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      recipe:
+        description: >-
+          Optional recipe path to build instead of the fixture PoC pair.
+          Images must be pullable from a registry (and live-bootable:
+          dracut + dracut-live installed, or skip_initramfs_rebuild with a
+          prepared initramfs).
+        required: false
+        default: ""
+  schedule:
+    # Weekly, Monday 05:00 UTC — keeps the PoC artifacts fresh against
+    # upstream image updates without burning runners daily.
+    - cron: '0 5 * * 1'
+
+concurrency:
+  group: poc-artifacts
+  cancel-in-progress: true
+
+jobs:
+  build-poc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+
+      - name: free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main as of 2026-06-09
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xorriso mtools squashfs-tools dosfstools \
+            systemd-boot systemd-boot-efi podman
+
+      - name: build tacklebox
+        run: go build -o tacklebox ./cmd/tacklebox
+
+      # The caches only pay off for registry-image recipes (stable image
+      # IDs between runs); the fixture images are rebuilt per run and miss.
+      # Restoring a stale snapshot is harmless either way.
+      - name: prepare output base for cache restore
+        run: sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt/tbx
+
+      - name: restore build caches
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            /mnt/tbx/initramfs-cache
+            /mnt/tbx/squashfs-cache
+          key: tbox-poc-cache-${{ github.run_id }}
+          restore-keys: |
+            tbox-poc-cache-
+
+      # ── Default PoC: the fixture pair, both layouts ─────────────────────
+      - name: build fixture live images
+        if: inputs.recipe == ''
+        run: |
+          podman build -f fixtures/iso-smoke.Containerfile \
+            --build-arg MARKER=alpha -t localhost/tbox-iso-alpha:latest fixtures
+          podman build -f fixtures/iso-smoke.Containerfile \
+            --build-arg MARKER=beta -t localhost/tbox-iso-beta:latest fixtures
+
+      - name: build PoC ISOs (per-env + dedup layouts)
+        if: inputs.recipe == ''
+        run: |
+          sudo ./tacklebox build fixtures/iso-2env.json \
+            --iso /mnt/tbx/tacklebox-poc-perenv.iso -b /mnt/tbx
+          sudo ./tacklebox build fixtures/iso-dedup-2env.json \
+            --iso /mnt/tbx/tacklebox-poc-dedup.iso -b /mnt/tbx
+
+      # ── Custom PoC: a caller-supplied recipe ────────────────────────────
+      - name: build PoC ISO (custom recipe)
+        if: inputs.recipe != ''
+        run: |
+          sudo ./tacklebox build "${{ inputs.recipe }}" \
+            --iso /mnt/tbx/tacklebox-poc-custom.iso -b /mnt/tbx
+
+      - name: verify ISOs
+        run: |
+          for iso in /mnt/tbx/*.iso; do
+            ./tacklebox verify "$iso"
+          done
+
+      - name: checksums
+        run: |
+          cd /mnt/tbx
+          sha256sum ./*.iso > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: upload to R2
+        if: env.R2_ACCESS_KEY_ID != '' && env.R2_BUCKET != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          # R2 predates the aws-cli v2.23+ default integrity checksums;
+          # when_required keeps the cli on the compatible code path.
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          STAMP="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          for f in /mnt/tbx/*.iso /mnt/tbx/SHA256SUMS; do
+            name=$(basename "$f")
+            aws s3 cp "$f" "s3://${R2_BUCKET}/tacklebox/poc/${STAMP}/${name}" \
+              --endpoint-url "$ENDPOINT" --no-progress
+            # latest/ is a server-side copy — no second upload.
+            aws s3 cp "s3://${R2_BUCKET}/tacklebox/poc/${STAMP}/${name}" \
+              "s3://${R2_BUCKET}/tacklebox/poc/latest/${name}" \
+              --endpoint-url "$ENDPOINT" --no-progress
+          done
+          {
+            echo "## PoC artifacts uploaded to R2"
+            echo "- \`tacklebox/poc/${STAMP}/\`"
+            echo "- \`tacklebox/poc/latest/\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: note skipped upload
+        if: env.R2_ACCESS_KEY_ID == '' || env.R2_BUCKET == ''
+        run: |
+          echo '## R2 upload skipped (R2_* secrets not configured)' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: artifact summary
+        if: always()
+        run: |
+          echo '## PoC ISO builds' >> "$GITHUB_STEP_SUMMARY"
+          ls -lh /mnt/tbx/*.iso 2>/dev/null | awk '{print "- `" $NF "` (" $5 ")"}' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f /mnt/tbx/SHA256SUMS ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat /mnt/tbx/SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi

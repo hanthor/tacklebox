@@ -55,7 +55,7 @@ jobs:
       - name: shellcheck dracut module
         uses: ludeeus/action-shellcheck@00b27aa7cb85167568cb48a3838b75f4265f2bca # master as of 2026-06-09
         with:
-          additional_files: src/dracut/95tbox-root/module-setup.sh src/dracut/95tbox-root/tbox-root-mount.sh
+          additional_files: src/dracut/95tbox-root/module-setup.sh src/dracut/95tbox-root/tbox-root-mount.sh scripts/test-boot.sh
           severity: warning
 
   # ── Stage 3: two-env disk-build smoke, verify, update, and boot ────────────
@@ -105,10 +105,28 @@ jobs:
       - name: build tacklebox
         run: go build -o tacklebox ./cmd/tacklebox
 
+      # Persist the image-ID-keyed build caches across runs. tacklebox keys
+      # cache entries by image ID internally, so restoring a stale snapshot
+      # is harmless (changed images simply miss). Rolling key: every run
+      # saves a fresh snapshot, restore picks the most recent. Saves the
+      # ~2 min/env dracut initramfs rebuild on cache-warm runs.
+      - name: prepare output base for cache restore
+        run: sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt/tbx
+
+      - name: restore build caches
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            /mnt/tbx/initramfs-cache
+            /mnt/tbx/squashfs-cache
+          key: tbox-build-cache-${{ github.run_id }}
+          restore-keys: |
+            tbox-build-cache-
+
       - name: pre-pull fixture images
         run: |
           sudo podman pull quay.io/centos-bootc/centos-bootc:stream10
-          sudo podman pull quay.io/fedora/fedora-bootc:42
+          sudo podman pull quay.io/fedora/fedora-bootc:44
 
       - name: tacklebox build (2-env block image)
         run: |
@@ -129,11 +147,13 @@ jobs:
       #     no existing mounts — should be a clean no-op
       #   - full bootc re-install → BLS rewrite pipeline
       #   - verify that the result still passes after update
+      # Shares -b /mnt/tbx with the build step on purpose: the update must
+      # hit the initramfs cache the build populated minutes earlier (the
+      # cache-reuse regression check).
       - name: tacklebox update (re-install same recipe)
         run: |
-          sudo mkdir -p /mnt/tbx-update
           sudo ./tacklebox update --yes fixtures/smoke-2env.json \
-            /mnt/tbx/tacklebox.img -b /mnt/tbx-update
+            /mnt/tbx/tacklebox.img -b /mnt/tbx
 
       - name: tacklebox verify (post-update)
         run: sudo ./tacklebox verify /mnt/tbx/tacklebox.img
@@ -164,3 +184,116 @@ jobs:
             tail -n 50 qemu-boot.log >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
           fi
+
+  # ── Stage 3-ISO: two-env ISO smoke (per-env + dedup layouts) ──────────────
+  # Builds BOTH ISO layouts from one pair of fixture images (fedora-bootc +
+  # dracut-live + a per-env marker, built in-job so the localhost/ user-store
+  # path is exercised), verifies them, asserts that the dedup layout actually
+  # shrinks the ISO, and QEMU-boots each layout. The two recipes pick
+  # different default_boot envs on purpose so both envs get boot coverage:
+  #   - per-env layout boots beta (plain dmsquash-live path)
+  #   - dedup layout boots alpha and must log the tbox-root subtree pivot
+  # No actions/cache here: the fixture images are rebuilt every run, so their
+  # image IDs (and thus every tacklebox cache key) change every run.
+  iso-smoke:
+    runs-on: ubuntu-latest
+    needs: lint-test
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+
+      - name: free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main as of 2026-06-09
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xorriso mtools squashfs-tools dosfstools \
+            systemd-boot systemd-boot-efi podman \
+            qemu-system-x86 ovmf
+
+      - name: build tacklebox
+        run: go build -o tacklebox ./cmd/tacklebox
+
+      # Plain podman (no sudo): the images must land in the runner user's
+      # store, which is where the live pipeline reads from.
+      - name: build fixture live images
+        run: |
+          podman build -f fixtures/iso-smoke.Containerfile \
+            --build-arg MARKER=alpha -t localhost/tbox-iso-alpha:latest fixtures
+          podman build -f fixtures/iso-smoke.Containerfile \
+            --build-arg MARKER=beta -t localhost/tbox-iso-beta:latest fixtures
+
+      - name: build per-env ISO
+        run: |
+          sudo mkdir -p /mnt/tbx
+          sudo ./tacklebox build fixtures/iso-2env.json --iso /mnt/tbx/smoke.iso -b /mnt/tbx
+
+      - name: verify per-env ISO
+        run: ./tacklebox verify /mnt/tbx/smoke.iso
+
+      - name: build dedup ISO
+        run: sudo ./tacklebox build fixtures/iso-dedup-2env.json --iso /mnt/tbx/dedup.iso -b /mnt/tbx
+
+      - name: verify dedup ISO
+        run: ./tacklebox verify /mnt/tbx/dedup.iso
+
+      # The fixture envs differ by one marker file, so the combined squashfs
+      # should be roughly half the size of two per-env squashfs files. The
+      # 90% bound is deliberately loose — it catches "dedup silently does
+      # nothing" without being flaky about compression noise.
+      - name: assert dedup shrinks the ISO
+        run: |
+          per_env=$(stat -c%s /mnt/tbx/smoke.iso)
+          dedup=$(stat -c%s /mnt/tbx/dedup.iso)
+          echo "per-env ISO: ${per_env} bytes; dedup ISO: ${dedup} bytes"
+          if [ "$dedup" -ge $((per_env * 9 / 10)) ]; then
+            echo "::error::dedup ISO (${dedup}) is not meaningfully smaller than per-env ISO (${per_env})"
+            exit 1
+          fi
+
+      - name: boot smoke, per-env ISO (env beta)
+        run: |
+          chmod +x scripts/test-boot.sh
+          QEMU_LOG=qemu-iso-perenv.log ./scripts/test-boot.sh /mnt/tbx/smoke.iso 600 \
+            "tacklebox.env=beta"
+
+      - name: boot smoke, dedup ISO (env alpha + tbox-root pivot)
+        run: |
+          QEMU_LOG=qemu-iso-dedup.log ./scripts/test-boot.sh /mnt/tbx/dedup.iso 600 \
+            "tacklebox.env=alpha" "Tacklebox: rebased OK"
+
+      - name: upload boot logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: iso-smoke-boot-logs
+          path: qemu-iso-*.log
+          if-no-files-found: ignore
+
+      - name: artifact summary
+        if: always()
+        run: |
+          echo '## iso-smoke artefacts' >> "$GITHUB_STEP_SUMMARY"
+          ls -lh /mnt/tbx/*.iso 2>/dev/null | awk '{print "- `" $NF "` (" $5 ")"}' >> "$GITHUB_STEP_SUMMARY"
+          for log in qemu-iso-perenv.log qemu-iso-dedup.log; do
+            if [ -f "$log" ]; then
+              echo "### $log (tail)" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              tail -n 30 "$log" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done

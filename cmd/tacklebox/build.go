@@ -202,7 +202,7 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	// The actual install steps still run sequentially (locking / ordering
 	// constraints) but overlapping network I/O here cuts wall time significantly.
 	if err := track("pre-pull (parallel)", func() error {
-		return prePullAll(r)
+		return prePullAll(r, tgt.InstallMode() == target.InstallModeLive)
 	}); err != nil {
 		return err
 	}
@@ -258,25 +258,50 @@ func runBuild(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	xz, _ := cmd.Flags().GetBool("xz")
 	switch {
 	case isIso:
 		fmt.Printf(">>> Tacklebox ISO complete: %s\n", artifact)
+		if xz {
+			if err := compressArtifact(artifact); err != nil {
+				return err
+			}
+		}
 	case isBlockDevice:
 		fmt.Printf(">>> Tacklebox provisioning complete: %s\n", artifact)
 	default:
 		fmt.Printf(">>> Tacklebox build complete: %s\n", artifact)
-		xz, _ := cmd.Flags().GetBool("xz")
 		if xz {
-			fmt.Printf(">>> Compressing image to %s.xz...\n", artifact)
-			if err := runner.Run("xz", "-T0", "-k", artifact); err != nil {
-				return fmt.Errorf("compress image %s: %w", artifact, err)
+			if err := compressArtifact(artifact); err != nil {
+				return err
 			}
-			fmt.Printf(">>> Compression complete: %s.xz\n", artifact)
 		}
 	}
 
 	printTimings(timings, time.Since(buildStart))
 	return nil
+}
+
+// compressArtifact xz-compresses artifact next to itself, keeping the
+// original. -f overwrites a stale .xz from a previous build.
+func compressArtifact(artifact string) error {
+	fmt.Printf(">>> Compressing image to %s.xz...\n", artifact)
+	if err := runner.Run("xz", "-T0", "-k", "-f", artifact); err != nil {
+		return fmt.Errorf("compress image %s: %w", artifact, err)
+	}
+	fmt.Printf(">>> Compression complete: %s.xz\n", artifact)
+	return nil
+}
+
+// envTitle returns the boot-menu title for an env: the recipe's `title`
+// field when set (e.g. "Bluefin (GNOME)"), otherwise the env ID, with the
+// boot mode appended.
+func envTitle(env recipe.BootableEnvironment, mode string) string {
+	t := env.Title
+	if t == "" {
+		t = env.ID
+	}
+	return fmt.Sprintf("%s (%s)", t, mode)
 }
 
 func printTimings(t map[string]time.Duration, total time.Duration) {
@@ -346,6 +371,11 @@ func confirmDestructive(target string, assumeYes bool) error {
 // with parallel=1 for production builds; use --parallel-install=N to try
 // the faster path when total wall time matters more than risk.
 func runEnvs(r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, parallel int, track func(string, func() error) error) error {
+	// Cross-env dedup (ISO only): all envs share one combined squashfs,
+	// so the per-env loop shape doesn't apply.
+	if tgt.InstallMode() == target.InstallModeLive && r.SharedStore.Dedup {
+		return installEnvsLiveCombined(r, tgt, storeMount, espMount, track)
+	}
 	if parallel <= 1 {
 		for _, env := range r.BootableEnvironments {
 			if err := installEnv(env, r, tgt, storeMount, espMount, track); err != nil {
@@ -382,34 +412,54 @@ func runEnvs(r recipe.MediaRecipe, tgt target.Target, storeMount, espMount strin
 	return nil
 }
 
+// combinedSquashName is the single squashfs every env boots from when
+// shared_store.dedup is set (ISO targets only).
+const combinedSquashName = "combined.rootfs.sfs"
+
 // buildLiveKernelCmdline returns the BLS `options` line for an env that
 // will be booted via dmsquash-live from a per-env squashfs in /LiveOS/.
 // Used by IsoTarget. label is the ISO9660 volume label (so dmsquash-live
 // can find the iso by `root=live:CDLABEL=...`).
 func buildLiveKernelCmdline(envID, label string) string {
-	// rd.live.overlay.overlayfs=1 alone => tmpfs-backed overlayfs (the
-	// default). DON'T pass `rd.live.overlay=tmpfs` — that's interpreted
-	// as a label/path to look up, not the literal string "tmpfs", which
-	// stalls dracut-initqueue waiting for a non-existent device.
-	// enforcing=0: live boots can't use the on-disk SELinux contexts
-	// from the bootc image because the labels reference paths that
-	// don't exist in the overlayfs view. Without this, systemd PID 1
-	// dies with "Failed to allocate manager object: Permission denied"
-	// before reaching userspace. SuperISO's existing build-iso.sh sets
-	// the same flag for the same reason.
-	// rd.live.overlay.size=8192: size in MiB for the tmpfs that backs
-	// the live overlay upper layer. The default (~half of RAM) is often
-	// only 1-2 GiB on 8 GiB machines. The offline bootc installer
-	// (fisherman / podman run) writes container layers to the overlay
-	// root before they can be redirected to the target disk, filling
-	// it and aborting the install. 8 GiB is large enough for any
-	// single bazzite/aurora/bluefin image pull without exceeding
-	// the 16 GiB machines this ISO targets.
+	return liveKernelCmdline(envID, label, envID+".rootfs.sfs", "")
+}
+
+// buildLiveKernelCmdlineCombined is the dedup variant: every env's entry
+// points at the same combined squashfs, and `tacklebox.root=<env>` makes
+// the tbox-root dracut module bind-mount /sysroot/<env> over /sysroot
+// after dmsquash-live has mounted the squashfs + overlay (the same pivot
+// it performs for block targets, minus the tbox-install/ prefix).
+func buildLiveKernelCmdlineCombined(envID, label string) string {
+	return liveKernelCmdline(envID, label, combinedSquashName, " tacklebox.root="+envID)
+}
+
+// liveKernelCmdline is the shared core. Pure — no I/O — so it can be
+// unit-tested.
+//
+// rd.live.overlay.overlayfs=1 alone => tmpfs-backed overlayfs (the
+// default). DON'T pass `rd.live.overlay=tmpfs` — that's interpreted
+// as a label/path to look up, not the literal string "tmpfs", which
+// stalls dracut-initqueue waiting for a non-existent device.
+// enforcing=0: live boots can't use the on-disk SELinux contexts
+// from the bootc image because the labels reference paths that
+// don't exist in the overlayfs view. Without this, systemd PID 1
+// dies with "Failed to allocate manager object: Permission denied"
+// before reaching userspace. SuperISO's existing build-iso.sh sets
+// the same flag for the same reason.
+// rd.live.overlay.size=8192: size in MiB for the tmpfs that backs
+// the live overlay upper layer. The default (~half of RAM) is often
+// only 1-2 GiB on 8 GiB machines. The offline bootc installer
+// (fisherman / podman run) writes container layers to the overlay
+// root before they can be redirected to the target disk, filling
+// it and aborting the install. 8 GiB is large enough for any
+// single bazzite/aurora/bluefin image pull without exceeding
+// the 16 GiB machines this ISO targets.
+func liveKernelCmdline(envID, label, squashimg, extra string) string {
 	return fmt.Sprintf(
-		"root=live:CDLABEL=%s rd.live.image rd.live.dir=LiveOS rd.live.squashimg=%s.rootfs.sfs"+
+		"root=live:CDLABEL=%s rd.live.image rd.live.dir=LiveOS rd.live.squashimg=%s"+
 			" rd.live.overlay.overlayfs=1 rd.live.overlay.size=8192 enforcing=0"+
-			" tacklebox.env=%s console=ttyS0,115200n8",
-		label, envID, envID,
+			" tacklebox.env=%s%s console=ttyS0,115200n8",
+		label, squashimg, envID, extra,
 	)
 }
 
@@ -502,10 +552,18 @@ func installEnvBootc(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt t
 	if err := runner.Run("sudo", "chmod", "0755", bootDir); err != nil {
 		return fmt.Errorf("chmod boot dir %s: %w", bootDir, err)
 	}
+	var initrdOverride string
+	if err := track("initramfs:"+env.ID, func() error {
+		var err error
+		initrdOverride, err = install.PrepareInitramfs(env.Image, install.BlockInitramfsModules, env.SkipInitramfsRebuild)
+		return err
+	}); err != nil {
+		return fmt.Errorf("prepare initramfs for %s: %w", env.ID, err)
+	}
 	var kver string
 	if err := track("extract:"+env.ID, func() error {
 		var err error
-		kver, err = install.ExtractBootFiles(env.Image, bootDir)
+		kver, err = install.ExtractBootFiles(env.Image, bootDir, initrdOverride)
 		return err
 	}); err != nil {
 		return fmt.Errorf("extract boot files for %s: %w", env.ID, err)
@@ -524,10 +582,9 @@ func installEnvBootc(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt t
 	}
 
 	for _, mode := range env.Modes {
-		title := fmt.Sprintf("%s (%s)", env.ID, mode)
 		id := fmt.Sprintf("%s-%s", env.ID, mode)
 		options := buildKernelCmdline(env.ID, mode, backend, blockdev.UsbSafe, ostreeBootcsum)
-		if err := install.WriteBLSEntry(espMount, id, title, tgt.KernelPath(env.ID), tgt.InitrdPath(env.ID), options); err != nil {
+		if err := install.WriteBLSEntry(espMount, id, envTitle(env, string(mode)), tgt.KernelPath(env.ID), tgt.InitrdPath(env.ID), options); err != nil {
 			return err
 		}
 	}
@@ -555,9 +612,20 @@ func installEnvLive(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt ta
 		label = l.IsoLabel()
 	}
 
+	// Initramfs first: a hopeless image (no dracut, no dmsquash-live)
+	// fails here in seconds instead of after a multi-minute squash.
+	var initrdOverride string
+	if err := track("initramfs:"+env.ID, func() error {
+		var err error
+		initrdOverride, err = install.PrepareInitramfs(env.Image, install.IsoInitramfsModules, env.SkipInitramfsRebuild)
+		return err
+	}); err != nil {
+		return fmt.Errorf("prepare initramfs for %s: %w", env.ID, err)
+	}
+
 	sfs := filepath.Join(storeMount, env.ID+".rootfs.sfs")
 	if err := track("install:"+env.ID, func() error {
-		return install.InstallLive(env.Image, sfs)
+		return install.InstallLive(env.Image, sfs, r.SharedStore.Compression)
 	}); err != nil {
 		return fmt.Errorf("squashfs %s: %w", env.ID, err)
 	}
@@ -574,33 +642,102 @@ func installEnvLive(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt ta
 	var kver string
 	if err := track("extract:"+env.ID, func() error {
 		var err error
-		kver, err = install.ExtractBootFiles(env.Image, bootDir)
+		kver, err = install.ExtractBootFiles(env.Image, bootDir, initrdOverride)
 		return err
 	}); err != nil {
 		return fmt.Errorf("extract boot files for %s: %w", env.ID, err)
 	}
 
 	options := buildLiveKernelCmdline(env.ID, label)
-	title := fmt.Sprintf("%s (live)", env.ID)
-	if err := install.WriteBLSEntry(espMount, env.ID, title, tgt.KernelPath(env.ID), tgt.InitrdPath(env.ID), options); err != nil {
+	if err := install.WriteBLSEntry(espMount, env.ID, envTitle(env, "live"), tgt.KernelPath(env.ID), tgt.InitrdPath(env.ID), options); err != nil {
 		return err
 	}
 	fmt.Printf(">>> Finished environment: %s (kernel=%s)\n", env.ID, kver)
 	return nil
 }
 
-// prePullImages pulls all unique images concurrently. Errors are aggregated so
-// the user sees every failure in one go instead of fixing them one-by-one.
-// prePullAll pulls all env images + offline payloads concurrently, deduplicating
-// references that appear in both lists.
-// localhost/ images are skipped — they live in the user's podman store and
-// cannot be pulled from a registry. InstallLive / fetchToStaging access them
-// via rootless podman (user store) without needing a pre-pull.
-func prePullAll(r recipe.MediaRecipe) error {
+// installEnvsLiveCombined is the cross-env dedup variant of the live
+// install loop (shared_store.dedup). One mksquashfs pass packs every
+// env's rootfs as a subtree of LiveOS/combined.rootfs.sfs, deduplicating
+// files shared between images. Each env still gets its own kernel,
+// initrd, and BLS entry; the entry pivots into the env's subtree via
+// tacklebox.root= (see buildLiveKernelCmdlineCombined).
+func installEnvsLiveCombined(r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, track func(string, func() error) error) error {
+	type labelled interface{ IsoLabel() string }
+	label := "TACKLEBOX"
+	if l, ok := tgt.(labelled); ok {
+		label = l.IsoLabel()
+	}
+
+	// Initramfs prep for every env up front: a hopeless image fails in
+	// seconds, before the (single, expensive) combined squash.
+	initrdOverrides := make(map[string]string, len(r.BootableEnvironments))
+	for _, env := range r.BootableEnvironments {
+		env := env
+		if err := track("initramfs:"+env.ID, func() error {
+			p, err := install.PrepareInitramfs(env.Image, install.IsoInitramfsModules, env.SkipInitramfsRebuild)
+			initrdOverrides[env.ID] = p
+			return err
+		}); err != nil {
+			return fmt.Errorf("prepare initramfs for %s: %w", env.ID, err)
+		}
+	}
+
+	envs := make([]install.LiveEnv, 0, len(r.BootableEnvironments))
+	for _, e := range r.BootableEnvironments {
+		envs = append(envs, install.LiveEnv{ID: e.ID, Image: e.Image})
+	}
+	sfs := filepath.Join(storeMount, combinedSquashName)
+	if err := track("install:combined", func() error {
+		return install.InstallLiveCombined(envs, sfs, r.SharedStore.Compression)
+	}); err != nil {
+		return fmt.Errorf("combined squashfs: %w", err)
+	}
+
+	for _, env := range r.BootableEnvironments {
+		bootDir := filepath.Join(espMount, "images", "pxeboot", env.ID)
+		if err := runner.Run("sudo", "mkdir", "-p", bootDir); err != nil {
+			return fmt.Errorf("create boot dir %s: %w", bootDir, err)
+		}
+		if err := runner.Run("sudo", "chmod", "0755", bootDir); err != nil {
+			return fmt.Errorf("chmod boot dir %s: %w", bootDir, err)
+		}
+		var kver string
+		env := env
+		if err := track("extract:"+env.ID, func() error {
+			var err error
+			kver, err = install.ExtractBootFiles(env.Image, bootDir, initrdOverrides[env.ID])
+			return err
+		}); err != nil {
+			return fmt.Errorf("extract boot files for %s: %w", env.ID, err)
+		}
+
+		options := buildLiveKernelCmdlineCombined(env.ID, label)
+		if err := install.WriteBLSEntry(espMount, env.ID, envTitle(env, "live"), tgt.KernelPath(env.ID), tgt.InitrdPath(env.ID), options); err != nil {
+			return err
+		}
+		fmt.Printf(">>> Finished environment: %s (kernel=%s, combined)\n", env.ID, kver)
+	}
+	return nil
+}
+
+// prePullAll pulls all env images + offline payloads concurrently,
+// deduplicating references that appear in both lists. Errors are
+// aggregated so the user sees every failure in one go.
+//
+// The destination store matches who reads the images later:
+//   - userStore (ISO/live targets): the invoking user's rootless store —
+//     squash, extract, and dracut-rebuild all run there via podman
+//     unshare / UserPodmanPrefix. Pulling into root's store instead would
+//     make each of those auto-pull a second copy.
+//   - root store (block targets): `podman run … bootc install` runs as
+//     root. localhost/ images are skipped here — they live in the user's
+//     store and rootless podman accesses them directly.
+func prePullAll(r recipe.MediaRecipe, userStore bool) error {
 	seen := make(map[string]struct{})
 	var unique []string
 	add := func(ref string) {
-		if strings.HasPrefix(ref, "localhost/") {
+		if !userStore && strings.HasPrefix(ref, "localhost/") {
 			return // built locally; rootless podman accesses them directly
 		}
 		if _, dup := seen[ref]; !dup {
@@ -618,6 +755,10 @@ func prePullAll(r recipe.MediaRecipe) error {
 		return nil
 	}
 
+	pull := install.Pull
+	if userStore {
+		pull = install.PullUser
+	}
 	fmt.Printf(">>> Pre-pulling %d image(s) in parallel (%d env, %d payload)\n",
 		len(unique), len(r.BootableEnvironments), len(r.OfflinePayloads))
 	var wg sync.WaitGroup
@@ -626,45 +767,7 @@ func prePullAll(r recipe.MediaRecipe) error {
 		wg.Add(1)
 		go func(i int, img string) {
 			defer wg.Done()
-			errs[i] = install.Pull(img)
-		}(i, img)
-	}
-	wg.Wait()
-
-	var failed []string
-	for i, err := range errs {
-		if err != nil {
-			failed = append(failed, fmt.Sprintf("  - %s: %v", unique[i], err))
-		}
-	}
-	if len(failed) > 0 {
-		return fmt.Errorf("pre-pull failed for %d image(s):\n%s", len(failed), strings.Join(failed, "\n"))
-	}
-	return nil
-}
-
-func prePullImages(envs []recipe.BootableEnvironment) error {
-	seen := make(map[string]struct{}, len(envs))
-	var unique []string
-	for _, e := range envs {
-		if _, dup := seen[e.Image]; dup {
-			continue
-		}
-		seen[e.Image] = struct{}{}
-		unique = append(unique, e.Image)
-	}
-	if len(unique) == 0 {
-		return nil
-	}
-
-	fmt.Printf(">>> Pre-pulling %d image(s) in parallel\n", len(unique))
-	var wg sync.WaitGroup
-	errs := make([]error, len(unique))
-	for i, img := range unique {
-		wg.Add(1)
-		go func(i int, img string) {
-			defer wg.Done()
-			errs[i] = install.Pull(img)
+			errs[i] = pull(img)
 		}(i, img)
 	}
 	wg.Wait()

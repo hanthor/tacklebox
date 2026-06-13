@@ -31,6 +31,12 @@ the dracut rebuild. Subsequent builds hit the cache and add no overhead. If your
 images already include `dmsquash-live` and `tbox-root`, set
 `"skip_initramfs_rebuild": true` in the env to skip the rebuild.
 
+The per-env squashfs is also cached (keyed by image ID + compression
+settings, under `<output-base>/squashfs-cache/`), so rebuilding a
+multi-env ISO only re-squashes the environments whose image actually
+changed. On CI, persist `<output-base>` between runs (e.g.
+`actions/cache`) to benefit; on a fresh runner every env is built once.
+
 ---
 
 ## Repository layout
@@ -58,6 +64,31 @@ ISO recipes are identical to block recipes except:
   needs to be.
 - `partitions` is ignored for ISO targets.
 
+Optional per-env `title` sets the boot menu entry name shown by
+systemd-boot (the env `id` is used when omitted). For release ISOs, set
+`"shared_store": {"compression": "release"}` to use zstd level 15
+(~10–15% smaller squashfs, slower build); the default favours build speed.
+
+### Cross-env dedup
+
+For multi-env ISOs whose images share a base (e.g. Bluefin + Bazzite are
+both Fedora-based), add `"dedup": true` to `shared_store`:
+
+```json
+"shared_store": { "format": "ext4", "dedup": true }
+```
+
+All envs are packed into **one** combined squashfs with a subtree per env,
+and mksquashfs stores each shared file once — often a dramatically smaller
+ISO than per-env squashfs files. Each env still gets its own boot menu
+entry; at boot the `tbox-root` dracut module pivots into the env's subtree.
+Trade-offs: changing any image rebuilds the whole combined squashfs (the
+squashfs cache covers the env set as a whole), and every env's initramfs
+must contain `tbox-root` — which the automatic initramfs preparation
+guarantees unless you set `skip_initramfs_rebuild` (only do that for
+images that ship **both** `dmsquash-live` and `tbox-root`).
+See `examples/iso-dedup.json`.
+
 ```json
 {
   "media_name": "MY_ISO",
@@ -70,6 +101,7 @@ ISO recipes are identical to block recipes except:
     {
       "id": "bluefin",
       "image": "ghcr.io/ublue-os/bluefin:stable",
+      "title": "Bluefin (GNOME)",
       "desktop": "gnome",
       "modes": ["live"]
     },
@@ -173,6 +205,24 @@ jobs:
             xorriso mtools squashfs-tools dosfstools \
             systemd-boot systemd-boot-efi gdisk podman
 
+      # Persist tacklebox's build caches between runs: the dracut initramfs
+      # rebuild (~2-3 min/env) and the per-env squashfs (minutes/env) are
+      # keyed by image ID internally, so a stale restore is harmless —
+      # changed images simply miss and rebuild. The rolling key saves a
+      # fresh snapshot every run and restores the most recent one.
+      - name: Prepare output base for cache restore
+        run: sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt/tbx
+
+      - name: Restore build caches
+        uses: actions/cache@v5
+        with:
+          path: |
+            /mnt/tbx/initramfs-cache
+            /mnt/tbx/squashfs-cache
+          key: tbox-build-cache-${{ github.run_id }}
+          restore-keys: |
+            tbox-build-cache-
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -223,6 +273,7 @@ jobs:
 |---|---|
 | Free disk space | Recovers ~30 GiB needed for squashfs builds on free runners |
 | Install build deps | `xorriso` (ISO assembly), `mtools` (FAT manipulation), `squashfs-tools`, `dosfstools`, `systemd-boot` |
+| Restore build caches | Reuses initramfs rebuilds + squashfs from previous runs (keyed by image ID, so stale restores are harmless) |
 | Log in to GHCR | Allows pulling private or rate-limited container images |
 | Build tacklebox | Compiles the binary from source; pin to a tag for reproducibility |
 | Pre-pull images | Parallel pull so build step doesn't time out on network I/O |
@@ -230,6 +281,46 @@ jobs:
 | Verify ISO | Sanity-checks BLS entries and squashfs distinctness |
 | Upload artifact | ISO is available for 14 days from the Actions run |
 | Create release | Attaches the ISO to a GitHub Release when you push a tag |
+
+---
+
+## Publishing to Cloudflare R2
+
+GitHub Actions artifacts expire and are awkward to share. For a stable
+download URL, push the ISO to an object store. R2 has no egress fees,
+which suits multi-GB ISOs. R2 exposes an S3-compatible API, so the
+standard `aws` CLI works — point it at the R2 endpoint.
+
+Add four repo secrets — `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
+`R2_SECRET_ACCESS_KEY`, `R2_BUCKET` — then append this step:
+
+```yaml
+      - name: Upload ISO to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          # R2 predates aws-cli's default integrity checksums; keep the cli
+          # on the compatible path or uploads 501/400.
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          ENDPOINT="https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          STAMP="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          aws s3 cp "/mnt/tbx/$ISO_NAME" \
+            "s3://${{ secrets.R2_BUCKET }}/iso/${STAMP}/$ISO_NAME" \
+            --endpoint-url "$ENDPOINT" --no-progress
+```
+
+The two `AWS_*_CHECKSUM_*` vars are the usual gotcha: without them recent
+`aws-cli` versions send checksum headers R2 rejects.
+
+This repo's own `.github/workflows/poc-artifacts.yml` is a complete,
+pinned example — it builds both ISO layouts (per-env + dedup), verifies
+them, writes a `SHA256SUMS`, and uploads to
+`tacklebox/poc/<date>-<sha>/` plus a `latest/` copy. It degrades
+gracefully: with the `R2_*` secrets unset (forks), it still builds and
+verifies and just skips the upload.
 
 ---
 
@@ -269,7 +360,7 @@ Then in the workflow:
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Boot stalls at `initrd-switch-root` | Image lacks `dracut`; initramfs rebuild failed silently | Check build logs for dracut errors; set `"skip_initramfs_rebuild": true` and provide a pre-prepared image if dracut is not available |
+| Build fails at `initramfs:<env>` | Image lacks `dracut` or the `dracut-live` module | Install `dracut`/`dracut-live` in the image, or set `"skip_initramfs_rebuild": true` and provide an image whose initramfs already has `dmsquash-live` + `tbox-root` |
 | First build unexpectedly slow | Dracut initramfs rebuild running (normal on first build per image) | Expected; subsequent builds use the cache |
 | `tacklebox verify` fails: "same squashfs hash" | Two envs resolved to the identical container image | Use distinct image refs or check your registry tags |
 | `xorriso` not found | Missing dep | `sudo apt-get install xorriso` |

@@ -148,7 +148,9 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	start := time.Now()
 
 	if err := track("pre-pull (parallel)", func() error {
-		return prePullImages(r.BootableEnvironments)
+		// update is block-only: bootc install runs as root, so pre-pull
+		// into root's store.
+		return prePullAll(r, false)
 	}); err != nil {
 		return err
 	}
@@ -272,10 +274,18 @@ func updateEnvBootc(env recipe.BootableEnvironment, r recipe.MediaRecipe, storeM
 	if err := runner.Run("sudo", "mkdir", "-p", bootDir); err != nil {
 		return fmt.Errorf("create boot dir %s: %w", bootDir, err)
 	}
+	var initrdOverride string
+	if err := track("initramfs:"+env.ID, func() error {
+		var err error
+		initrdOverride, err = install.PrepareInitramfs(env.Image, install.BlockInitramfsModules, env.SkipInitramfsRebuild)
+		return err
+	}); err != nil {
+		return fmt.Errorf("prepare initramfs for %s: %w", env.ID, err)
+	}
 	var kver string
 	if err := track("extract:"+env.ID, func() error {
 		var err error
-		kver, err = install.ExtractBootFiles(env.Image, bootDir)
+		kver, err = install.ExtractBootFiles(env.Image, bootDir, initrdOverride)
 		return err
 	}); err != nil {
 		return err
@@ -295,10 +305,9 @@ func updateEnvBootc(env recipe.BootableEnvironment, r recipe.MediaRecipe, storeM
 
 	// Re-write BLS entries; overwrite any existing ones for this env.
 	for _, mode := range env.Modes {
-		title := fmt.Sprintf("%s (%s)", env.ID, mode)
 		id := fmt.Sprintf("%s-%s", env.ID, mode)
 		options := buildKernelCmdline(env.ID, mode, backend, blockdev.UsbSafe, ostreeBootcsum)
-		if err := install.WriteBLSEntry(espMount, id, title, "/EFI/"+env.ID+"/vmlinuz", "/EFI/"+env.ID+"/initrd.img", options); err != nil {
+		if err := install.WriteBLSEntry(espMount, id, envTitle(env, string(mode)), "/EFI/"+env.ID+"/vmlinuz", "/EFI/"+env.ID+"/initrd.img", options); err != nil {
 			return err
 		}
 	}

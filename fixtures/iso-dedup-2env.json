@@ -1,0 +1,23 @@
+{
+  "media_name": "TBX_ISO_DEDUP",
+  "size": "20G",
+  "default_boot": "alpha",
+  "shared_store": {
+    "format": "ext4",
+    "dedup": true
+  },
+  "bootable_environments": [
+    {
+      "id": "alpha",
+      "image": "localhost/tbox-iso-alpha:latest",
+      "title": "Fixture Alpha",
+      "modes": ["live"]
+    },
+    {
+      "id": "beta",
+      "image": "localhost/tbox-iso-beta:latest",
+      "title": "Fixture Beta",
+      "modes": ["live"]
+    }
+  ]
+}

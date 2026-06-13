@@ -1,10 +1,13 @@
 package install
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -26,7 +29,13 @@ import (
 //
 // The squashfs is written to a user-writable temp file first, then
 // sudo-moved into dstSquashfs (which may be in a root-owned staging tree).
-func InstallLive(image, dstSquashfs string) error {
+//
+// Results are cached under <staging-root>/squashfs-cache keyed by image ID
+// + compression settings, so rebuilding a multi-env ISO only re-squashes
+// the envs whose image actually changed. compression is the recipe's
+// shared_store.compression value ("release"/"max" for distribution
+// quality; anything else means the fast default).
+func InstallLive(image, dstSquashfs, compression string) error {
 	mountSerialise.Lock()
 	defer mountSerialise.Unlock()
 
@@ -35,25 +44,28 @@ func InstallLive(image, dstSquashfs string) error {
 		return fmt.Errorf("mksquashfs not found in PATH: %w", err)
 	}
 
-	level, block := "3", "131072"
-	if os.Getenv("SUPERISO_COMPRESSION") == "release" {
-		level, block = "15", "1048576"
+	level, block := squashParams(compression)
+
+	// Cache lookup. A failed image-ID resolution disables caching for this
+	// env (we still build) rather than failing the build.
+	var cachePath string
+	if _, id, err := podmanForImage(image); err == nil {
+		cachePath = filepath.Join(stagingRoot, "squashfs-cache", squashCacheName([]string{id}, level, block))
+		if _, err := os.Stat(cachePath); err == nil {
+			fmt.Printf(">>> [live] squashfs cache hit for %s\n", image)
+			return placeSquashfs(cachePath, dstSquashfs)
+		}
 	}
 
-	// Write to a user-writable temp file; sudo-move to final dest afterwards.
-	tmpF, err := os.CreateTemp("", "tbox-live-*.squashfs")
+	// Write to a user-writable temp file; sudo-move to final dest
+	// afterwards. The temp file is owned by root (tacklebox runs under
+	// sudo), but mksquashfs runs as the original user inside podman
+	// unshare — tempSquashFile makes it world-writable for that reason.
+	tmpPath, err := tempSquashFile()
 	if err != nil {
-		return fmt.Errorf("create temp squashfs: %w", err)
+		return err
 	}
-	tmpF.Close()
-	tmpPath := tmpF.Name()
 	defer os.Remove(tmpPath)
-	// The temp file is owned by root (tacklebox runs under sudo), but
-	// mksquashfs runs as the original user inside podman unshare.
-	// Make it world-writable so the unshare user can write the squashfs.
-	if err := os.Chmod(tmpPath, 0666); err != nil {
-		return fmt.Errorf("chmod temp squashfs: %w", err)
-	}
 
 	// Single podman unshare session: mount → squashfs → unmount.
 	// shellEscape is applied to every variable interpolated into the script.
@@ -74,11 +86,194 @@ trap 'podman image unmount %s' EXIT
 		return fmt.Errorf("squashfs %s: %w", image, err)
 	}
 
-	if err := runner.Run("sudo", "mkdir", "-p", filepath.Dir(dstSquashfs)); err != nil {
+	return stashSquashfs(tmpPath, cachePath, dstSquashfs)
+}
+
+// LiveEnv is the (env ID, image ref) pair InstallLiveCombined needs from
+// the recipe — the install package stays recipe-agnostic.
+type LiveEnv struct {
+	ID    string
+	Image string
+}
+
+// InstallLiveCombined packs every env's rootfs into ONE squashfs at
+// dstSquashfs, one top-level subtree per env ID. mksquashfs's built-in
+// duplicate detection then stores files shared across images (e.g. the
+// Fedora base of bluefin + bazzite) exactly once — the cross-env dedup
+// that motivates a multi-image ISO in the first place.
+//
+// At boot, dmsquash-live mounts the combined squashfs + overlay as usual
+// and the tbox-root dracut module bind-mounts /sysroot/<env> over /sysroot
+// (driven by tacklebox.root=<env> on the cmdline) — the same pivot it
+// performs for block targets.
+//
+// Cached like InstallLive, keyed by ALL image IDs + compression: changing
+// any env's image rebuilds the whole combined squashfs (the inherent
+// trade-off of dedup vs per-env caching).
+func InstallLiveCombined(envs []LiveEnv, dstSquashfs, compression string) error {
+	mountSerialise.Lock()
+	defer mountSerialise.Unlock()
+
+	mksquashfsPath, err := exec.LookPath("mksquashfs")
+	if err != nil {
+		return fmt.Errorf("mksquashfs not found in PATH: %w", err)
+	}
+	level, block := squashParams(compression)
+
+	var cachePath string
+	if ids, ok := resolveImageIDs(envs); ok {
+		cachePath = filepath.Join(stagingRoot, "squashfs-cache", squashCacheName(ids, level, block))
+		if _, err := os.Stat(cachePath); err == nil {
+			fmt.Printf(">>> [live] combined squashfs cache hit (%d envs)\n", len(envs))
+			return placeSquashfs(cachePath, dstSquashfs)
+		}
+	}
+
+	tmpPath, err := tempSquashFile()
+	if err != nil {
 		return err
 	}
-	if err := runner.Run("sudo", "mv", tmpPath, dstSquashfs); err != nil {
-		return fmt.Errorf("move squashfs to %s: %w", dstSquashfs, err)
+	defer os.Remove(tmpPath)
+
+	fmt.Printf(">>> [live] squashing %d envs into %s (cross-env dedup, podman unshare)\n", len(envs), dstSquashfs)
+	if err := RunUnshare(combinedSquashScript(envs, mksquashfsPath, tmpPath, level, block)); err != nil {
+		return fmt.Errorf("combined squashfs: %w", err)
+	}
+	return stashSquashfs(tmpPath, cachePath, dstSquashfs)
+}
+
+// combinedSquashScript builds the podman-unshare script for the combined
+// squash: mount every image, rbind each under a staging dir entry named
+// by env ID (so the squashfs subtrees get recipe-controlled names instead
+// of podman's overlay hash paths), then run mksquashfs once over the
+// staging root. The rbinds live in the unshare session's mount namespace
+// and vanish with it; the trap unmounts are best-effort hygiene.
+func combinedSquashScript(envs []LiveEnv, mksquashfsPath, tmpPath, level, block string) string {
+	var b strings.Builder
+	b.WriteString("set -eu\nSTAGE=$(mktemp -d)\n")
+
+	b.WriteString("trap '")
+	for _, e := range envs {
+		fmt.Fprintf(&b, "umount -R \"$STAGE\"/%s 2>/dev/null || true; ", shellEsc(e.ID))
+	}
+	for _, e := range envs {
+		fmt.Fprintf(&b, "podman image unmount %s >/dev/null 2>&1 || true; ", shellEsc(e.Image))
+	}
+	b.WriteString("' EXIT\n")
+
+	excludes := []string{"proc", "sys", "dev", "run", "tmp", "var/lib/containers/storage"}
+	var excludeArgs []string
+	for _, e := range envs {
+		fmt.Fprintf(&b, "M=$(podman image mount %s)\n", shellEsc(e.Image))
+		fmt.Fprintf(&b, "mkdir -p \"$STAGE\"/%s\n", shellEsc(e.ID))
+		fmt.Fprintf(&b, "mount --rbind \"$M\" \"$STAGE\"/%s\n", shellEsc(e.ID))
+		for _, x := range excludes {
+			excludeArgs = append(excludeArgs, shellEsc(e.ID+"/"+x))
+		}
+	}
+
+	fmt.Fprintf(&b, `%s "$STAGE" %s \
+  -noappend -comp zstd -Xcompression-level %s -b %s \
+  -processors 4 \
+  -e %s
+`, mksquashfsPath, shellEsc(tmpPath), level, block, strings.Join(excludeArgs, " "))
+	return b.String()
+}
+
+// resolveImageIDs maps each env to "<id>=<imageID>" for cache keying.
+// Any unresolvable image disables caching (ok=false) rather than failing.
+func resolveImageIDs(envs []LiveEnv) ([]string, bool) {
+	parts := make([]string, 0, len(envs))
+	for _, e := range envs {
+		_, id, err := podmanForImage(e.Image)
+		if err != nil {
+			return nil, false
+		}
+		parts = append(parts, e.ID+"="+id)
+	}
+	return parts, true
+}
+
+// squashCacheName derives the squashfs-cache filename from the content
+// identity parts (image IDs, or id=imageID pairs for combined builds) and
+// the compression settings. Parts are sorted so recipe declaration order
+// doesn't defeat the cache.
+func squashCacheName(parts []string, level, block string) string {
+	sorted := append([]string(nil), parts...)
+	sort.Strings(sorted)
+	h := sha256.Sum256([]byte(strings.Join(sorted, ",") + "|zstd|" + level + "|" + block))
+	return hex.EncodeToString(h[:])[:16] + ".sfs"
+}
+
+// tempSquashFile creates the user-writable scratch file mksquashfs writes
+// to inside podman unshare (see InstallLive for why the chmod).
+func tempSquashFile() (string, error) {
+	tmpF, err := os.CreateTemp("", "tbox-live-*.squashfs")
+	if err != nil {
+		return "", fmt.Errorf("create temp squashfs: %w", err)
+	}
+	tmpF.Close()
+	if err := os.Chmod(tmpF.Name(), 0666); err != nil {
+		os.Remove(tmpF.Name())
+		return "", fmt.Errorf("chmod temp squashfs: %w", err)
+	}
+	return tmpF.Name(), nil
+}
+
+// stashSquashfs moves a freshly-built squashfs into the cache (when
+// cachePath is non-empty) and materializes it at dst; without a cache
+// path it moves straight into place.
+func stashSquashfs(tmpPath, cachePath, dst string) error {
+	if cachePath != "" {
+		if err := runner.Run("sudo", "mkdir", "-p", filepath.Dir(cachePath)); err != nil {
+			return err
+		}
+		if err := runner.Run("sudo", "mv", tmpPath, cachePath); err != nil {
+			return fmt.Errorf("move squashfs into cache: %w", err)
+		}
+		if err := runner.Run("sudo", "chmod", "0644", cachePath); err != nil {
+			return err
+		}
+		return placeSquashfs(cachePath, dst)
+	}
+	if err := runner.Run("sudo", "mkdir", "-p", filepath.Dir(dst)); err != nil {
+		return err
+	}
+	if err := runner.Run("sudo", "mv", tmpPath, dst); err != nil {
+		return fmt.Errorf("move squashfs to %s: %w", dst, err)
+	}
+	return nil
+}
+
+// squashParams resolves mksquashfs zstd settings. Priority: the
+// SUPERISO_COMPRESSION=release env var (kept for SuperISO script
+// compatibility) > recipe compression ("release" or "max") > fast default
+// (level 3, 128 KiB blocks — quick builds, ~10-15% larger output).
+func squashParams(compression string) (level, block string) {
+	level, block = "3", "131072"
+	if compression == "release" || compression == "max" {
+		level, block = "15", "1048576"
+	}
+	if os.Getenv("SUPERISO_COMPRESSION") == "release" {
+		level, block = "15", "1048576"
+	}
+	return level, block
+}
+
+// placeSquashfs materializes a cached squashfs into the staging tree.
+// Hardlink first — the cache and the ISO staging tree both live under the
+// output base, and nothing mutates the file after placement — falling back
+// to a reflink-friendly copy when they're on different filesystems.
+func placeSquashfs(cachePath, dst string) error {
+	if err := runner.Run("sudo", "mkdir", "-p", filepath.Dir(dst)); err != nil {
+		return err
+	}
+	_ = runner.Run("sudo", "rm", "-f", dst)
+	if err := runner.Run("sudo", "ln", cachePath, dst); err == nil {
+		return nil
+	}
+	if err := runner.Run("sudo", "cp", "--reflink=auto", cachePath, dst); err != nil {
+		return fmt.Errorf("place squashfs %s -> %s: %w", cachePath, dst, err)
 	}
 	return nil
 }
@@ -246,8 +441,10 @@ func CleanupStaging() {
 }
 
 // ExtractBootFiles copies vmlinuz + initramfs from the per-image staging
-// cache into destDir.
-func ExtractBootFiles(image string, destDir string) (string, error) {
+// cache into destDir. initrdOverride, when non-empty, is a host path to a
+// prepared initramfs (see PrepareInitramfs) used instead of the image's
+// stock one; the vmlinuz still comes from the image.
+func ExtractBootFiles(image string, destDir string, initrdOverride string) (string, error) {
 	if err := runner.Run("sudo", "mkdir", "-p", destDir); err != nil {
 		return "", err
 	}
@@ -264,7 +461,11 @@ func ExtractBootFiles(image string, destDir string) (string, error) {
 	if err := runner.Run("sudo", "chmod", "0644", filepath.Join(destDir, "vmlinuz")); err != nil {
 		return "", fmt.Errorf("chmod vmlinuz in dest: %w", err)
 	}
-	if err := runner.Run("sudo", "cp", filepath.Join(s.dir, "initrd.img"), filepath.Join(destDir, "initrd.img")); err != nil {
+	initrdSrc := filepath.Join(s.dir, "initrd.img")
+	if initrdOverride != "" {
+		initrdSrc = initrdOverride
+	}
+	if err := runner.Run("sudo", "cp", initrdSrc, filepath.Join(destDir, "initrd.img")); err != nil {
 		return "", fmt.Errorf("copy initrd from staging: %w", err)
 	}
 	if err := runner.Run("sudo", "chmod", "0644", filepath.Join(destDir, "initrd.img")); err != nil {

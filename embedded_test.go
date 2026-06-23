@@ -8,9 +8,8 @@ import (
 
 func TestDracutTboxRootEmbedded(t *testing.T) {
 	// Verify the embedded FS is not nil
-	if DracutTboxRoot == nil {
-		t.Fatal("DracutTboxRoot embed.FS is nil")
-	}
+	// embed.FS is a struct, not a pointer, so it can never be nil.
+	// fstest.TestFS below validates the FS is properly populated.
 
 	// Verify expected files exist in the embedded FS
 	expectedFiles := []string{

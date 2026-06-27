@@ -24,6 +24,9 @@ jobs:
       - name: go test
         run: go test ./...
 
+      - name: go test with coverage summary
+        run: go test -cover -covermode=set ./...
+
       # Integration-tag help checks: builds the binary and execs --help
       # for every subcommand. Confirms the CLI surface matches what CI depends on.
       - name: go test (integration tag, help-only)

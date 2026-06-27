@@ -112,8 +112,10 @@ jobs:
       # ── Custom PoC: a caller-supplied recipe ────────────────────────────
       - name: build PoC ISO (custom recipe)
         if: inputs.recipe != ''
+        env:
+          RECIPE: ${{ inputs.recipe }}
         run: |
-          sudo ./tacklebox build "${{ inputs.recipe }}" \
+          sudo ./tacklebox build "${RECIPE}" \
             --iso /mnt/tbx/tacklebox-poc-custom.iso -b /mnt/tbx
 
       - name: verify ISOs

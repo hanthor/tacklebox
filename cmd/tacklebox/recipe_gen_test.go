@@ -551,6 +551,68 @@ func TestRecipeGenJSONInput(t *testing.T) {
 	}
 }
 
+// ── recipeGenCmd.RunE invocation tests ─────────────────────────────────────
+// These tests invoke recipeGenCmd.RunE directly, exercising the
+// full file read → parse → defaults → validation → output pipeline.
+// The critical gap vs runRecipeGen above is that this calls the *real*
+// command handler with its actual flag parsing.
+
+func TestRecipeGenRunE_MinimalInput(t *testing.T) {
+	yamlContent := `media_name: Test Media
+bootable_environments:
+  - id: test-env
+    image: ghcr.io/test/image:latest
+`
+	inputPath := filepath.Join(t.TempDir(), "input.yaml")
+	if err := os.WriteFile(inputPath, []byte(yamlContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set up the --output flag to capture to a temp file instead of stdout.
+	outputPath := filepath.Join(t.TempDir(), "out.json")
+	recipeGenCmd.Flags().Set("output", outputPath)
+	err := recipeGenCmd.RunE(recipeGenCmd, []string{inputPath})
+	if err != nil {
+		t.Fatalf("recipeGenCmd.RunE failed: %v", err)
+	}
+
+	// Verify output.
+	data, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("output file not created: %v", err)
+	}
+	var r map[string]any
+	if err := json.Unmarshal(data, &r); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+	if r["media_name"] != "Test Media" {
+		t.Errorf("media_name = %v", r["media_name"])
+	}
+}
+
+func TestRecipeGenRunE_InvalidYAML(t *testing.T) {
+	inputPath := filepath.Join(t.TempDir(), "invalid.yaml")
+	if err := os.WriteFile(inputPath, []byte("{{invalid yaml"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "out.json")
+	recipeGenCmd.Flags().Set("output", outputPath)
+	err := recipeGenCmd.RunE(recipeGenCmd, []string{inputPath})
+	if err == nil {
+		t.Error("expected error for invalid YAML, got nil")
+	}
+}
+
+func TestRecipeGenRunE_MissingFile(t *testing.T) {
+	outputPath := filepath.Join(t.TempDir(), "out.json")
+	recipeGenCmd.Flags().Set("output", outputPath)
+	err := recipeGenCmd.RunE(recipeGenCmd, []string{"/nonexistent/input.yaml"})
+	if err == nil {
+		t.Error("expected error for missing file, got nil")
+	}
+}
+
 func TestYamlNormalizeRetainsJSONCompatibility(t *testing.T) {
 	// After yamlNormalize, the result must be JSON-marshalable.
 	input := map[any]any{

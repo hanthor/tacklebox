@@ -10,3 +10,6 @@
 # Test artifacts
 /coverage.out
 *.test
+
+# Agent runtime artifacts
+.pi/goals/

@@ -80,8 +80,14 @@ func PrepareInitramfs(image string, modules []string, skip bool) (string, error)
 		"--security-opt", "label=disable",
 		"-v", outDir+":/tbox-out",
 		"-v", moduleDir+":/usr/lib/dracut/modules.d/95tbox-root:ro",
+	)
+	if _, err := os.Stat("/usr/lib/dracut/modules.d/90dmsquash-live"); err == nil {
+		runArgs = append(runArgs, "-v", "/usr/lib/dracut/modules.d/90dmsquash-live:/usr/lib/dracut/modules.d/90dmsquash-live:ro")
+	}
+	runArgs = append(runArgs,
 		"--entrypoint", "/bin/sh",
-		image, "-c", initramfsScript(modules))
+		image, "-c", initramfsScript(modules),
+	)
 	out, err := runner.Output(prefix[0], runArgs...)
 	if err != nil {
 		return "", fmt.Errorf("initramfs preparation for %s failed (does the image ship dracut and the dracut-live module?): %w", image, err)

@@ -1,0 +1,135 @@
+# Builds the Bazzite All-In-One multi-boot ISO and publishes it to Cloudflare R2.
+#
+# Uses the org-wide R2 secrets and the same rclone pattern as other tuna-os ISO repos:
+#   R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ENDPOINT, R2_BUCKET
+# Artifacts land flat under the tacklebox prefix:
+#   <bucket>/tacklebox/bazzite-aio-<YYYYMMDD>-<sha7>.iso   immutable, per-run
+#   <bucket>/tacklebox/bazzite-aio-latest.iso              rolling latest
+# Published at https://download.tunaos.org/tacklebox/bazzite-aio-latest.iso
+name: bazzite-aio
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_upload:
+        description: 'Build ISO but skip uploading to R2 (dry run)'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # Weekly, Tuesday 05:00 UTC (staggered from the Monday weekly PoC build)
+    - cron: '0 5 * * 2'
+
+concurrency:
+  group: bazzite-aio
+  cancel-in-progress: true
+
+jobs:
+  build-bazzite-aio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+
+      - name: free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main as of 2026-06-09
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xorriso mtools squashfs-tools dosfstools \
+            systemd-boot systemd-boot-efi podman rclone
+
+      - name: build tacklebox
+        run: go build -o tacklebox ./cmd/tacklebox
+
+      - name: prepare output base for cache restore
+        run: sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt/tbx
+
+      - name: restore build caches
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            /mnt/tbx/initramfs-cache
+            /mnt/tbx/squashfs-cache
+          key: tbox-bazzite-cache-${{ github.run_id }}
+          restore-keys: |
+            tbox-bazzite-cache-
+
+      - name: pre-pull images
+        run: |
+          jq -r '.bootable_environments[].image' examples/bazzite-aio.json | \
+            xargs -P6 -I{} sudo podman pull {}
+
+      - name: build Bazzite AIO ISO
+        run: |
+          sudo ./tacklebox build examples/bazzite-aio.json \
+            --iso /mnt/tbx/bazzite-aio.iso -b /mnt/tbx
+
+      - name: verify ISO
+        run: |
+          sudo ./tacklebox verify /mnt/tbx/bazzite-aio.iso
+
+      - name: checksums
+        run: |
+          cd /mnt/tbx
+          sha256sum bazzite-aio.iso > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: upload to R2
+        if: ${{ inputs.skip_upload != true && github.event_name != 'pull_request' && env.R2_BUCKET != '' }}
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_REGION: auto
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          STAMP="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          PREFIX="R2:${R2_BUCKET}/tacklebox"
+          {
+            echo "## Bazzite AIO ISO uploaded to R2"
+          } >> "$GITHUB_STEP_SUMMARY"
+          
+          rclone copyto --log-level INFO --checksum --s3-no-check-bucket \
+            /mnt/tbx/bazzite-aio.iso "${PREFIX}/bazzite-aio-${STAMP}.iso"
+          rclone copyto --log-level INFO --s3-no-check-bucket \
+            /mnt/tbx/bazzite-aio.iso "${PREFIX}/bazzite-aio-latest.iso"
+          echo "- https://download.tunaos.org/tacklebox/bazzite-aio-latest.iso" >> "$GITHUB_STEP_SUMMARY"
+          
+          rclone copyto --log-level INFO --s3-no-check-bucket \
+            /mnt/tbx/SHA256SUMS "${PREFIX}/bazzite-aio-SHA256SUMS-${STAMP}"
+
+      - name: note skipped upload
+        if: ${{ inputs.skip_upload == true || github.event_name == 'pull_request' || env.R2_BUCKET == '' }}
+        run: |
+          echo '## R2 upload skipped (dry run, PR, or R2 secrets unset)' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: artifact summary
+        if: always()
+        run: |
+          echo '## Bazzite AIO ISO build' >> "$GITHUB_STEP_SUMMARY"
+          ls -lh /mnt/tbx/bazzite-aio.iso 2>/dev/null | awk '{print "- `" $NF "` (" $5 ")"}' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f /mnt/tbx/SHA256SUMS ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat /mnt/tbx/SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi

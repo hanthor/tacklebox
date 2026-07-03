@@ -1,0 +1,52 @@
+{
+  "media_name": "Bazzite-AIO",
+  "size": "50G",
+  "shared_store": {
+    "format": "ext4",
+    "dedup": true
+  },
+  "bootable_environments": [
+    {
+      "id": "bazzite-kde",
+      "image": "ghcr.io/ublue-os/bazzite:stable",
+      "title": "Bazzite KDE (AMD/Intel)",
+      "desktop": "kde",
+      "modes": ["live"]
+    },
+    {
+      "id": "bazzite-gnome",
+      "image": "ghcr.io/ublue-os/bazzite-gnome:stable",
+      "title": "Bazzite GNOME (AMD/Intel)",
+      "desktop": "gnome",
+      "modes": ["live"]
+    },
+    {
+      "id": "bazzite-nvidia-kde",
+      "image": "ghcr.io/ublue-os/bazzite-nvidia:stable",
+      "title": "Bazzite Nvidia KDE",
+      "desktop": "kde",
+      "modes": ["live"]
+    },
+    {
+      "id": "bazzite-nvidia-gnome",
+      "image": "ghcr.io/ublue-os/bazzite-gnome-nvidia:stable",
+      "title": "Bazzite Nvidia GNOME",
+      "desktop": "gnome",
+      "modes": ["live"]
+    },
+    {
+      "id": "bazzite-deck-kde",
+      "image": "ghcr.io/ublue-os/bazzite-deck:stable",
+      "title": "Bazzite Deck / Handheld KDE",
+      "desktop": "kde",
+      "modes": ["live"]
+    },
+    {
+      "id": "bazzite-deck-gnome",
+      "image": "ghcr.io/ublue-os/bazzite-deck-gnome:stable",
+      "title": "Bazzite Deck / Handheld GNOME",
+      "desktop": "gnome",
+      "modes": ["live"]
+    }
+  ]
+}

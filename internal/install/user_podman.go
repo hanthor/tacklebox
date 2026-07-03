@@ -22,7 +22,33 @@ import (
 //
 // If SUDO_USER is not set (running as root directly, or as the target user
 // already) returns ["podman"] unchanged.
+// rootContext reports whether container work should run directly as root
+// against root's store instead of dropping to SUDO_USER's rootless store.
+//
+// The SUDO_USER drop dance caused a long tail of CI failures (nested sudo
+// making SUDO_USER=root, root/rootless store splits, root-owned crun state
+// poisoning /run/user/<uid> — tuna-os/tacklebox#86). When tacklebox runs as
+// root, staying root is simpler and correct: `podman image mount` needs no
+// user namespace, and overlay file ownership in root's store is already
+// real, so mksquashfs sees the right UIDs without unshare.
+//
+// TACKLEBOX_CONTEXT=user restores the legacy drop behavior;
+// TACKLEBOX_CONTEXT=root forces root context (it is also the default
+// whenever EUID is 0).
+func rootContext() bool {
+	switch os.Getenv("TACKLEBOX_CONTEXT") {
+	case "root":
+		return true
+	case "user":
+		return false
+	}
+	return os.Geteuid() == 0
+}
+
 func UserCommandPrefix(command string) []string {
+	if rootContext() {
+		return []string{command}
+	}
 	sudoUser := os.Getenv("SUDO_USER")
 	if sudoUser == "" || sudoUser == "root" {
 		return []string{command}
@@ -56,6 +82,12 @@ func UserPodmanPrefix() []string { return UserCommandPrefix("podman") }
 // The script string is passed directly to `sh -c`; use shellEsc() from
 // live.go to safely interpolate variable values into it.
 func RunUnshare(script string) error {
+	// Root context: no user namespace needed — root's store has real file
+	// ownership and root can mount images natively, so the script runs
+	// directly. `podman unshare` would refuse to run as root anyway.
+	if rootContext() {
+		return runner.Run("sh", "-c", script)
+	}
 	prefix := UserPodmanPrefix()
 	// Build: <prefix> unshare -- sh -c <script>
 	// e.g.  sudo -u james -H --preserve-env=PATH podman unshare -- sh -c '...'

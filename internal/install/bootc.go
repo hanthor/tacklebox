@@ -3,6 +3,7 @@ package install
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -105,6 +106,25 @@ func PullUser(image string) error {
 		return nil
 	}
 	if strings.HasPrefix(image, "localhost/") {
+		// Root context: the image may live in the invoking user's rootless
+		// store (plain `podman build` before `sudo tacklebox`). Sync it over
+		// once instead of failing — this replaces the manual
+		// `podman save | sudo podman load` every consumer had to script.
+		if rootContext() {
+			if su := os.Getenv("SUDO_USER"); su != "" && su != "root" {
+				check := exec.Command("sudo", "-u", su, "-H", "podman", "image", "exists", image)
+				if check.Run() == nil {
+					fmt.Printf(">>> Syncing %s from %s's rootless store into root's store\n", image, su)
+					sync := fmt.Sprintf("sudo -u %s -H podman save %s | podman load", shellEsc(su), shellEsc(image))
+					if err := runner.Run("sh", "-c", sync); err != nil {
+						return fmt.Errorf("sync %s from user store: %w", image, err)
+					}
+					return nil
+				}
+			}
+			return fmt.Errorf(
+				"localhost image %q not found in root's podman store (and not in SUDO_USER's rootless store); build it with sudo, or sync it: podman save %s | sudo podman load", image, image)
+		}
 		return fmt.Errorf(
 			"localhost image %q not found in the invoking user's podman store; build it with plain `podman build` (not sudo) first", image)
 	}
@@ -199,13 +219,14 @@ func parseBackend(inspectJson string) Backend {
 	return BackendComposefs
 }
 
-
 // FindOstreeDeployment returns the ostree deployment hash (the directory name
 // that bootc install actually wrote under <envRoot>/ostree/boot.1/<stateroot>/).
 // Returns ("", nil) if the env isn't ostree-backed (e.g. composefs).
 //
 // bootc install writes the kernel argument as
-//   ostree=/ostree/boot.1/<stateroot>/<bootcsum>/0
+//
+//	ostree=/ostree/boot.1/<stateroot>/<bootcsum>/0
+//
 // where <bootcsum> is a 64-char hex SHA. Tacklebox previously hardcoded
 // `current` instead, which doesn't exist and broke ostree-prepare-root at
 // switch_root time.

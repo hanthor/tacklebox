@@ -1,0 +1,31 @@
+{
+  "media_name": "Bazzite-GNOME",
+  "size": "30G",
+  "shared_store": {
+    "format": "ext4",
+    "dedup": true
+  },
+  "bootable_environments": [
+    {
+      "id": "bazzite-gnome",
+      "image": "ghcr.io/ublue-os/bazzite-gnome:stable",
+      "title": "Bazzite GNOME (AMD/Intel)",
+      "desktop": "gnome",
+      "modes": ["live"]
+    },
+    {
+      "id": "bazzite-nvidia-gnome",
+      "image": "ghcr.io/ublue-os/bazzite-gnome-nvidia:stable",
+      "title": "Bazzite Nvidia GNOME",
+      "desktop": "gnome",
+      "modes": ["live"]
+    },
+    {
+      "id": "bazzite-deck-gnome",
+      "image": "ghcr.io/ublue-os/bazzite-deck-gnome:stable",
+      "title": "Bazzite Deck / Handheld GNOME",
+      "desktop": "gnome",
+      "modes": ["live"]
+    }
+  ]
+}

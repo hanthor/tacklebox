@@ -1,0 +1,129 @@
+# Builds the Bazzite GNOME multi-boot ISO (AMD/Intel, Nvidia, Deck) and publishes to Cloudflare R2.
+# Published at https://download.tunaos.org/tacklebox/bazzite-gnome-latest.iso
+name: bazzite-gnome
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_upload:
+        description: 'Build ISO but skip uploading to R2 (dry run)'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # Weekly, Wednesday 07:00 UTC (staggered 2h after KDE build)
+    - cron: '0 7 * * 3'
+
+concurrency:
+  group: bazzite-gnome
+  cancel-in-progress: true
+
+jobs:
+  build-bazzite-gnome:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+
+      - name: free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main as of 2026-06-09
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xorriso mtools squashfs-tools dosfstools \
+            systemd-boot systemd-boot-efi podman rclone dracut-live
+
+      - name: build tacklebox
+        run: go build -o tacklebox ./cmd/tacklebox
+
+      - name: prepare output dirs
+        run: |
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /var/tmp/tbx
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt/iso-out
+
+      - name: restore build caches
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            /var/tmp/tbx/initramfs-cache
+            /var/tmp/tbx/squashfs-cache
+          key: tbox-bazzite-gnome-cache-${{ github.run_id }}
+          restore-keys: |
+            tbox-bazzite-gnome-cache-
+
+      - name: pre-pull images
+        run: |
+          jq -r '.bootable_environments[].image' examples/bazzite-gnome.json | \
+            xargs -P3 -I{} sudo podman pull {}
+
+      - name: build Bazzite GNOME ISO
+        run: |
+          sudo ./tacklebox build examples/bazzite-gnome.json \
+            --iso /mnt/iso-out/bazzite-gnome.iso -b /var/tmp/tbx
+
+      - name: verify ISO
+        run: |
+          sudo ./tacklebox verify /mnt/iso-out/bazzite-gnome.iso
+
+      - name: checksums
+        run: |
+          cd /mnt/iso-out
+          sha256sum bazzite-gnome.iso > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: upload to R2
+        if: ${{ inputs.skip_upload != true && github.event_name != 'pull_request' && env.R2_BUCKET != '' }}
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_REGION: auto
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          STAMP="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          PREFIX="R2:${R2_BUCKET}/tacklebox"
+          {
+            echo "## Bazzite GNOME ISO uploaded to R2"
+          } >> "$GITHUB_STEP_SUMMARY"
+          rclone copyto --log-level INFO --checksum --s3-no-check-bucket \
+            /mnt/iso-out/bazzite-gnome.iso "${PREFIX}/bazzite-gnome-${STAMP}.iso"
+          rclone copyto --log-level INFO --s3-no-check-bucket \
+            /mnt/iso-out/bazzite-gnome.iso "${PREFIX}/bazzite-gnome-latest.iso"
+          echo "- https://download.tunaos.org/tacklebox/bazzite-gnome-latest.iso" >> "$GITHUB_STEP_SUMMARY"
+          rclone copyto --log-level INFO --s3-no-check-bucket \
+            /mnt/iso-out/SHA256SUMS "${PREFIX}/bazzite-gnome-SHA256SUMS-${STAMP}"
+
+      - name: note skipped upload
+        if: ${{ inputs.skip_upload == true || github.event_name == 'pull_request' || env.R2_BUCKET == '' }}
+        run: |
+          echo '## R2 upload skipped (dry run, PR, or R2 secrets unset)' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: artifact summary
+        if: always()
+        run: |
+          echo '## Bazzite GNOME ISO build' >> "$GITHUB_STEP_SUMMARY"
+          ls -lh /mnt/iso-out/bazzite-gnome.iso 2>/dev/null | awk '{print "- `" $NF "` (" $5 ")"}' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f /mnt/iso-out/SHA256SUMS ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat /mnt/iso-out/SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi

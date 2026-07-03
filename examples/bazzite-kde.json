@@ -1,0 +1,31 @@
+{
+  "media_name": "Bazzite-KDE",
+  "size": "30G",
+  "shared_store": {
+    "format": "ext4",
+    "dedup": true
+  },
+  "bootable_environments": [
+    {
+      "id": "bazzite-kde",
+      "image": "ghcr.io/ublue-os/bazzite:stable",
+      "title": "Bazzite KDE (AMD/Intel)",
+      "desktop": "kde",
+      "modes": ["live"]
+    },
+    {
+      "id": "bazzite-nvidia-kde",
+      "image": "ghcr.io/ublue-os/bazzite-nvidia:stable",
+      "title": "Bazzite Nvidia KDE",
+      "desktop": "kde",
+      "modes": ["live"]
+    },
+    {
+      "id": "bazzite-deck-kde",
+      "image": "ghcr.io/ublue-os/bazzite-deck:stable",
+      "title": "Bazzite Deck / Handheld KDE",
+      "desktop": "kde",
+      "modes": ["live"]
+    }
+  ]
+}

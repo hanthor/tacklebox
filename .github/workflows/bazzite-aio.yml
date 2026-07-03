@@ -46,9 +46,9 @@ jobs:
           android: true
           dotnet: true
           haskell: true
-          large-packages: false
+          large-packages: true
           docker-images: true
-          swap-storage: false
+          swap-storage: true
 
       - name: install build deps
         run: |
@@ -61,7 +61,11 @@ jobs:
         run: go build -o tacklebox ./cmd/tacklebox
 
       - name: prepare output base for cache restore
-        run: sudo install -d -o "$(id -u)" -g "$(id -g)" /var/tmp/tbx
+        run: |
+          # /var/tmp/tbx: build intermediates (squashfs, initramfs, iso tree)
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /var/tmp/tbx
+          # /mnt/iso-out: final ISO destination (freed ~14 GiB by docker cleanup)
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt/iso-out
 
       - name: restore build caches
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -81,15 +85,15 @@ jobs:
       - name: build Bazzite AIO ISO
         run: |
           sudo ./tacklebox build examples/bazzite-aio.json \
-            --iso /var/tmp/tbx/bazzite-aio.iso -b /var/tmp/tbx
+            --iso /mnt/iso-out/bazzite-aio.iso -b /var/tmp/tbx
 
       - name: verify ISO
         run: |
-          sudo ./tacklebox verify /var/tmp/tbx/bazzite-aio.iso
+          sudo ./tacklebox verify /mnt/iso-out/bazzite-aio.iso
 
       - name: checksums
         run: |
-          cd /var/tmp/tbx
+          cd /mnt/iso-out
           sha256sum bazzite-aio.iso > SHA256SUMS
           cat SHA256SUMS
 
@@ -110,13 +114,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           
           rclone copyto --log-level INFO --checksum --s3-no-check-bucket \
-            /var/tmp/tbx/bazzite-aio.iso "${PREFIX}/bazzite-aio-${STAMP}.iso"
+            /mnt/iso-out/bazzite-aio.iso "${PREFIX}/bazzite-aio-${STAMP}.iso"
           rclone copyto --log-level INFO --s3-no-check-bucket \
-            /var/tmp/tbx/bazzite-aio.iso "${PREFIX}/bazzite-aio-latest.iso"
+            /mnt/iso-out/bazzite-aio.iso "${PREFIX}/bazzite-aio-latest.iso"
           echo "- https://download.tunaos.org/tacklebox/bazzite-aio-latest.iso" >> "$GITHUB_STEP_SUMMARY"
           
           rclone copyto --log-level INFO --s3-no-check-bucket \
-            /var/tmp/tbx/SHA256SUMS "${PREFIX}/bazzite-aio-SHA256SUMS-${STAMP}"
+            /mnt/iso-out/SHA256SUMS "${PREFIX}/bazzite-aio-SHA256SUMS-${STAMP}"
 
       - name: note skipped upload
         if: ${{ inputs.skip_upload == true || github.event_name == 'pull_request' || env.R2_BUCKET == '' }}
@@ -127,9 +131,9 @@ jobs:
         if: always()
         run: |
           echo '## Bazzite AIO ISO build' >> "$GITHUB_STEP_SUMMARY"
-          ls -lh /var/tmp/tbx/bazzite-aio.iso 2>/dev/null | awk '{print "- `" $NF "` (" $5 ")"}' >> "$GITHUB_STEP_SUMMARY"
-          if [ -f /var/tmp/tbx/SHA256SUMS ]; then
+          ls -lh /mnt/iso-out/bazzite-aio.iso 2>/dev/null | awk '{print "- `" $NF "` (" $5 ")"}' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f /mnt/iso-out/SHA256SUMS ]; then
             echo '```' >> "$GITHUB_STEP_SUMMARY"
-            cat /var/tmp/tbx/SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
+            cat /mnt/iso-out/SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
           fi

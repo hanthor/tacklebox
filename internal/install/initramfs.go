@@ -84,6 +84,11 @@ func PrepareInitramfs(image string, modules []string, skip bool) (string, error)
 	if _, err := os.Stat("/usr/lib/dracut/modules.d/90dmsquash-live"); err == nil {
 		runArgs = append(runArgs, "-v", "/usr/lib/dracut/modules.d/90dmsquash-live:/usr/lib/dracut/modules.d/90dmsquash-live:ro")
 	}
+	if _, err := os.Stat("/usr/lib/dracut/modules.d/99img-lib"); err == nil {
+		runArgs = append(runArgs, "-v", "/usr/lib/dracut/modules.d/99img-lib:/usr/lib/dracut/modules.d/99img-lib:ro")
+	} else if _, err := os.Stat("/usr/lib/dracut/modules.d/90img-lib"); err == nil {
+		runArgs = append(runArgs, "-v", "/usr/lib/dracut/modules.d/90img-lib:/usr/lib/dracut/modules.d/90img-lib:ro")
+	}
 	runArgs = append(runArgs,
 		"--entrypoint", "/bin/sh",
 		image, "-c", initramfsScript(modules),

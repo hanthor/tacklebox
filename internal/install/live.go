@@ -307,16 +307,44 @@ func shellEsc(s string) string {
 
 // extractScript runs inside a container and copies vmlinuz + initramfs.img
 // out of /usr/lib/modules/<kver>/ to /dest/.
+// Kernel preference order (tuna-os/tacklebox#86 item 3):
+//  1. non-debug kernel that ships both vmlinuz and initramfs.img
+//  2. non-debug kernel with only vmlinuz
+//  3. a +debug kernel (CentOS Stream ships these WITHOUT an initramfs and
+//     they sort first alphabetically — the old "first modules.dep wins"
+//     logic picked them and the build died at the initramfs copy)
+//
+// Missing initramfs on the final choice is a clear, actionable error.
 const extractScript = `set -eu
 kver=""
+kver_noinitrd=""
+kver_debug=""
 for d in /usr/lib/modules/*/; do
-  if [ -f "$d/modules.dep" ]; then
-    kver=$(basename "$d")
+  [ -f "$d/modules.dep" ] || continue
+  b=$(basename "$d")
+  case "$b" in
+  *+debug*|*-debug)
+    [ -z "$kver_debug" ] && kver_debug="$b"
+    continue ;;
+  esac
+  if [ -f "$d/vmlinuz" ] && [ -f "$d/initramfs.img" ]; then
+    kver="$b"
     break
   fi
+  if [ -f "$d/vmlinuz" ] && [ -z "$kver_noinitrd" ]; then
+    kver_noinitrd="$b"
+  fi
 done
+[ -n "$kver" ] || kver="$kver_noinitrd"
+[ -n "$kver" ] || kver="$kver_debug"
 if [ -z "$kver" ]; then
-  echo "no kernel found under /usr/lib/modules" >&2
+  echo "no kernel found under /usr/lib/modules (looked for modules.dep):" >&2
+  ls /usr/lib/modules >&2 || true
+  exit 1
+fi
+if [ ! -f "/usr/lib/modules/$kver/initramfs.img" ]; then
+  echo "kernel $kver has no initramfs.img (debug kernels usually ship without one)." >&2
+  echo "Regenerate it in the image: dracut --force --reproducible --no-hostonly --kver $kver" >&2
   exit 1
 fi
 cp "/usr/lib/modules/$kver/vmlinuz" /dest/vmlinuz

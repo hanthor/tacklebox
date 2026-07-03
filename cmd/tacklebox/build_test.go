@@ -73,11 +73,11 @@ func TestBuildKernelCmdline(t *testing.T) {
 			excludes: []string{"commit=", "errors=remount-ro", "rd.live.overlay"},
 		},
 		{
-			name:    "composefs persistent unsafe — no rootflags at all",
-			env:     "dakota",
-			mode:    "persistent",
-			backend: composefs,
-			usbSafe: false,
+			name:     "composefs persistent unsafe — no rootflags at all",
+			env:      "dakota",
+			mode:     "persistent",
+			backend:  composefs,
+			usbSafe:  false,
 			contains: []string{"rootflags=subvol=containers/storage/overlay/default/diff"},
 			excludes: []string{"commit=", "errors=remount-ro"},
 		},
@@ -373,5 +373,16 @@ func TestBuildLiveKernelCmdlineCombined(t *testing.T) {
 	// would try to rebase /sysroot onto a subdir that doesn't exist.
 	if plain := buildLiveKernelCmdline("bazzite", "TBX_ISO"); strings.Contains(plain, "tacklebox.root=") {
 		t.Errorf("per-env cmdline must not set tacklebox.root: %s", plain)
+	}
+}
+
+func TestAppendKargs(t *testing.T) {
+	got := appendKargs("root=live:CDLABEL=X quiet", []string{"console=ttyS0", "", "  ", "console=tty0"})
+	want := "root=live:CDLABEL=X quiet console=ttyS0 console=tty0"
+	if got != want {
+		t.Fatalf("appendKargs = %q, want %q", got, want)
+	}
+	if appendKargs("a", nil) != "a" {
+		t.Fatal("nil kargs must be a no-op")
 	}
 }

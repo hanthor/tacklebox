@@ -418,6 +418,19 @@ const combinedSquashName = "combined.rootfs.sfs"
 
 // buildLiveKernelCmdline returns the BLS `options` line for an env that
 // will be booted via dmsquash-live from a per-env squashfs in /LiveOS/.
+// appendKargs appends recipe-level extra kernel arguments to a generated
+// options line. Empty/whitespace entries are skipped; order is preserved.
+func appendKargs(options string, kargs []string) string {
+	for _, k := range kargs {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		options += " " + k
+	}
+	return options
+}
+
 // Used by IsoTarget. label is the ISO9660 volume label (so dmsquash-live
 // can find the iso by `root=live:CDLABEL=...`).
 func buildLiveKernelCmdline(envID, label string) string {
@@ -583,7 +596,7 @@ func installEnvBootc(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt t
 
 	for _, mode := range env.Modes {
 		id := fmt.Sprintf("%s-%s", env.ID, mode)
-		options := buildKernelCmdline(env.ID, mode, backend, blockdev.UsbSafe, ostreeBootcsum)
+		options := appendKargs(buildKernelCmdline(env.ID, mode, backend, blockdev.UsbSafe, ostreeBootcsum), r.Kargs)
 		isDefault := env.ID == r.DefaultBoot
 		if err := install.WriteBLSEntry(espMount, id, envTitle(env, string(mode)), tgt.KernelPath(env.ID), tgt.InitrdPath(env.ID), options, isDefault); err != nil {
 			return err
@@ -649,7 +662,7 @@ func installEnvLive(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt ta
 		return fmt.Errorf("extract boot files for %s: %w", env.ID, err)
 	}
 
-	options := buildLiveKernelCmdline(env.ID, label)
+	options := appendKargs(buildLiveKernelCmdline(env.ID, label), r.Kargs)
 	isDefault := env.ID == r.DefaultBoot
 	if err := install.WriteBLSEntry(espMount, env.ID, envTitle(env, "live"), tgt.KernelPath(env.ID), tgt.InitrdPath(env.ID), options, isDefault); err != nil {
 		return err
@@ -714,7 +727,7 @@ func installEnvsLiveCombined(r recipe.MediaRecipe, tgt target.Target, storeMount
 			return fmt.Errorf("extract boot files for %s: %w", env.ID, err)
 		}
 
-		options := buildLiveKernelCmdlineCombined(env.ID, label)
+		options := appendKargs(buildLiveKernelCmdlineCombined(env.ID, label), r.Kargs)
 		isDefault := env.ID == r.DefaultBoot
 		if err := install.WriteBLSEntry(espMount, env.ID, envTitle(env, "live"), tgt.KernelPath(env.ID), tgt.InitrdPath(env.ID), options, isDefault); err != nil {
 			return err

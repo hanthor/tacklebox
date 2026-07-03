@@ -104,3 +104,21 @@ func TestUserCommandPrefix_ArbitraryCommand(t *testing.T) {
 		t.Errorf("last arg = %q, want skopeo", got[len(got)-1])
 	}
 }
+
+func TestRootContextForcesDirectCommands(t *testing.T) {
+	t.Setenv("TACKLEBOX_CONTEXT", "root")
+	t.Setenv("SUDO_USER", "james")
+	got := UserCommandPrefix("podman")
+	if len(got) != 1 || got[0] != "podman" {
+		t.Fatalf("root context must not drop to SUDO_USER, got %v", got)
+	}
+}
+
+func TestUserContextOverridePreservesDrop(t *testing.T) {
+	t.Setenv("TACKLEBOX_CONTEXT", "user")
+	t.Setenv("SUDO_USER", "james")
+	got := UserCommandPrefix("podman")
+	if len(got) < 3 || got[0] != "sudo" {
+		t.Fatalf("TACKLEBOX_CONTEXT=user must keep the legacy drop, got %v", got)
+	}
+}

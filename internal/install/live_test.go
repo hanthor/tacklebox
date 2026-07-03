@@ -1,6 +1,7 @@
 package install
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -129,4 +130,46 @@ func TestCombinedSquashScript(t *testing.T) {
 	if got := strings.Count(s, "podman image unmount"); got != 2 {
 		t.Errorf("want 2 unmounts in trap, got %d", got)
 	}
+}
+
+// The extract script must never pick a +debug kernel when a regular one
+// exists, and must fail with an actionable message when the chosen kernel
+// lacks an initramfs (tuna-os/tacklebox#86 item 3). Exercised with a fake
+// modules tree via sh, no containers needed.
+func TestExtractScriptKernelSelection(t *testing.T) {
+	run := func(t *testing.T, setup string) (string, error) {
+		t.Helper()
+		root := t.TempDir()
+		dest := t.TempDir()
+		script := "set -eu\nROOT=" + root + "\nDEST=" + dest + "\n" + setup + "\n" +
+			strings.ReplaceAll(strings.ReplaceAll(extractScript, "/usr/lib/modules", root), "/dest", dest)
+		out, err := exec.Command("sh", "-c", script).CombinedOutput()
+		return string(out), err
+	}
+	mk := `mkdir -p "$ROOT/$1"; touch "$ROOT/$1/modules.dep" "$ROOT/$1/vmlinuz"; [ "$2" = initrd ] && touch "$ROOT/$1/initramfs.img" || true`
+
+	t.Run("prefers non-debug with initramfs", func(t *testing.T) {
+		setup := `mkkernel() { ` + mk + `; }
+mkkernel "6.12.0-1.el10.x86_64+debug" noinitrd
+mkkernel "6.12.0-1.el10.x86_64" initrd`
+		out, err := run(t, setup)
+		if err != nil {
+			t.Fatalf("expected success, got %v: %s", err, out)
+		}
+		if !strings.Contains(out, "KVER=6.12.0-1.el10.x86_64") || strings.Contains(out, "+debug") {
+			t.Fatalf("picked wrong kernel: %s", out)
+		}
+	})
+
+	t.Run("clear error when only a debug kernel without initramfs exists", func(t *testing.T) {
+		setup := `mkkernel() { ` + mk + `; }
+mkkernel "6.12.0-1.el10.x86_64+debug" noinitrd`
+		out, err := run(t, setup)
+		if err == nil {
+			t.Fatalf("expected failure, got success: %s", out)
+		}
+		if !strings.Contains(out, "no initramfs.img") || !strings.Contains(out, "dracut") {
+			t.Fatalf("error not actionable: %s", out)
+		}
+	})
 }

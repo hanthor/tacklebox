@@ -53,4 +53,9 @@ type MediaRecipe struct {
 	DefaultBoot          string                `json:"default_boot,omitempty"`
 	BootableEnvironments []BootableEnvironment `json:"bootable_environments"`
 	OfflinePayloads      []string              `json:"offline_payloads"`
+	// Kargs are appended verbatim to every generated BLS entry's options
+	// line (both live and block modes). Typical use: "console=ttyS0" so CI
+	// boot gates get serial markers, or debug flags — without rebuilding
+	// the image (tuna-os/tacklebox#86 item 4).
+	Kargs []string `json:"kargs,omitempty"`
 }

@@ -160,6 +160,13 @@ func verifyIso(path string) []checkResult {
 		if !strings.HasSuffix(name, ".rootfs.sfs") {
 			continue
 		}
+		// combined.rootfs.sfs is the shared dedup store used by all environments
+		// in the combined-squashfs layout; it is not a per-env file so a hash
+		// collision check is meaningless. Skip it to avoid extracting the full
+		// (multi-GB) file to /tmp during verification.
+		if name == "combined.rootfs.sfs" {
+			continue
+		}
 		h, err := hashIsoFilePrefix(path, "/LiveOS/"+name, 1<<20)
 		if err != nil {
 			results = append(results, checkResult{"hash /LiveOS/" + name, err})

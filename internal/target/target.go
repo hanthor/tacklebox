@@ -14,6 +14,16 @@ package target
 // summary as the per-env phases.
 type Track func(name string, fn func() error) error
 
+// orNoopTrack normalizes a nil Track to a pass-through, so Target
+// implementations never nil-deref when a caller (tests, future
+// embedders) doesn't care about phase timing.
+func orNoopTrack(t Track) Track {
+	if t != nil {
+		return t
+	}
+	return func(_ string, fn func() error) error { return fn() }
+}
+
 // Mountpoints names the two filesystem locations a per-env install needs
 // to write into. Their meaning is the same regardless of target type:
 //
@@ -37,8 +47,9 @@ type Mountpoints struct {
 //     subdir of the shared store. Used by BlockTarget. Each env ends
 //     up as an ostree (or composefs) deployment.
 //   - Live:  per-env podman-image-mount + mksquashfs into a single
-//     <env>.rootfs.sfs file. Used by IsoTarget. Boot-time pivot is
-//     dmsquash-live's job (rd.live.* on the kernel cmdline).
+//     <env>.rootfs.sfs file. Used by IsoTarget. Boot-time assembly is
+//     the tbox-live dracut module's job (root=tbox: + tacklebox.live.*
+//     on the kernel cmdline).
 type InstallMode string
 
 const (
@@ -76,7 +87,7 @@ type Target interface {
 	// BLS `linux` and `initrd` lines should reference for env. For
 	// BlockTarget these are `/EFI/<env>/vmlinuz` (the ESP root *is* the
 	// boot fs). For IsoTarget they're `/images/pxeboot/<env>/vmlinuz`
-	// (where dmsquash-live expects them on a live ISO).
+	// (the conventional live-ISO location).
 	KernelPath(envID string) string
 	InitrdPath(envID string) string
 }

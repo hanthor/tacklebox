@@ -36,8 +36,13 @@ in the tacklebox binary, so this works without the repo checkout.
 
 | Target type | Modules added |
 |---|---|
-| ISO (`--iso`) | `dmsquash-live`, `tbox-root` |
+| ISO (`--iso`) | `tbox-live`, `tbox-root` |
 | Block / USB | `tbox-root` |
+
+Both modules are tacklebox's own, embedded in the binary and injected with
+the image's stock dracut — so live ISOs work from **any** distro's bootc
+image (Fedora, Debian, Arch, Gentoo, …) with no distro-specific packages
+like Fedora's `dracut-live` required.
 
 If your image already ships the required modules (e.g. pre-built `superiso-live`
 images), add `"skip_initramfs_rebuild": true` to the environment in your recipe
@@ -133,9 +138,9 @@ Persist=2 GiB, and Store=remainder. Provide explicit sizes when you need a
 larger ESP (more kernels), more persistent space, or want to leave headroom.
 
 `skip_initramfs_rebuild` is optional (default `false`). Set it to `true` for
-images that already include `dmsquash-live` and `tbox-root` in their initramfs
-(e.g. pre-built `superiso-live` images) to skip the rebuild step and save
-2–3 minutes per environment on the first build.
+images that already include `tbox-live` and `tbox-root` in their initramfs
+(e.g. images that pre-bake tacklebox's dracut modules) to skip the rebuild
+step and save 2–3 minutes per environment on the first build.
 
 `live_customize` (optional, live/ISO builds only) lists scripts that run
 inside a container of the env's image before it is squashed — the
@@ -171,12 +176,27 @@ into **one** combined squashfs — one subtree per env — instead of one
 squashfs per env. mksquashfs then stores files shared across images
 exactly once, which can shrink a multi-env ISO dramatically when the
 images share a base (Bluefin + Bazzite, or two variants of your own
-image). At boot, dmsquash-live mounts the combined squashfs and the
+image). At boot, tbox-live mounts the combined squashfs and the
 `tbox-root` dracut module pivots into the env's subtree
 (`tacklebox.root=<env>` on the kernel cmdline). Trade-offs: changing any
 one image rebuilds (and re-downloads) the whole combined squashfs, and
 the squashfs cache is keyed by *all* image IDs together. See
 `examples/iso-dedup.json`.
+
+`shared_store.dedup_layout` picks how a dedup'd store is packed:
+
+- `"combined"` (default): the single-squashfs layout described above.
+  Best dedup; any image change rebuilds the whole store.
+- `"delta"`: one `base.rootfs.sfs` (the full rootfs of the
+  `shared_store.delta_base` env — defaults to the first env) plus a
+  small `<env>.delta.sfs` per other env, computed as a file-level diff
+  against the base (with overlayfs whiteouts, so deletions apply too).
+  At boot the delta stacks as an extra overlay lowerdir
+  (`tacklebox.live.delta=<env>.delta.sfs`). Slightly weaker dedup than
+  combined, but **per-env caching survives single-image updates**:
+  changing one env's image re-diffs only that env's delta. Pick the env
+  the others were built from as `delta_base`. See
+  `examples/iso-delta.json`.
 
 > **Sizing rule of thumb:** ostree-backed bootc deployments occupy ~10 GiB
 > each, composefs-backed ones ~5 GiB. A 30 GiB recipe is enough for one

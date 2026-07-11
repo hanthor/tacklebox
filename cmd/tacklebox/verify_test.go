@@ -103,9 +103,24 @@ func TestBLSOption(t *testing.T) {
 	}
 }
 
+func TestBLSSquashimg(t *testing.T) {
+	// Current spelling (tbox-live module).
+	if got := blsSquashimg("root=tbox:CDLABEL=X tacklebox.live.squashimg=alpha.rootfs.sfs"); got != "alpha.rootfs.sfs" {
+		t.Errorf("tbox-live spelling = %q", got)
+	}
+	// Legacy dmsquash-live spelling: ISOs built before the tbox-live
+	// switch must stay verifiable.
+	if got := blsSquashimg("root=live:CDLABEL=X rd.live.squashimg=beta.rootfs.sfs"); got != "beta.rootfs.sfs" {
+		t.Errorf("legacy spelling = %q", got)
+	}
+	if got := blsSquashimg("root=LABEL=TBOX_STORE rw"); got != "" {
+		t.Errorf("non-live entry = %q, want empty", got)
+	}
+}
+
 func TestCheckCombinedPivots(t *testing.T) {
 	combined := func(name, root string) blsEntry {
-		return blsEntry{name: name, options: "rd.live.squashimg=combined.rootfs.sfs tacklebox.root=" + root}
+		return blsEntry{name: name, options: "tacklebox.live.squashimg=combined.rootfs.sfs tacklebox.root=" + root}
 	}
 
 	// Healthy combined layout: distinct pivots, one OK result.
@@ -143,4 +158,53 @@ func TestCheckCombinedPivots(t *testing.T) {
 	if rs := checkCombinedPivots(perEnv); rs != nil {
 		t.Errorf("per-env layout should be skipped: %+v", rs)
 	}
+}
+
+func TestCheckCombinedPivotsDeltaLayout(t *testing.T) {
+	deltaEnv := func(name, delta string) blsEntry {
+		opts := "tacklebox.live.squashimg=base.rootfs.sfs"
+		if delta != "" {
+			opts += " tacklebox.live.delta=" + delta
+		}
+		return blsEntry{name: name, options: opts}
+	}
+
+	// Healthy delta layout: one bare base entry + distinct deltas.
+	rs := checkCombinedPivots([]blsEntry{
+		deltaEnv("base.conf", ""),
+		deltaEnv("a.conf", "a.delta.sfs"),
+		deltaEnv("b.conf", "b.delta.sfs"),
+	})
+	if len(rs) != 1 || rs[0].err != nil {
+		t.Errorf("healthy delta layout: got %+v", rs)
+	}
+
+	// Two entries sharing one delta boot identical content.
+	rs = checkCombinedPivots([]blsEntry{
+		deltaEnv("base.conf", ""),
+		deltaEnv("a.conf", "same.delta.sfs"),
+		deltaEnv("b.conf", "same.delta.sfs"),
+	})
+	if !anyFailed(rs) {
+		t.Errorf("shared delta should fail: %+v", rs)
+	}
+
+	// Two bare entries: only the base env may boot the base as-is.
+	rs = checkCombinedPivots([]blsEntry{
+		deltaEnv("base.conf", ""),
+		deltaEnv("other.conf", ""),
+		deltaEnv("a.conf", "a.delta.sfs"),
+	})
+	if !anyFailed(rs) {
+		t.Errorf("two bare entries should fail: %+v", rs)
+	}
+}
+
+func anyFailed(rs []checkResult) bool {
+	for _, r := range rs {
+		if r.err != nil {
+			return true
+		}
+	}
+	return false
 }

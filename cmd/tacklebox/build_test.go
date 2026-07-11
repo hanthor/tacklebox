@@ -115,28 +115,25 @@ func TestBuildLiveKernelCmdline(t *testing.T) {
 			envID: "bazzite",
 			label: "TBX_ISO",
 			contains: []string{
-				"root=live:CDLABEL=TBX_ISO",
-				"rd.live.image",
-				"rd.live.dir=LiveOS",
-				"rd.live.squashimg=bazzite.rootfs.sfs",
-				"rd.live.overlay.overlayfs=1",
+				"root=tbox:CDLABEL=TBX_ISO",
+				"tacklebox.live.squashimg=bazzite.rootfs.sfs",
+				"tacklebox.live.overlay.size=8192",
 				"enforcing=0",
 				"tacklebox.env=bazzite",
 				"console=ttyS0,115200n8",
 			},
-			// Regression: rd.live.overlay=tmpfs hangs dracut-initqueue
-			// because dmsquash-live treats "tmpfs" as a label/path, not
-			// the literal string. We rely on rd.live.overlay.overlayfs=1
-			// alone defaulting to a tmpfs upper.
-			excludes: []string{"rd.live.overlay=tmpfs"},
+			// The rd.live.* / root=live: args belong to dmsquash-live;
+			// emitting them alongside root=tbox: would make an image that
+			// happens to ship dmsquash-live fight tbox-live for the root.
+			excludes: []string{"root=live:", "rd.live."},
 		},
 		{
 			name:  "label with spaces gets passed verbatim",
 			envID: "fedora",
 			label: "MY_LABEL",
 			contains: []string{
-				"root=live:CDLABEL=MY_LABEL",
-				"rd.live.squashimg=fedora.rootfs.sfs",
+				"root=tbox:CDLABEL=MY_LABEL",
+				"tacklebox.live.squashimg=fedora.rootfs.sfs",
 			},
 		},
 	}
@@ -359,11 +356,11 @@ func TestEnvTitle(t *testing.T) {
 func TestBuildLiveKernelCmdlineCombined(t *testing.T) {
 	got := buildLiveKernelCmdlineCombined("bazzite", "TBX_ISO")
 	for _, want := range []string{
-		"root=live:CDLABEL=TBX_ISO",
-		"rd.live.squashimg=combined.rootfs.sfs",
+		"root=tbox:CDLABEL=TBX_ISO",
+		"tacklebox.live.squashimg=combined.rootfs.sfs",
 		"tacklebox.root=bazzite",
 		"tacklebox.env=bazzite",
-		"rd.live.overlay.overlayfs=1",
+		"tacklebox.live.overlay.size=8192",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("combined cmdline missing %q: %s", want, got)
@@ -373,6 +370,84 @@ func TestBuildLiveKernelCmdlineCombined(t *testing.T) {
 	// would try to rebase /sysroot onto a subdir that doesn't exist.
 	if plain := buildLiveKernelCmdline("bazzite", "TBX_ISO"); strings.Contains(plain, "tacklebox.root=") {
 		t.Errorf("per-env cmdline must not set tacklebox.root: %s", plain)
+	}
+}
+
+func TestBuildLiveKernelCmdlineDelta(t *testing.T) {
+	base := buildLiveKernelCmdlineDelta("bluefin", "TBX_ISO", true)
+	for _, want := range []string{
+		"root=tbox:CDLABEL=TBX_ISO",
+		"tacklebox.live.squashimg=base.rootfs.sfs",
+		"tacklebox.env=bluefin",
+	} {
+		if !strings.Contains(base, want) {
+			t.Errorf("base cmdline missing %q: %s", want, base)
+		}
+	}
+	// The base env boots the base squashfs directly: no delta, no pivot.
+	for _, bad := range []string{"tacklebox.live.delta=", "tacklebox.root="} {
+		if strings.Contains(base, bad) {
+			t.Errorf("base cmdline must not contain %q: %s", bad, base)
+		}
+	}
+
+	delta := buildLiveKernelCmdlineDelta("bazzite", "TBX_ISO", false)
+	for _, want := range []string{
+		"tacklebox.live.squashimg=base.rootfs.sfs",
+		"tacklebox.live.delta=bazzite.delta.sfs",
+		"tacklebox.env=bazzite",
+	} {
+		if !strings.Contains(delta, want) {
+			t.Errorf("delta cmdline missing %q: %s", want, delta)
+		}
+	}
+	if strings.Contains(delta, "tacklebox.root=") {
+		t.Errorf("delta cmdline must not pivot via tacklebox.root: %s", delta)
+	}
+}
+
+func TestValidateDedupLayout(t *testing.T) {
+	mk := func(dedup bool, layout, base string) recipe.MediaRecipe {
+		return recipe.MediaRecipe{
+			SharedStore: recipe.SharedStore{Dedup: dedup, DedupLayout: layout, DeltaBase: base},
+			BootableEnvironments: []recipe.BootableEnvironment{
+				{ID: "alpha"}, {ID: "beta"},
+			},
+		}
+	}
+	cases := []struct {
+		name    string
+		r       recipe.MediaRecipe
+		wantErr bool
+	}{
+		{"default", mk(false, "", ""), false},
+		{"combined", mk(true, "combined", ""), false},
+		{"delta", mk(true, "delta", ""), false},
+		{"delta with base", mk(true, "delta", "beta"), false},
+		{"bogus layout", mk(true, "deltoid", ""), true},
+		{"layout without dedup", mk(false, "delta", ""), true},
+		{"delta_base without delta layout", mk(true, "combined", "beta"), true},
+		{"delta_base unknown env", mk(true, "delta", "gamma"), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateDedupLayout(tc.r); (err != nil) != tc.wantErr {
+				t.Errorf("err = %v, wantErr = %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestDeltaBaseEnv(t *testing.T) {
+	r := recipe.MediaRecipe{
+		BootableEnvironments: []recipe.BootableEnvironment{{ID: "alpha"}, {ID: "beta"}},
+	}
+	if got := deltaBaseEnv(r); got != "alpha" {
+		t.Errorf("default base = %q, want first env", got)
+	}
+	r.SharedStore.DeltaBase = "beta"
+	if got := deltaBaseEnv(r); got != "beta" {
+		t.Errorf("explicit base = %q, want beta", got)
 	}
 }
 

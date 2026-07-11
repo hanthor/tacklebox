@@ -120,7 +120,7 @@ func verifyIso(path string) []checkResult {
 	}
 
 	// Combined-squashfs layout (shared_store.dedup): every entry points
-	// at the same rd.live.squashimg and per-env distinctness lives in the
+	// at the same squashimg and per-env distinctness lives in the
 	// tacklebox.root= pivot instead of separate squashfs files.
 	results = append(results, checkCombinedPivots(entries)...)
 
@@ -141,11 +141,19 @@ func verifyIso(path string) []checkResult {
 	// Every BLS entry must reference a squashfs image that exists.
 	// A missing file means the ISO will fail at boot even if verify passes.
 	for _, e := range entries {
-		if img := blsOption(e.options, "rd.live.squashimg"); img != "" {
+		if img := blsSquashimg(e.options); img != "" {
 			if !sfsSet[img] {
 				results = append(results, checkResult{
 					"squashfs referenced by BLS entry",
 					fmt.Errorf("%s references %s but file not found in /LiveOS", e.name, img),
+				})
+			}
+		}
+		if delta := blsOption(e.options, "tacklebox.live.delta"); delta != "" {
+			if !sfsSet[delta] {
+				results = append(results, checkResult{
+					"delta squashfs referenced by BLS entry",
+					fmt.Errorf("%s references %s but file not found in /LiveOS", e.name, delta),
 				})
 			}
 		}
@@ -157,14 +165,16 @@ func verifyIso(path string) []checkResult {
 			hasOfflineStore = true
 			continue
 		}
-		if !strings.HasSuffix(name, ".rootfs.sfs") {
+		if !strings.HasSuffix(name, ".rootfs.sfs") && !strings.HasSuffix(name, ".delta.sfs") {
 			continue
 		}
-		// combined.rootfs.sfs is the shared dedup store used by all environments
-		// in the combined-squashfs layout; it is not a per-env file so a hash
-		// collision check is meaningless. Skip it to avoid extracting the full
-		// (multi-GB) file to /tmp during verification.
-		if name == "combined.rootfs.sfs" {
+		// combined.rootfs.sfs (combined layout) and base.rootfs.sfs (delta
+		// layout) are shared stores used by all environments; they are not
+		// per-env files so a hash collision check is meaningless. Skip them
+		// to avoid extracting the full (multi-GB) file to /tmp during
+		// verification. Per-env <env>.delta.sfs files ARE hashed: two envs
+		// with identical deltas booted identical content.
+		if name == "combined.rootfs.sfs" || name == "base.rootfs.sfs" {
 			continue
 		}
 		h, err := hashIsoFilePrefix(path, "/LiveOS/"+name, 1<<20)
@@ -355,16 +365,31 @@ func blsOption(options, key string) string {
 	return ""
 }
 
-// checkCombinedPivots validates the combined-squashfs layout: when
-// multiple BLS entries share one rd.live.squashimg, each must carry a
-// distinct tacklebox.root= so the tbox-root module pivots every entry
-// into its own subtree. Two entries sharing a pivot would boot identical
-// content — the combined-layout analogue of the squashfs-hash collision.
-// Returns nil for non-combined (per-env squashimg) ISOs.
+// blsSquashimg extracts the squashfs image referenced by a live BLS
+// entry. tacklebox.live.squashimg is what tacklebox writes today
+// (tbox-live module); rd.live.squashimg is the dmsquash-live spelling
+// kept so `tacklebox verify` still validates ISOs built before the
+// tbox-live switch (tuna-os/tacklebox#90).
+func blsSquashimg(options string) string {
+	if v := blsOption(options, "tacklebox.live.squashimg"); v != "" {
+		return v
+	}
+	return blsOption(options, "rd.live.squashimg")
+}
+
+// checkCombinedPivots validates the shared-squashfs layouts: when
+// multiple BLS entries point at ONE squashimg, each must be
+// distinguishable at boot — via tacklebox.root= (combined layout: the
+// tbox-root subtree pivot) or tacklebox.live.delta= (delta layout: the
+// stacked delta squashfs). Two entries sharing a distinguisher would
+// boot identical content — the shared-store analogue of the
+// squashfs-hash collision. In the delta layout exactly one entry (the
+// base env) legitimately has neither: it boots the base squashfs as-is.
+// Returns nil for per-env-squashimg ISOs.
 func checkCombinedPivots(entries []blsEntry) []checkResult {
 	squashimgs := map[string]bool{}
 	for _, e := range entries {
-		if v := blsOption(e.options, "rd.live.squashimg"); v != "" {
+		if v := blsSquashimg(e.options); v != "" {
 			squashimgs[v] = true
 		}
 	}
@@ -373,35 +398,51 @@ func checkCombinedPivots(entries []blsEntry) []checkResult {
 	}
 
 	var results []checkResult
-	pivots := map[string][]string{}
-	var missing []string
+	distinguishers := map[string][]string{}
+	var bare []string
+	deltaLayout := false
 	for _, e := range entries {
-		root := blsOption(e.options, "tacklebox.root")
-		if root == "" {
-			missing = append(missing, e.name)
+		if blsOption(e.options, "tacklebox.live.delta") != "" {
+			deltaLayout = true
+		}
+	}
+	for _, e := range entries {
+		d := blsOption(e.options, "tacklebox.root")
+		if d == "" {
+			d = blsOption(e.options, "tacklebox.live.delta")
+		}
+		if d == "" {
+			bare = append(bare, e.name)
 			continue
 		}
-		pivots[root] = append(pivots[root], e.name)
+		distinguishers[d] = append(distinguishers[d], e.name)
 	}
-	if len(missing) > 0 {
+	// Combined layout: every entry needs the pivot. Delta layout: exactly
+	// one bare entry (the base env, booting the base squashfs as-is) is
+	// legitimate.
+	maxBare := 0
+	if deltaLayout {
+		maxBare = 1
+	}
+	if len(bare) > maxBare {
 		results = append(results, checkResult{
-			"combined squashfs entries carry tacklebox.root=",
-			fmt.Errorf("entries missing the pivot arg: %v", missing),
+			"shared squashfs entries distinguishable",
+			fmt.Errorf("entries carry neither tacklebox.root= nor tacklebox.live.delta=: %v", bare),
 		})
 	}
 	collisions := 0
-	for root, names := range pivots {
+	for d, names := range distinguishers {
 		if len(names) > 1 {
 			collisions++
 			results = append(results, checkResult{
-				"combined squashfs per-env pivot distinct",
-				fmt.Errorf("%d entries share tacklebox.root=%s: %v", len(names), root, names),
+				"shared squashfs per-env distinguisher distinct",
+				fmt.Errorf("%d entries share %s: %v", len(names), d, names),
 			})
 		}
 	}
-	if collisions == 0 && len(missing) == 0 {
+	if collisions == 0 && len(bare) <= maxBare {
 		results = append(results, checkResult{
-			fmt.Sprintf("combined squashfs: %d entries pivot to %d distinct env roots", len(entries), len(pivots)), nil,
+			fmt.Sprintf("combined squashfs: %d entries pivot to %d distinct env roots", len(entries), len(distinguishers)+len(bare)), nil,
 		})
 	}
 	return results

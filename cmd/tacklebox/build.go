@@ -69,6 +69,9 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	if r.Size == "" {
 		return fmt.Errorf("recipe %s missing size", recipePath)
 	}
+	if err := validateDedupLayout(r); err != nil {
+		return fmt.Errorf("recipe %s: %w", recipePath, err)
+	}
 
 	// Resolve live_customize script paths against the recipe's directory and
 	// fail fast on missing files, before any expensive build work starts.
@@ -387,9 +390,12 @@ func confirmDestructive(target string, assumeYes bool) error {
 // with parallel=1 for production builds; use --parallel-install=N to try
 // the faster path when total wall time matters more than risk.
 func runEnvs(r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, parallel int, track func(string, func() error) error) error {
-	// Cross-env dedup (ISO only): all envs share one combined squashfs,
-	// so the per-env loop shape doesn't apply.
+	// Cross-env dedup (ISO only): envs share squashfs content, so the
+	// per-env loop shape doesn't apply.
 	if tgt.InstallMode() == target.InstallModeLive && r.SharedStore.Dedup {
+		if r.SharedStore.DedupLayout == "delta" {
+			return installEnvsLiveDelta(r, tgt, storeMount, espMount, track)
+		}
 		return installEnvsLiveCombined(r, tgt, storeMount, espMount, track)
 	}
 	if parallel <= 1 {
@@ -432,8 +438,47 @@ func runEnvs(r recipe.MediaRecipe, tgt target.Target, storeMount, espMount strin
 // shared_store.dedup is set (ISO targets only).
 const combinedSquashName = "combined.rootfs.sfs"
 
+// baseSquashName is the shared full-rootfs squashfs of the delta layout
+// (shared_store.dedup_layout=delta); every other env adds a
+// <env>.delta.sfs on top.
+const baseSquashName = "base.rootfs.sfs"
+
+// validateDedupLayout fails fast on nonsense shared_store dedup settings
+// so a typo dies at parse time, not after a multi-minute squash.
+func validateDedupLayout(r recipe.MediaRecipe) error {
+	switch r.SharedStore.DedupLayout {
+	case "", "combined", "delta":
+	default:
+		return fmt.Errorf("shared_store.dedup_layout %q: must be \"combined\" or \"delta\"", r.SharedStore.DedupLayout)
+	}
+	if r.SharedStore.DedupLayout != "" && !r.SharedStore.Dedup {
+		return fmt.Errorf("shared_store.dedup_layout is set but dedup is false")
+	}
+	if r.SharedStore.DeltaBase != "" {
+		if r.SharedStore.DedupLayout != "delta" {
+			return fmt.Errorf("shared_store.delta_base is only meaningful with dedup_layout \"delta\"")
+		}
+		for _, e := range r.BootableEnvironments {
+			if e.ID == r.SharedStore.DeltaBase {
+				return nil
+			}
+		}
+		return fmt.Errorf("shared_store.delta_base %q does not name a bootable environment", r.SharedStore.DeltaBase)
+	}
+	return nil
+}
+
+// deltaBaseEnv resolves the delta layout's base env: delta_base if set,
+// else the first env in the recipe.
+func deltaBaseEnv(r recipe.MediaRecipe) string {
+	if r.SharedStore.DeltaBase != "" {
+		return r.SharedStore.DeltaBase
+	}
+	return r.BootableEnvironments[0].ID
+}
+
 // buildLiveKernelCmdline returns the BLS `options` line for an env that
-// will be booted via dmsquash-live from a per-env squashfs in /LiveOS/.
+// will be booted via tbox-live from a per-env squashfs in /LiveOS/.
 // appendKargs appends recipe-level extra kernel arguments to a generated
 // options line. Empty/whitespace entries are skipped; order is preserved.
 func appendKargs(options string, kargs []string) string {
@@ -447,8 +492,8 @@ func appendKargs(options string, kargs []string) string {
 	return options
 }
 
-// Used by IsoTarget. label is the ISO9660 volume label (so dmsquash-live
-// can find the iso by `root=live:CDLABEL=...`).
+// Used by IsoTarget. label is the ISO9660 volume label (so tbox-live
+// can find the iso by `root=tbox:CDLABEL=...`).
 func buildLiveKernelCmdline(envID, label string) string {
 	return liveKernelCmdline(envID, label, envID+".rootfs.sfs", "")
 }
@@ -456,28 +501,41 @@ func buildLiveKernelCmdline(envID, label string) string {
 // buildLiveKernelCmdlineCombined is the dedup variant: every env's entry
 // points at the same combined squashfs, and `tacklebox.root=<env>` makes
 // the tbox-root dracut module bind-mount /sysroot/<env> over /sysroot
-// after dmsquash-live has mounted the squashfs + overlay (the same pivot
+// after tbox-live has mounted the squashfs + overlay (the same pivot
 // it performs for block targets, minus the tbox-install/ prefix).
 func buildLiveKernelCmdlineCombined(envID, label string) string {
 	return liveKernelCmdline(envID, label, combinedSquashName, " tacklebox.root="+envID)
 }
 
+// buildLiveKernelCmdlineDelta is the delta-dedup variant: every entry
+// boots the shared base squashfs, and non-base envs stack their
+// <env>.delta.sfs as an extra overlay lowerdir via tacklebox.live.delta=
+// (consumed by tbox-live; see src/dracut/90tbox-live). The base env's
+// entry is identical to a plain per-env boot of base.rootfs.sfs.
+func buildLiveKernelCmdlineDelta(envID, label string, isBase bool) string {
+	extra := ""
+	if !isBase {
+		extra = " tacklebox.live.delta=" + envID + ".delta.sfs"
+	}
+	return liveKernelCmdline(envID, label, baseSquashName, extra)
+}
+
 // liveKernelCmdline is the shared core. Pure — no I/O — so it can be
 // unit-tested.
 //
-// rd.live.overlay.overlayfs=1 alone => tmpfs-backed overlayfs (the
-// default). DON'T pass `rd.live.overlay=tmpfs` — that's interpreted
-// as a label/path to look up, not the literal string "tmpfs", which
-// stalls dracut-initqueue waiting for a non-existent device.
+// root=tbox:CDLABEL= and the tacklebox.live.* args are consumed by the
+// embedded tbox-live dracut module (src/dracut/90tbox-live) — tacklebox's
+// distro-neutral replacement for dmsquash-live, so images built from any
+// distro's dracut can live-boot (tuna-os/tacklebox#90).
 // enforcing=0: live boots can't use the on-disk SELinux contexts
 // from the bootc image because the labels reference paths that
 // don't exist in the overlayfs view. Without this, systemd PID 1
 // dies with "Failed to allocate manager object: Permission denied"
 // before reaching userspace. SuperISO's existing build-iso.sh sets
 // the same flag for the same reason.
-// rd.live.overlay.size=8192: size in MiB for the tmpfs that backs
-// the live overlay upper layer. The default (~half of RAM) is often
-// only 1-2 GiB on 8 GiB machines. The offline bootc installer
+// tacklebox.live.overlay.size=8192: size in MiB for the tmpfs that
+// backs the live overlay upper layer. A half-of-RAM default would
+// often be only 1-2 GiB on 8 GiB machines. The offline bootc installer
 // (fisherman / podman run) writes container layers to the overlay
 // root before they can be redirected to the target disk, filling
 // it and aborting the install. 8 GiB is large enough for any
@@ -485,8 +543,8 @@ func buildLiveKernelCmdlineCombined(envID, label string) string {
 // the 16 GiB machines this ISO targets.
 func liveKernelCmdline(envID, label, squashimg, extra string) string {
 	return fmt.Sprintf(
-		"root=live:CDLABEL=%s rd.live.image rd.live.dir=LiveOS rd.live.squashimg=%s"+
-			" rd.live.overlay.overlayfs=1 rd.live.overlay.size=8192 enforcing=0"+
+		"root=tbox:CDLABEL=%s tacklebox.live.squashimg=%s"+
+			" tacklebox.live.overlay.size=8192 enforcing=0"+
 			" tacklebox.env=%s%s console=ttyS0,115200n8",
 		label, squashimg, envID, extra,
 	)
@@ -632,7 +690,7 @@ func installEnvBootc(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt t
 }
 
 // installEnvLive packs env's container rootfs as a single squashfs and
-// writes a dmsquash-live BLS entry. ISO label comes from the IsoTarget;
+// writes a tbox-live BLS entry. ISO label comes from the IsoTarget;
 // we reach it via a small interface to avoid a hard target.IsoTarget
 // import.
 func installEnvLive(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, track func(string, func() error) error) error {
@@ -657,8 +715,8 @@ func installEnvLive(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt ta
 		}
 	}
 
-	// Initramfs first: a hopeless image (no dracut, no dmsquash-live)
-	// fails here in seconds instead of after a multi-minute squash.
+	// Initramfs first: a hopeless image (no dracut) fails here in
+	// seconds instead of after a multi-minute squash.
 	var initrdOverride string
 	if err := track("initramfs:"+env.ID, func() error {
 		var err error
@@ -783,6 +841,101 @@ func installEnvsLiveCombined(r recipe.MediaRecipe, tgt target.Target, storeMount
 			return err
 		}
 		fmt.Printf(">>> Finished environment: %s (kernel=%s, combined)\n", env.ID, kver)
+	}
+	return nil
+}
+
+// installEnvsLiveDelta is the delta-dedup variant of the live install
+// loop (shared_store.dedup_layout=delta). The base env's rootfs becomes
+// LiveOS/base.rootfs.sfs; every other env gets a small
+// LiveOS/<env>.delta.sfs diffed against it (install.TreeDiff — copies +
+// overlayfs whiteouts). Each env keeps its own kernel, initrd, and BLS
+// entry; non-base entries stack their delta as an extra overlay
+// lowerdir via tacklebox.live.delta=.
+//
+// Compared to the combined layout: slightly weaker dedup (the diff is
+// against one base, not global), but updating a single env's image only
+// re-squashes that env's delta instead of the whole store.
+func installEnvsLiveDelta(r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, track func(string, func() error) error) error {
+	type labelled interface{ IsoLabel() string }
+	label := "TACKLEBOX"
+	if l, ok := tgt.(labelled); ok {
+		label = l.IsoLabel()
+	}
+	baseID := deltaBaseEnv(r)
+
+	// Live customization first (see installEnvLive). Work on a copy of the
+	// env list so the derived image refs stay local to this build pass.
+	localEnvs := append([]recipe.BootableEnvironment(nil), r.BootableEnvironments...)
+	for i := range localEnvs {
+		env := &localEnvs[i]
+		if len(env.LiveCustomize) == 0 {
+			continue
+		}
+		if err := track("customize:"+env.ID, func() error {
+			derived, err := install.CustomizeLive(env.Image, env.LiveCustomize)
+			if err == nil {
+				env.Image = derived
+			}
+			return err
+		}); err != nil {
+			return fmt.Errorf("live customize for %s: %w", env.ID, err)
+		}
+	}
+
+	// Initramfs prep for every env up front: a hopeless image fails in
+	// seconds, before the expensive base squash + diffs.
+	initrdOverrides := make(map[string]string, len(localEnvs))
+	for _, env := range localEnvs {
+		env := env
+		if err := track("initramfs:"+env.ID, func() error {
+			p, err := install.PrepareInitramfs(env.Image, install.IsoInitramfsModules, env.SkipInitramfsRebuild)
+			initrdOverrides[env.ID] = p
+			return err
+		}); err != nil {
+			return fmt.Errorf("prepare initramfs for %s: %w", env.ID, err)
+		}
+	}
+
+	var baseEnv install.LiveEnv
+	envs := make([]install.LiveEnv, 0, len(localEnvs))
+	for _, e := range localEnvs {
+		le := install.LiveEnv{ID: e.ID, Image: e.Image}
+		envs = append(envs, le)
+		if e.ID == baseID {
+			baseEnv = le
+		}
+	}
+	if err := track("install:delta", func() error {
+		return install.InstallLiveDelta(baseEnv, envs, storeMount, baseSquashName, r.SharedStore.Compression)
+	}); err != nil {
+		return fmt.Errorf("delta squashfs store: %w", err)
+	}
+
+	for _, env := range localEnvs {
+		bootDir := filepath.Join(espMount, "images", "pxeboot", env.ID)
+		if err := runner.Run("sudo", "mkdir", "-p", bootDir); err != nil {
+			return fmt.Errorf("create boot dir %s: %w", bootDir, err)
+		}
+		if err := runner.Run("sudo", "chmod", "0755", bootDir); err != nil {
+			return fmt.Errorf("chmod boot dir %s: %w", bootDir, err)
+		}
+		var kver string
+		env := env
+		if err := track("extract:"+env.ID, func() error {
+			var err error
+			kver, err = install.ExtractBootFiles(env.Image, bootDir, initrdOverrides[env.ID])
+			return err
+		}); err != nil {
+			return fmt.Errorf("extract boot files for %s: %w", env.ID, err)
+		}
+
+		options := appendKargs(buildLiveKernelCmdlineDelta(env.ID, label, env.ID == baseID), r.Kargs)
+		isDefault := env.ID == r.DefaultBoot
+		if err := install.WriteBLSEntry(espMount, env.ID, envTitle(env, "live"), tgt.KernelPath(env.ID), tgt.InitrdPath(env.ID), options, isDefault); err != nil {
+			return err
+		}
+		fmt.Printf(">>> Finished environment: %s (kernel=%s, delta)\n", env.ID, kver)
 	}
 	return nil
 }

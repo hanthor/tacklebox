@@ -59,6 +59,27 @@ func TestCopyLocalImageToOfflineStoreRejectsInvalidTimeout(t *testing.T) {
 	}
 }
 
+func TestRemoveSourceImageUsesInvokingUserStore(t *testing.T) {
+	t.Setenv("SUDO_USER", "builder")
+
+	oldRunFn := runner.RunFn
+	defer func() { runner.RunFn = oldRunFn }()
+
+	var got []string
+	runner.RunFn = func(_ io.Reader, name string, args ...string) error {
+		got = append([]string{name}, args...)
+		return nil
+	}
+
+	if err := removeSourceImage("example.com/os:latest"); err != nil {
+		t.Fatalf("removeSourceImage returned error: %v", err)
+	}
+	want := []string{"sudo", "-u", "builder", "-H", "--preserve-env=PATH,TMPDIR,XDG_RUNTIME_DIR,XDG_DATA_HOME,CONTAINERS_STORAGE_CONF", "podman", "image", "rm", "example.com/os:latest"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("call mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
 func TestBuildOfflineStore_EmptyImages(t *testing.T) {
 	tmp := t.TempDir()
 	err := BuildOfflineStore(nil, filepath.Join(tmp, "staging"), filepath.Join(tmp, "out.squashfs"))
@@ -309,4 +330,3 @@ func mockSudoMkdirMv(_ io.Reader, name string, args ...string) error {
 	}
 	return nil
 }
-

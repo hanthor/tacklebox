@@ -248,14 +248,14 @@ func runBuild(cmd *cobra.Command, args []string) error {
 		case target.InstallModeLive:
 			dst := filepath.Join(mp.StoreMount, "store.squashfs.img")
 			if err := track("offline-store", func() error {
-				return install.BuildOfflineStore(r.OfflinePayloads, outputBase, dst)
+				return install.BuildOfflineStore(r.OfflinePayloads, outputBase, dst, r.SharedStore.PruneSourceImages)
 			}); err != nil {
 				return err
 			}
 		case target.InstallModeBootc:
 			dst := filepath.Join(mp.StoreMount, "tbox-containers.squashfs")
 			if err := track("offline-store", func() error {
-				return install.BuildOfflineStore(r.OfflinePayloads, outputBase, dst)
+				return install.BuildOfflineStore(r.OfflinePayloads, outputBase, dst, r.SharedStore.PruneSourceImages)
 			}); err != nil {
 				return err
 			}

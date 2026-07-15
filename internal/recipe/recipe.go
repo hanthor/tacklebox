@@ -27,6 +27,13 @@ type SharedStore struct {
 	// env whose image the others were built FROM (or share the most
 	// with) — every other env's delta is a diff against it.
 	DeltaBase string `json:"delta_base,omitempty"`
+	// PruneSourceImages removes each offline payload from the builder's
+	// rootless containers-storage immediately after it has been copied into
+	// the embedded read-only store. This is intended for ephemeral CI runners:
+	// live ISO assembly is complete before the offline store is built, so those
+	// unpacked source images are no longer needed and reclaiming them prevents
+	// source + destination stores from growing in lockstep.
+	PruneSourceImages bool `json:"prune_source_images,omitempty"`
 }
 
 // Partitions lets a recipe override the auto-computed partition layout.

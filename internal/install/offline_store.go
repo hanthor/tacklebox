@@ -31,7 +31,7 @@ import (
 //	ProvisionStoreMountBlock) mounts it at /var/lib/superiso-store inside
 //	each deployed env via /sysroot (the physical-root mount point that ostree
 //	keeps live after switch_root).
-func BuildOfflineStore(images []string, stagingRoot, dstSquashfs string) error {
+func BuildOfflineStore(images []string, stagingRoot, dstSquashfs string, pruneSourceImages ...bool) error {
 	if len(images) == 0 {
 		return nil
 	}
@@ -62,9 +62,16 @@ func BuildOfflineStore(images []string, stagingRoot, dstSquashfs string) error {
 
 	// Pull each image inside podman unshare: user-namespace overlay gives
 	// correct UID mappings and deduplication across shared base layers.
+	prune := len(pruneSourceImages) > 0 && pruneSourceImages[0]
 	for _, img := range images {
 		if err := copyLocalImageToOfflineStore(img, storeRoot, storeRunRoot); err != nil {
 			return err
+		}
+		if prune {
+			if err := removeSourceImage(img); err != nil {
+				return err
+			}
+			logDiskUsage("after pruning " + img)
 		}
 	}
 
@@ -114,6 +121,22 @@ func BuildOfflineStore(images []string, stagingRoot, dstSquashfs string) error {
 		return fmt.Errorf("move store squashfs to %s: %w", dstSquashfs, err)
 	}
 	return nil
+}
+
+func removeSourceImage(img string) error {
+	podman := UserPodmanPrefix()
+	args := append(podman[1:], "image", "rm", img)
+	fmt.Printf(">>> [offline-store] pruning source image %s from ephemeral builder store\n", img)
+	if err := runner.Run(podman[0], args...); err != nil {
+		return fmt.Errorf("prune copied offline payload %s: %w", img, err)
+	}
+	return nil
+}
+
+func logDiskUsage(label string) {
+	if out, err := runner.Output("df", "-h", "/"); err == nil {
+		fmt.Printf(">>> [offline-store] disk usage %s:\n%s", label, out)
+	}
 }
 
 func copyLocalImageToOfflineStore(img, storeRoot, storeRunRoot string) error {

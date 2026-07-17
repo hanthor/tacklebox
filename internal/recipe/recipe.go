@@ -1,5 +1,10 @@
 package recipe
 
+import (
+	"encoding/json"
+	"fmt"
+)
+
 type SharedStore struct {
 	Format      string `json:"format"`
 	Compression string `json:"compression"`
@@ -84,6 +89,60 @@ type BootableEnvironment struct {
 	LiveCustomize []string `json:"live_customize,omitempty"`
 }
 
+// OfflinePayload describes an image copied into Tacklebox's read-only
+// containers-storage store. Ref is the name exposed by that store; Source is
+// the builder-side image to copy. Usually they are identical.
+//
+// The string form remains supported for existing recipes:
+//
+//	"offline_payloads": ["ghcr.io/example/os:stable"]
+//
+// A source/ref pair lets a locally-built image be embedded under its canonical
+// registry name, so an installer can use containers-storage:<ref> directly
+// without retagging or converting the image at install time:
+//
+//	"offline_payloads": [{
+//	  "source": "localhost/os:stable",
+//	  "ref": "ghcr.io/example/os:stable"
+//	}]
+type OfflinePayload struct {
+	Source string `json:"source"`
+	Ref    string `json:"ref"`
+}
+
+func (p *OfflinePayload) UnmarshalJSON(data []byte) error {
+	if len(data) > 0 && data[0] == '"' {
+		var ref string
+		if err := json.Unmarshal(data, &ref); err != nil {
+			return err
+		}
+		p.Source, p.Ref = ref, ref
+		return nil
+	}
+	var raw struct {
+		Source string `json:"source"`
+		Ref    string `json:"ref"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if raw.Source == "" || raw.Ref == "" {
+		return fmt.Errorf("offline payload needs both source and ref")
+	}
+	p.Source, p.Ref = raw.Source, raw.Ref
+	return nil
+}
+
+func (p OfflinePayload) MarshalJSON() ([]byte, error) {
+	if p.Source == p.Ref {
+		return json.Marshal(p.Ref)
+	}
+	return json.Marshal(struct {
+		Source string `json:"source"`
+		Ref    string `json:"ref"`
+	}{p.Source, p.Ref})
+}
+
 type MediaRecipe struct {
 	MediaName            string                `json:"media_name"`
 	Size                 string                `json:"size"`
@@ -91,7 +150,7 @@ type MediaRecipe struct {
 	Partitions           Partitions            `json:"partitions,omitempty"`
 	DefaultBoot          string                `json:"default_boot,omitempty"`
 	BootableEnvironments []BootableEnvironment `json:"bootable_environments"`
-	OfflinePayloads      []string              `json:"offline_payloads"`
+	OfflinePayloads      []OfflinePayload      `json:"offline_payloads"`
 	// Kargs are appended verbatim to every generated BLS entry's options
 	// line (both live and block modes). Typical use: "console=ttyS0" so CI
 	// boot gates get serial markers, or debug flags — without rebuilding

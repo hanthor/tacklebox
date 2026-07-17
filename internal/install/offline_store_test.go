@@ -42,6 +42,30 @@ func TestCopyLocalImageToOfflineStoreUsesLocalContainersStorage(t *testing.T) {
 	}
 }
 
+func TestCopyLocalImageToOfflineStoreCanExposeCanonicalRef(t *testing.T) {
+	t.Setenv("SUDO_USER", "")
+
+	oldRunFn := runner.RunFn
+	defer func() { runner.RunFn = oldRunFn }()
+
+	var calls [][]string
+	runner.RunFn = func(_ io.Reader, name string, args ...string) error {
+		calls = append(calls, append([]string{name}, args...))
+		return nil
+	}
+
+	err := copyLocalImageToOfflineStoreAs(
+		"localhost/os:dev", "ghcr.io/example/os:stable", "/tmp/store", "/tmp/run",
+	)
+	if err != nil {
+		t.Fatalf("copyLocalImageToOfflineStoreAs returned error: %v", err)
+	}
+	if got := calls[1][len(calls[1])-1]; !strings.Contains(got, "containers-storage:localhost/os:dev") ||
+		!strings.Contains(got, "containers-storage:[overlay@/tmp/store+/tmp/run]ghcr.io/example/os:stable") {
+		t.Fatalf("copy command did not preserve source/ref mapping: %q", got)
+	}
+}
+
 func TestCopyLocalImageToOfflineStoreRejectsInvalidTimeout(t *testing.T) {
 	t.Setenv("SUDO_USER", "")
 	t.Setenv("TACKLEBOX_OFFLINE_COPY_TIMEOUT", "nope")

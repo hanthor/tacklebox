@@ -244,18 +244,22 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	// tbox-containers.squashfs and each deployed env gets a mount unit +
 	// storage.conf drop-in provisioned so the store is visible at boot.
 	if len(r.OfflinePayloads) > 0 {
+		payloads := make([]install.OfflinePayload, 0, len(r.OfflinePayloads))
+		for _, payload := range r.OfflinePayloads {
+			payloads = append(payloads, install.OfflinePayload{Source: payload.Source, Ref: payload.Ref})
+		}
 		switch tgt.InstallMode() {
 		case target.InstallModeLive:
 			dst := filepath.Join(mp.StoreMount, "store.squashfs.img")
 			if err := track("offline-store", func() error {
-				return install.BuildOfflineStore(r.OfflinePayloads, outputBase, dst, r.SharedStore.PruneSourceImages)
+				return install.BuildOfflineStorePayloads(payloads, outputBase, dst, r.SharedStore.PruneSourceImages)
 			}); err != nil {
 				return err
 			}
 		case target.InstallModeBootc:
 			dst := filepath.Join(mp.StoreMount, "tbox-containers.squashfs")
 			if err := track("offline-store", func() error {
-				return install.BuildOfflineStore(r.OfflinePayloads, outputBase, dst, r.SharedStore.PruneSourceImages)
+				return install.BuildOfflineStorePayloads(payloads, outputBase, dst, r.SharedStore.PruneSourceImages)
 			}); err != nil {
 				return err
 			}
@@ -968,7 +972,7 @@ func prePullAll(r recipe.MediaRecipe, userStore bool) error {
 		add(e.Image)
 	}
 	for _, p := range r.OfflinePayloads {
-		add(p)
+		add(p.Source)
 	}
 	if len(unique) == 0 {
 		return nil

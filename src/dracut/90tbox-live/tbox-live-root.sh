@@ -55,7 +55,9 @@ mount -o ro "$dev" /run/initramfs/live \
 sfs="/run/initramfs/live/$livedir/$squashimg"
 [ -f "$sfs" ] || die "Tacklebox: $sfs not found on live device"
 
-mount -t squashfs -o ro,loop "$sfs" /run/rootfsbase \
+# -t auto: the rootfs image may be squashfs (mksquashfs path) or erofs
+# (pure-Go writer path) — the kernel probes; both modules are installed.
+mount -o ro,loop "$sfs" /run/rootfsbase \
     || die "Tacklebox: cannot loop-mount $sfs"
 
 delta=$(getarg tacklebox.live.delta)
@@ -63,7 +65,7 @@ if [ -n "$delta" ]; then
     dsfs="/run/initramfs/live/$livedir/$delta"
     [ -f "$dsfs" ] || die "Tacklebox: $dsfs not found on live device"
     mkdir -p /run/tbox-delta
-    mount -t squashfs -o ro,loop "$dsfs" /run/tbox-delta \
+    mount -o ro,loop "$dsfs" /run/tbox-delta \
         || die "Tacklebox: cannot loop-mount $dsfs"
 fi
 

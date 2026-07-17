@@ -10,6 +10,15 @@ import (
 	"github.com/tuna-os/tacklebox/internal/runner"
 )
 
+// OfflinePayload is the source and destination name of an image embedded in
+// the offline containers-storage store. Keeping these distinct lets media
+// builders expose a local build under the canonical registry reference that
+// bootc will use after installation.
+type OfflinePayload struct {
+	Source string
+	Ref    string
+}
+
 // BuildOfflineStore pulls images into an isolated podman containers-storage
 // graphroot and packs the result into a read-only squashfs at dstSquashfs.
 //
@@ -32,7 +41,18 @@ import (
 //	each deployed env via /sysroot (the physical-root mount point that ostree
 //	keeps live after switch_root).
 func BuildOfflineStore(images []string, stagingRoot, dstSquashfs string, pruneSourceImages ...bool) error {
-	if len(images) == 0 {
+	payloads := make([]OfflinePayload, 0, len(images))
+	for _, image := range images {
+		payloads = append(payloads, OfflinePayload{Source: image, Ref: image})
+	}
+	return BuildOfflineStorePayloads(payloads, stagingRoot, dstSquashfs, pruneSourceImages...)
+}
+
+// BuildOfflineStorePayloads copies each payload Source into the embedded
+// store under payload Ref. Ref is therefore the stable name visible to the
+// live installer, independent of whether the builder used localhost/ images.
+func BuildOfflineStorePayloads(payloads []OfflinePayload, stagingRoot, dstSquashfs string, pruneSourceImages ...bool) error {
+	if len(payloads) == 0 {
 		return nil
 	}
 
@@ -63,15 +83,18 @@ func BuildOfflineStore(images []string, stagingRoot, dstSquashfs string, pruneSo
 	// Pull each image inside podman unshare: user-namespace overlay gives
 	// correct UID mappings and deduplication across shared base layers.
 	prune := len(pruneSourceImages) > 0 && pruneSourceImages[0]
-	for _, img := range images {
-		if err := copyLocalImageToOfflineStore(img, storeRoot, storeRunRoot); err != nil {
+	for _, payload := range payloads {
+		if payload.Source == "" || payload.Ref == "" {
+			return fmt.Errorf("offline payload needs both source and ref")
+		}
+		if err := copyLocalImageToOfflineStoreAs(payload.Source, payload.Ref, storeRoot, storeRunRoot); err != nil {
 			return err
 		}
 		if prune {
-			if err := removeSourceImage(img); err != nil {
+			if err := removeSourceImage(payload.Source); err != nil {
 				return err
 			}
-			logDiskUsage("after pruning " + img)
+			logDiskUsage("after pruning " + payload.Source)
 		}
 	}
 
@@ -140,10 +163,14 @@ func logDiskUsage(label string) {
 }
 
 func copyLocalImageToOfflineStore(img, storeRoot, storeRunRoot string) error {
+	return copyLocalImageToOfflineStoreAs(img, img, storeRoot, storeRunRoot)
+}
+
+func copyLocalImageToOfflineStoreAs(source, ref, storeRoot, storeRunRoot string) error {
 	podman := UserPodmanPrefix()
-	podmanArgs := append(podman[1:], "image", "exists", img)
+	podmanArgs := append(podman[1:], "image", "exists", source)
 	if err := runner.Run(podman[0], podmanArgs...); err != nil {
-		return fmt.Errorf("offline payload %s is not present in the builder podman store; pre-pull it before ISO assembly: %w", img, err)
+		return fmt.Errorf("offline payload source %s is not present in the builder podman store; pre-pull it before ISO assembly: %w", source, err)
 	}
 
 	timeoutSeconds := 1800
@@ -155,17 +182,17 @@ func copyLocalImageToOfflineStore(img, storeRoot, storeRunRoot string) error {
 		timeoutSeconds = parsed
 	}
 
-	dest := fmt.Sprintf("containers-storage:[overlay@%s+%s]%s", storeRoot, storeRunRoot, img)
-	fmt.Printf(">>> [offline-store] copying %s from local containers-storage -> embedded store\n", img)
+	dest := fmt.Sprintf("containers-storage:[overlay@%s+%s]%s", storeRoot, storeRunRoot, ref)
+	fmt.Printf(">>> [offline-store] copying %s -> %s in embedded store\n", source, ref)
 
 	script := fmt.Sprintf(
 		"timeout %d skopeo copy --remove-signatures %s %s",
 		timeoutSeconds,
-		shellEsc("containers-storage:"+img),
+		shellEsc("containers-storage:"+source),
 		shellEsc(dest),
 	)
 	if err := RunUnshare(script); err != nil {
-		return fmt.Errorf("copy %s into offline store from local containers-storage: %w", img, err)
+		return fmt.Errorf("copy %s into offline store from local containers-storage: %w", source, err)
 	}
 	return nil
 }

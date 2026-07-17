@@ -301,3 +301,15 @@ func (s *DirStore) Put(r io.Reader) (string, int64, error) {
 func (s *DirStore) Open(ref string) (io.ReadCloser, error) {
 	return os.Open(ref)
 }
+
+// ApplyTar builds a rootfs tree from a single uncompressed tar stream
+// (e.g. `podman export` of a customized container) instead of registry
+// layers — the native path for live_customize output until the customize
+// step itself is expressed as tree operations.
+func ApplyTar(r io.Reader, store BlobStore) (*Node, error) {
+	root := &Node{Type: TypeDir, Mode: 0o755, Children: map[string]*Node{}}
+	if err := applyLayer(root, r, "application/x-tar", store); err != nil {
+		return nil, err
+	}
+	return root, nil
+}

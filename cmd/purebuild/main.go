@@ -31,6 +31,7 @@ func main() {
 		label    = flag.String("label", "TUNAOS", "ISO volume label (CDLABEL)")
 		initrd   = flag.String("initrd", "", "path to a tbox-enabled initramfs (overrides the image's stock one)")
 		workdir  = flag.String("workdir", ".purebuild", "scratch directory")
+		rootTar  = flag.String("rootfs-tar", "", "build from this rootfs tar (podman export of a customized container) instead of pulling; the tar is DELETED after ingest to bound disk use")
 	)
 	flag.Parse()
 	if *image == "" || !strings.Contains(*image, ":") {
@@ -44,21 +45,38 @@ func main() {
 		log.Fatal(err)
 	}
 
-	c := oci.NewClient(*registry)
-	ref := oci.Ref{Repo: repo, Tag: tag}
-	log.Printf(">>> resolving %s", *image)
-	m, err := c.ResolveManifest(ref, "amd64")
-	if err != nil {
-		log.Fatal(err)
-	}
 	store := &oci.DirStore{Dir: filepath.Join(*workdir, "blobs")}
-	log.Printf(">>> unpacking %d layers", len(m.Layers))
-	root, err := c.Unpack(ref, m, store, func(i, n int) {
-		fmt.Printf("\r    layer %d/%d", i+1, n)
-	})
-	fmt.Println()
-	if err != nil {
-		log.Fatal(err)
+	var root *oci.Node
+	if *rootTar != "" {
+		log.Printf(">>> ingesting rootfs tar %s", *rootTar)
+		tf, err := os.Open(*rootTar)
+		if err != nil {
+			log.Fatal(err)
+		}
+		root, err = oci.ApplyTar(tf, store)
+		tf.Close()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := os.Remove(*rootTar); err != nil {
+			log.Printf("!!! could not remove %s: %v", *rootTar, err)
+		}
+	} else {
+		c := oci.NewClient(*registry)
+		ref := oci.Ref{Repo: repo, Tag: tag}
+		log.Printf(">>> resolving %s", *image)
+		m, err := c.ResolveManifest(ref, "amd64")
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf(">>> unpacking %d layers", len(m.Layers))
+		root, err = c.Unpack(ref, m, store, func(i, n int) {
+			fmt.Printf("\r    layer %d/%d", i+1, n)
+		})
+		fmt.Println()
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	// Kernel + stock initramfs + systemd-boot out of the image tree.
@@ -108,6 +126,30 @@ func main() {
 	if err := sf.Close(); err != nil {
 		log.Fatal(err)
 	}
+
+	// The EROFS now holds every file body; keep only the blobs the ESP/ISO
+	// stages still need and delete the rest so peak disk stays bounded.
+	keep := map[string]bool{}
+	for _, p := range []string{
+		"usr/lib/modules/" + kver + "/vmlinuz",
+		"usr/lib/modules/" + kver + "/initramfs.img",
+		"usr/lib/systemd/boot/efi/systemd-bootx64.efi",
+	} {
+		if n := root.Lookup(p); n != nil {
+			keep[n.Ref] = true
+		}
+	}
+	pruned := 0
+	root.Walk(func(_ string, n *oci.Node) error {
+		if n.Type == oci.TypeFile && n.Ref != "" && !keep[n.Ref] {
+			if os.Remove(n.Ref) == nil {
+				pruned++
+			}
+			n.Ref = ""
+		}
+		return nil
+	})
+	log.Printf(">>> pruned %d staged blobs", pruned)
 
 	// BLS entry — same template as cmd/tacklebox's liveKernelCmdline.
 	kargs := fmt.Sprintf(

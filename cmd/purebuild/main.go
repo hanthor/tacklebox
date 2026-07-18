@@ -25,6 +25,7 @@ import (
 )
 
 var initrdOnDisk string
+var sdBootDisk string
 
 func main() {
 	var (
@@ -64,9 +65,9 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		if err := os.Remove(*rootTar); err != nil {
-			log.Printf("!!! could not remove %s: %v", *rootTar, err)
-		}
+		// The punch-reader already released the tar's blocks; the empty
+		// husk is left for the caller (deleting early would lose the
+		// input if a later stage fails).
 	} else {
 		c := oci.NewClient(*registry)
 		ref := oci.Ref{Repo: repo, Tag: tag}
@@ -143,7 +144,20 @@ func main() {
 	} else {
 		log.Printf("!!! stock initramfs — live boot will stop without tbox modules")
 	}
-	sdBoot := blob("usr/lib/systemd/boot/efi/systemd-bootx64.efi")
+	// systemd-boot: prefer the image's own copy; EL10 images don't ship it,
+	// so fall back to the host binary exactly like production
+	// ExtractEFIBinary does (CI installs systemd-boot-efi).
+	var sdBoot func() (io.ReadCloser, error)
+	if n := root.Lookup("usr/lib/systemd/boot/efi/systemd-bootx64.efi"); n != nil && n.Type == oci.TypeFile {
+		sdBoot = func() (io.ReadCloser, error) { return store.Open(n.Ref) }
+		sdBootDisk = n.Ref
+	} else if _, err := os.Stat("/usr/lib/systemd/boot/efi/systemd-bootx64.efi"); err == nil {
+		sdBootDisk = "/usr/lib/systemd/boot/efi/systemd-bootx64.efi"
+		sdBoot = purefs.FileSource(sdBootDisk)
+		log.Printf(">>> systemd-boot from host (image ships none)")
+	} else {
+		log.Fatal("no systemd-boot EFI binary in image or on host (install systemd-boot-efi)")
+	}
 
 	// Blobs still needed after the EROFS pass; everything else is deleted
 	// the moment the EROFS writer has consumed it (rolling disk peak).
@@ -204,7 +218,7 @@ func main() {
 
 	log.Printf(">>> authoring ISO")
 	if *useXorriso {
-		if err := assembleWithXorriso(*workdir, *out, *label, envID, espPath, sfsPath, sfsName, store, root, kver); err != nil {
+		if err := assembleWithXorriso(*workdir, *out, *label, envID, espPath, sfsPath, sfsName, root, kver); err != nil {
 			log.Fatal(err)
 		}
 		st, _ := os.Stat(*out)
@@ -258,7 +272,7 @@ func (d *deleteOnClose) Close() error {
 // runs xorriso with the exact production argument set from
 // internal/target.IsoTarget.assembleIso. Native-only convenience; the
 // browser path uses the pure writer.
-func assembleWithXorriso(workdir, out, label, envID, espPath, sfsPath, sfsName string, store *oci.DirStore, root *oci.Node, kver string) error {
+func assembleWithXorriso(workdir, out, label, envID, espPath, sfsPath, sfsName string, root *oci.Node, kver string) error {
 	isoRoot := filepath.Join(workdir, "iso-root")
 	_ = os.RemoveAll(isoRoot)
 	px := filepath.Join(isoRoot, "images", "pxeboot", envID)
@@ -287,8 +301,7 @@ func assembleWithXorriso(workdir, out, label, envID, espPath, sfsPath, sfsName s
 	if err := place(filepath.Join(isoRoot, "EFI", "efi.img"), espPath); err != nil {
 		return err
 	}
-	sdb := root.Lookup("usr/lib/systemd/boot/efi/systemd-bootx64.efi")
-	if err := place(filepath.Join(isoRoot, "EFI", "BOOT", "BOOTX64.EFI"), sdb.Ref); err != nil {
+	if err := place(filepath.Join(isoRoot, "EFI", "BOOT", "BOOTX64.EFI"), sdBootDisk); err != nil {
 		return err
 	}
 	if err := place(filepath.Join(px, "vmlinuz"), root.Lookup("usr/lib/modules/"+kver+"/vmlinuz").Ref); err != nil {

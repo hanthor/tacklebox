@@ -147,6 +147,17 @@ func buildIso(_ js.Value, args []js.Value) any {
 			flatpaks = append(flatpaks, v.Index(i).String())
 		}
 	}
+	strSlice := func(key string) []string {
+		var out []string
+		if v := opts.Get(key); v.Type() == js.TypeObject {
+			for i := 0; i < v.Get("length").Int(); i++ {
+				out = append(out, v.Index(i).String())
+			}
+		}
+		return out
+	}
+	packages := strSlice("packages")
+	extraRun := strSlice("extraRun")
 	return promise(func() (any, error) {
 		if gRoot == nil {
 			return nil, fmt.Errorf("introspect an image first")
@@ -289,6 +300,17 @@ func buildIso(_ js.Value, args []js.Value) any {
 			inputs = append(inputs, purefs.IsoInput{
 				Path: "/LiveOS/flatpak-preload.json", Size: int64(len(manifest)),
 				Source: bytesSource(manifest),
+			})
+		}
+		// remora manifest (tacklebox#99): packages + custom repos/config
+		// (extra_run) ride into the installed system, where remora rebuilds
+		// the layers on the upstream base and bootc-switches — customization
+		// that persists AND keeps updating.
+		if len(packages) > 0 || len(extraRun) > 0 {
+			ry := purefs.RemoraManifest(gFacts.PkgManager, packages, extraRun)
+			inputs = append(inputs, purefs.IsoInput{
+				Path: "/LiveOS/remora/remora.yaml", Size: int64(len(ry)),
+				Source: bytesSource([]byte(ry)),
 			})
 		}
 		if err := purefs.WriteIso9660(jw, label, inputs, "/EFI/efi.img"); err != nil {

@@ -227,6 +227,41 @@ func main() {
 	}
 
 	log.Printf(">>> authoring ISO")
+	if !*useXorriso {
+		// Pure streaming writer: no workspace, no staging copy, each
+		// source read once — and the same code path the WASM builder uses.
+		f, err := os.Create(*out)
+		if err != nil {
+			log.Fatal(err)
+		}
+		espSt, _ := os.Stat(espPath)
+		sfsSt, _ := os.Stat(sfsPath)
+		kn := root.Lookup("usr/lib/modules/" + kver + "/vmlinuz")
+		var initrdSize int64
+		if *initrd != "" {
+			ist, _ := os.Stat(*initrd)
+			initrdSize = ist.Size()
+		} else {
+			initrdSize = root.Lookup("usr/lib/modules/" + kver + "/initramfs.img").Size
+		}
+		sdbSt, _ := os.Stat(sdBootDisk)
+		inputs := []purefs.IsoInput{
+			{Path: "/EFI/efi.img", Size: espSt.Size(), Source: purefs.FileSource(espPath)},
+			{Path: "/EFI/BOOT/BOOTX64.EFI", Size: sdbSt.Size(), Source: purefs.FileSource(sdBootDisk)},
+			{Path: kernelPath, Size: kn.Size, Source: blob("usr/lib/modules/" + kver + "/vmlinuz")},
+			{Path: initrdPath, Size: initrdSize, Source: initrdSource},
+			{Path: "/LiveOS/" + sfsName, Size: sfsSt.Size(), Source: purefs.FileSource(sfsPath)},
+		}
+		if err := purefs.WriteIso9660(f, *label, inputs, "/EFI/efi.img"); err != nil {
+			log.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			log.Fatal(err)
+		}
+		st, _ := os.Stat(*out)
+		log.Printf(">>> done: %s (%.1f GB)", *out, float64(st.Size())/1e9)
+		return
+	}
 	if *useXorriso {
 		if err := assembleWithXorriso(*workdir, *out, *label, envID, espPath, sfsPath, sfsName, root, kver); err != nil {
 			log.Fatal(err)

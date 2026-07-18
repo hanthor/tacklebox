@@ -98,6 +98,39 @@ func (c *Client) Unpack(ref Ref, m *Manifest, store BlobStore, progress func(lay
 	return root, nil
 }
 
+// UnpackOnto applies onto an EXISTING tree the layers of m whose digests
+// are not in skip — the consumption side of live-overlay parity
+// artifacts (tunaOS#673): an overlay image is the base image plus
+// customize-delta layers; skipping the base's digests applies exactly
+// the delta.
+func (c *Client) UnpackOnto(root *Node, ref Ref, m *Manifest, store BlobStore, skip map[string]bool, progress func(layer, total int)) error {
+	applied := 0
+	for i, layer := range m.Layers {
+		if skip[layer.Digest] {
+			continue
+		}
+		if progress != nil {
+			progress(i, len(m.Layers))
+		}
+		body, err := c.Blob(ref, layer)
+		if err != nil {
+			return fmt.Errorf("overlay layer %d: %w", i, err)
+		}
+		if err := applyLayerFiltered(root, body, layer.MediaType, store, c.SkipBodies); err != nil {
+			body.Close()
+			return fmt.Errorf("overlay layer %d: %w", i, err)
+		}
+		if err := body.Close(); err != nil {
+			return err
+		}
+		applied++
+	}
+	if applied == 0 {
+		return fmt.Errorf("overlay added no layers beyond the base (%d shared)", len(m.Layers))
+	}
+	return nil
+}
+
 // SkipBodies, when set on a Client, drops the file bodies (and nodes)
 // of matching paths during Unpack — boot-irrelevant junk (tmp/, caches)
 // never hits the blob store. The path is slash-separated, no leading /.

@@ -34,9 +34,12 @@ import (
 )
 
 var (
-	gRoot  *oci.Node
-	gStore *hybridStore
-	gFacts purefs.ImageFacts
+	gRoot     *oci.Node
+	gStore    *hybridStore
+	gFacts    purefs.ImageFacts
+	gClient   *oci.Client
+	gManifest *oci.Manifest
+	gImage    string
 )
 
 func main() {
@@ -122,6 +125,7 @@ func introspect(_ js.Value, args []js.Value) any {
 			return nil, err
 		}
 		gRoot = root
+		gClient, gManifest, gImage = c, m, image
 		gFacts = purefs.Introspect(root)
 		b, _ := json.Marshal(gFacts)
 		return string(b), nil
@@ -148,6 +152,30 @@ func buildIso(_ js.Value, args []js.Value) any {
 			return nil, fmt.Errorf("introspect an image first")
 		}
 		root, store := gRoot, gStore
+
+		// Live-overlay parity artifact (tunaOS#673): tuna-os/<variant>:<flavor>
+		// images have a published customize delta at
+		// tuna-os/live-overlay:<variant>-<flavor> — apply its non-base
+		// layers so the browser ISO carries the identical live payload
+		// (installer flatpak, autologin, polkit) CI media do. Best-effort:
+		// absence just means the plain baseline.
+		if strings.HasPrefix(gImage, "tuna-os/") && gClient != nil {
+			parts := strings.SplitN(strings.TrimPrefix(gImage, "tuna-os/"), ":", 2)
+			if len(parts) == 2 {
+				ovRef := oci.Ref{Repo: "tuna-os/live-overlay", Tag: parts[0] + "-" + parts[1]}
+				if ovm, err := gClient.ResolveManifest(ovRef, "amd64"); err == nil {
+					skip := map[string]bool{}
+					for _, l := range gManifest.Layers {
+						skip[l.Digest] = true
+					}
+					emitProgress("overlay", 0, 1)
+					if err := gClient.UnpackOnto(root, ovRef, ovm, store, skip, nil); err != nil {
+						fmt.Println("!!! live overlay skipped:", err)
+					}
+					emitProgress("overlay", 1, 1)
+				}
+			}
+		}
 
 		if err := purefs.EnsureLiveUser(root, store, "liveuser", 1000); err != nil {
 			return nil, err
@@ -211,7 +239,7 @@ func buildIso(_ js.Value, args []js.Value) any {
 			if oerr != nil {
 				return nil, oerr
 			}
-			combined := append(stock, overlay...)
+			combined := append(overlay, stock...)
 			initrdSrc = bytesSource(combined)
 			initrdSize = int64(len(combined))
 			emitProgress("initrd", 1, 1)

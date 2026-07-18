@@ -162,7 +162,7 @@ func main() {
 			log.Fatal(err)
 		}
 		combined := filepath.Join(*workdir, "initrd-tbox.img")
-		if err := os.WriteFile(combined, append(stock, overlay...), 0o644); err != nil {
+		if err := os.WriteFile(combined, append(overlay, stock...), 0o644); err != nil {
 			log.Fatal(err)
 		}
 		initrdSource = purefs.FileSource(combined)

@@ -14,12 +14,14 @@ import (
 	"github.com/tuna-os/tacklebox/internal/oci"
 )
 
-// BuildInitrdOverlay produces a newc cpio archive that, appended to an
+// BuildInitrdOverlay produces a newc cpio archive that, PREPENDED to an
 // image's stock initramfs, turns it into a tbox-live initramfs — the
 // same effect as the dracut rebuild PrepareInitramfs does in a
-// container, computed as pure tree work instead. The kernel's initramfs
-// loader concatenates segments, later entries win, so the overlay only
-// has to carry:
+// container, computed as pure tree work instead. Segment order matters:
+// the kernel unpacks raw cpio segments first and allows ONE trailing
+// compressed segment — raw-after-compressed fails ("invalid magic at
+// start of compressed archive"). The overlay introduces only new paths,
+// so extraction order doesn't change the result. It carries:
 //
 //   - the tbox dracut module scripts at their RUNTIME hook paths (both
 //     the /usr/lib and /var/lib hookdir generations of dracut)

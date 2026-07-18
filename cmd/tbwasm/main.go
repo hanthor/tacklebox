@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"syscall/js"
 
 	"github.com/tuna-os/tacklebox/internal/oci"
@@ -33,7 +34,7 @@ import (
 
 var (
 	gRoot  *oci.Node
-	gStore *oci.MemStore
+	gStore *hybridStore
 	gFacts purefs.ImageFacts
 )
 
@@ -41,6 +42,9 @@ func main() {
 	js.Global().Set("tboxIntrospect", js.FuncOf(introspect))
 	js.Global().Set("tboxBuildIso", js.FuncOf(buildIso))
 	js.Global().Set("tboxReset", js.FuncOf(func(js.Value, []js.Value) any {
+		if gStore != nil && gStore.arena != nil {
+			gStore.arena.Destroy()
+		}
 		gRoot, gStore = nil, nil
 		return nil
 	}))
@@ -87,17 +91,33 @@ func introspect(_ js.Value, args []js.Value) any {
 			return nil, fmt.Errorf("image must be <repo>:<tag>")
 		}
 		c := oci.NewClient(registry)
+		// Boot-irrelevant junk never hits origin storage (quota!).
+		c.SkipBodies = func(p string) bool {
+			for _, pre := range []string{"tmp/", "var/tmp/", "var/cache/", "var/log/", "run/"} {
+				if strings.HasPrefix(p, pre) {
+					return true
+				}
+			}
+			return false
+		}
 		ref := oci.Ref{Repo: repo, Tag: tag}
 		emitProgress("resolve", 0, 1)
 		m, err := c.ResolveManifest(ref, "amd64")
 		if err != nil {
 			return nil, err
 		}
-		gStore = &oci.MemStore{}
-		root, err := c.Unpack(ref, m, gStore, func(i, n int) {
+		arena, err := newOpfsArena("tbox-arena.bin")
+		if err != nil {
+			return nil, err
+		}
+		gStore = &hybridStore{arena: arena, mem: &oci.MemStore{}}
+		root, err := c.Unpack(ref, m, arena, func(i, n int) {
 			emitProgress("unpack", i+1, n)
 		})
 		if err != nil {
+			return nil, err
+		}
+		if err := arena.Seal(); err != nil {
 			return nil, err
 		}
 		gRoot = root
@@ -140,9 +160,20 @@ func buildIso(_ js.Value, args []js.Value) any {
 		sfsName := envID + ".rootfs.sfs"
 
 		emitProgress("erofs", 0, 1)
-		var sfs bytes.Buffer
-		if err := purefs.WriteErofs(root, store, &sfs, 0); err != nil {
+		sfsArena, err := newOpfsArena("tbox-erofs.img")
+		if err != nil {
 			return nil, err
+		}
+		defer sfsArena.Destroy()
+		if err := purefs.WriteErofs(root, store, arenaWriter{sfsArena}, 0); err != nil {
+			return nil, err
+		}
+		sfsSize := sfsArena.off
+		if err := sfsArena.Seal(); err != nil {
+			return nil, err
+		}
+		sfsSource := func() (io.ReadCloser, error) {
+			return sfsArena.Open(fmt.Sprintf("a:0:%d", sfsSize))
 		}
 		emitProgress("erofs", 1, 1)
 
@@ -203,7 +234,7 @@ func buildIso(_ js.Value, args []js.Value) any {
 			{Path: "/EFI/BOOT/BOOTX64.EFI", Size: mustSize(sdSrc), Source: sdSrc},
 			{Path: kernelPath, Size: kernelSize, Source: kernelSrc},
 			{Path: initrdPath, Size: initrdSize, Source: initrdSrc},
-			{Path: "/LiveOS/" + sfsName, Size: int64(sfs.Len()), Source: bytesSource(sfs.Bytes())},
+			{Path: "/LiveOS/" + sfsName, Size: sfsSize, Source: sfsSource},
 		}
 		if len(flatpaks) > 0 {
 			manifest, _ := json.Marshal(map[string]any{"preload": flatpaks})

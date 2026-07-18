@@ -2,6 +2,7 @@ package oci
 
 import (
 	"archive/tar"
+	"bufio"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -66,7 +67,7 @@ func (c *Client) Unpack(ref Ref, m *Manifest, store BlobStore, progress func(lay
 		if err != nil {
 			return nil, fmt.Errorf("layer %d: %w", i, err)
 		}
-		if err := applyLayer(root, body, layer.MediaType, store); err != nil {
+		if err := applyLayerFiltered(root, body, layer.MediaType, store, c.SkipBodies); err != nil {
 			body.Close()
 			return nil, fmt.Errorf("layer %d: %w", i, err)
 		}
@@ -77,7 +78,20 @@ func (c *Client) Unpack(ref Ref, m *Manifest, store BlobStore, progress func(lay
 	return root, nil
 }
 
+// SkipBodies, when set on a Client, drops the file bodies (and nodes)
+// of matching paths during Unpack — boot-irrelevant junk (tmp/, caches)
+// never hits the blob store. The path is slash-separated, no leading /.
 func applyLayer(root *Node, r io.Reader, mediaType string, store BlobStore) error {
+	return applyLayerFiltered(root, r, mediaType, store, nil)
+}
+
+func applyLayerFiltered(root *Node, r io.Reader, mediaType string, store BlobStore, skip func(string) bool) error {
+	// Large read buffer between the transport and the decompressor: on
+	// GOOS=js every underlying Read is a JS promise round-trip, and zstd/
+	// gzip issue small reads — unbuffered, a single layer costs hundreds
+	// of thousands of event-loop hops and looks hung. Native path benefits
+	// mildly too.
+	r = bufio.NewReaderSize(r, 4<<20)
 	var tr *tar.Reader
 	switch {
 	case strings.Contains(mediaType, "zstd"):
@@ -106,7 +120,7 @@ func applyLayer(root *Node, r io.Reader, mediaType string, store BlobStore) erro
 		if err != nil {
 			return err
 		}
-		if err := applyEntry(root, hdr, tr, store); err != nil {
+		if err := applyEntry(root, hdr, tr, store, skip); err != nil {
 			return fmt.Errorf("%s: %w", hdr.Name, err)
 		}
 	}
@@ -135,7 +149,11 @@ func dirOf(root *Node, parts []string) (*Node, string) {
 	return n, parts[len(parts)-1]
 }
 
-func applyEntry(root *Node, hdr *tar.Header, body io.Reader, store BlobStore) error {
+func applyEntry(root *Node, hdr *tar.Header, body io.Reader, store BlobStore, skip func(string) bool) error {
+	if skip != nil && hdr.Typeflag == tar.TypeReg && skip(strings.Trim(hdr.Name, "/")) {
+		_, err := io.Copy(io.Discard, body)
+		return err
+	}
 	parts := splitClean(hdr.Name)
 	if parts == nil {
 		if hdr.Typeflag == tar.TypeDir {

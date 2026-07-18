@@ -24,6 +24,9 @@ type Client struct {
 	Base string
 	// HTTP lets tests and the WASM build substitute a transport.
 	HTTP *http.Client
+	// SkipBodies drops file bodies of matching paths during Unpack —
+	// boot-irrelevant junk (tmp/, caches) never reaches the blob store.
+	SkipBodies func(path string) bool
 
 	token string
 }

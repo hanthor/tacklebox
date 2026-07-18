@@ -2,7 +2,8 @@
 //
 // Today: BlockTarget — sparse loop image or real /dev/* block device.
 // Soon:  IsoTarget — UEFI-bootable ISO9660 (replaces SuperISO's
-//        scripts/build-iso.sh; see PLAN-merge.md at the repo root).
+//
+//	scripts/build-iso.sh; see PLAN-merge.md at the repo root).
 //
 // The orchestrator in cmd/tacklebox/build.go calls Prepare → installs each
 // env into the returned Mountpoints → calls Finalize. Cleanup runs on
@@ -28,9 +29,9 @@ func orNoopTrack(t Track) Track {
 // to write into. Their meaning is the same regardless of target type:
 //
 //   - EspMount:   the ESP (FAT) where bootloader + per-env kernel/initrd
-//                 + BLS entries live.
+//   - BLS entries live.
 //   - StoreMount: the shared store where each env's ostree / composefs
-//                 deployment is written under tbox-install/<env>/.
+//     deployment is written under tbox-install/<env>/.
 //
 // IsoTarget will mount a FAT image file at EspMount and a tmp dir at
 // StoreMount; later phases pack each env's content into a per-env

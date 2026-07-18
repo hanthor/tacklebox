@@ -20,7 +20,7 @@ depends() { echo "base"; return 0; }
 installkernel() {
     # The stock initramfs of a minimal bootc image may lack all four.
     # hostonly='' forces them in even on hostonly rebuilds.
-    hostonly='' instmods squashfs loop overlay iso9660
+    hostonly='' instmods squashfs erofs loop overlay iso9660
 }
 
 install() {

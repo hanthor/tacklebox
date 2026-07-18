@@ -30,7 +30,10 @@
 
 command -v getarg > /dev/null 2>&1 || . /lib/dracut-lib.sh
 
+# argv is unreliable through initqueue's shell re-parse (see
+# parse-tbox-live.sh); the parse hook hands the path over in a file.
 dev=$1
+[ -z "$dev" ] && [ -f /run/tbox-live-root.dev ] && dev=$(cat /run/tbox-live-root.dev)
 
 # Idempotence across initqueue passes; bail quietly until the device
 # exists (the wait_for_dev finished hook keeps initqueue looping until

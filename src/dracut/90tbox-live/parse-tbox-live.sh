@@ -40,6 +40,13 @@ tbox:/dev/*)
 esac
 
 if [ "$tboxroot" = "1" ]; then
+    # The device path travels via a file, NOT argv: initqueue stores its
+    # command as a shell line and re-parses it, so an unquoted \x20
+    # (udev's space escape in by-label paths) collapses to x20 and the
+    # path never matches (observed: label 'TunaOS Yellowfin', run
+    # 29627295208). A file survives any characters.
+    printf '%s' "${root#tbox:}" > /run/tbox-live-root.dev
+
     # Assemble the live root on the first udev-settled initqueue pass
     # where the ISO device exists (USB/CD enumeration can take a while).
     # The initqueue "finished" condition must be the DONE MARKER our
@@ -47,6 +54,6 @@ if [ "$tboxroot" = "1" ]; then
     # moment a finished check passes, and waiting on the device would
     # let it exit before the settled queue (and thus our mounts) ever
     # ran on a device that was present from the start.
-    /sbin/initqueue --settled --unique /sbin/tbox-live-root "${root#tbox:}"
+    /sbin/initqueue --settled --unique /sbin/tbox-live-root
     wait_for_dev -n /run/tacklebox-live-done
 fi

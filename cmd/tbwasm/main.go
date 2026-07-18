@@ -28,14 +28,18 @@ import (
 	"strings"
 	"syscall/js"
 
+	tacklebox "github.com/tuna-os/tacklebox"
 	"github.com/tuna-os/tacklebox/internal/oci"
 	"github.com/tuna-os/tacklebox/internal/purefs"
 )
 
 var (
-	gRoot  *oci.Node
-	gStore *hybridStore
-	gFacts purefs.ImageFacts
+	gRoot     *oci.Node
+	gStore    *hybridStore
+	gFacts    purefs.ImageFacts
+	gClient   *oci.Client
+	gManifest *oci.Manifest
+	gImage    string
 )
 
 func main() {
@@ -121,6 +125,7 @@ func introspect(_ js.Value, args []js.Value) any {
 			return nil, err
 		}
 		gRoot = root
+		gClient, gManifest, gImage = c, m, image
 		gFacts = purefs.Introspect(root)
 		b, _ := json.Marshal(gFacts)
 		return string(b), nil
@@ -142,11 +147,46 @@ func buildIso(_ js.Value, args []js.Value) any {
 			flatpaks = append(flatpaks, v.Index(i).String())
 		}
 	}
+	strSlice := func(key string) []string {
+		var out []string
+		if v := opts.Get(key); v.Type() == js.TypeObject {
+			for i := 0; i < v.Get("length").Int(); i++ {
+				out = append(out, v.Index(i).String())
+			}
+		}
+		return out
+	}
+	packages := strSlice("packages")
+	extraRun := strSlice("extraRun")
 	return promise(func() (any, error) {
 		if gRoot == nil {
 			return nil, fmt.Errorf("introspect an image first")
 		}
 		root, store := gRoot, gStore
+
+		// Live-overlay parity artifact (tunaOS#673): tuna-os/<variant>:<flavor>
+		// images have a published customize delta at
+		// tuna-os/live-overlay:<variant>-<flavor> — apply its non-base
+		// layers so the browser ISO carries the identical live payload
+		// (installer flatpak, autologin, polkit) CI media do. Best-effort:
+		// absence just means the plain baseline.
+		if strings.HasPrefix(gImage, "tuna-os/") && gClient != nil {
+			parts := strings.SplitN(strings.TrimPrefix(gImage, "tuna-os/"), ":", 2)
+			if len(parts) == 2 {
+				ovRef := oci.Ref{Repo: "tuna-os/live-overlay", Tag: parts[0] + "-" + parts[1]}
+				if ovm, err := gClient.ResolveManifest(ovRef, "amd64"); err == nil {
+					skip := map[string]bool{}
+					for _, l := range gManifest.Layers {
+						skip[l.Digest] = true
+					}
+					emitProgress("overlay", 0, 1)
+					if err := gClient.UnpackOnto(root, ovRef, ovm, store, skip, nil); err != nil {
+						fmt.Println("!!! live overlay skipped:", err)
+					}
+					emitProgress("overlay", 1, 1)
+				}
+			}
+		}
 
 		if err := purefs.EnsureLiveUser(root, store, "liveuser", 1000); err != nil {
 			return nil, err
@@ -190,14 +230,33 @@ func buildIso(_ js.Value, args []js.Value) any {
 		}
 		initrdSrc, initrdSize, err := blob("usr/lib/modules/" + kver + "/initramfs.img")
 		if len(initrd) > 0 {
+			// explicit override wins
 			initrdSrc = func() (io.ReadCloser, error) {
 				return io.NopCloser(bytes.NewReader(initrd)), nil
 			}
 			initrdSize = int64(len(initrd))
 			err = nil
+		} else if err == nil {
+			// Auto: append the tbox overlay segment (embedded dracut
+			// module scripts + the image's own fs/device kernel modules)
+			// to the stock initramfs — live-bootable with no supplied
+			// artifacts (the tacklebox engine "tackles the initramfs").
+			emitProgress("initrd", 0, 1)
+			overlay, oerr := purefs.BuildInitrdOverlay(root, store, kver, tacklebox.DracutModules)
+			if oerr != nil {
+				return nil, fmt.Errorf("initrd overlay: %w", oerr)
+			}
+			stock, oerr := blobBytes(initrdSrc)
+			if oerr != nil {
+				return nil, oerr
+			}
+			combined := append(overlay, stock...)
+			initrdSrc = bytesSource(combined)
+			initrdSize = int64(len(combined))
+			emitProgress("initrd", 1, 1)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("no initramfs in image and none supplied: %w", err)
+			return nil, fmt.Errorf("no initramfs in image: %w", err)
 		}
 		sdSrc, _, err := blob("usr/lib/systemd/boot/efi/systemd-bootx64.efi")
 		if err != nil {
@@ -243,12 +302,32 @@ func buildIso(_ js.Value, args []js.Value) any {
 				Source: bytesSource(manifest),
 			})
 		}
+		// remora manifest (tacklebox#99): packages + custom repos/config
+		// (extra_run) ride into the installed system, where remora rebuilds
+		// the layers on the upstream base and bootc-switches — customization
+		// that persists AND keeps updating.
+		if len(packages) > 0 || len(extraRun) > 0 {
+			ry := purefs.RemoraManifest(gFacts.PkgManager, packages, extraRun)
+			inputs = append(inputs, purefs.IsoInput{
+				Path: "/LiveOS/remora/remora.yaml", Size: int64(len(ry)),
+				Source: bytesSource([]byte(ry)),
+			})
+		}
 		if err := purefs.WriteIso9660(jw, label, inputs, "/EFI/efi.img"); err != nil {
 			return nil, err
 		}
 		emitProgress("iso", 1, 1)
 		return jw.written, nil
 	})
+}
+
+func blobBytes(src func() (io.ReadCloser, error)) ([]byte, error) {
+	rc, err := src()
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	return io.ReadAll(rc)
 }
 
 func bytesSource(b []byte) func() (io.ReadCloser, error) {

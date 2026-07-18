@@ -59,23 +59,76 @@ type BlobStore interface {
 // filesystem.
 func (c *Client) Unpack(ref Ref, m *Manifest, store BlobStore, progress func(layer int, total int)) (*Node, error) {
 	root := &Node{Type: TypeDir, Mode: 0o755, Children: map[string]*Node{}}
+
+	// Pipeline: the next layer's fetch begins while the current one is
+	// decompressing/applying — overlay semantics still apply strictly in
+	// order, only the network wait overlaps CPU work. One layer of
+	// lookahead keeps peak buffering bounded.
+	type fetched struct {
+		body io.ReadCloser
+		err  error
+	}
+	next := make(chan fetched, 1)
+	fetch := func(i int) {
+		body, err := c.Blob(ref, m.Layers[i])
+		next <- fetched{body, err}
+	}
+	if len(m.Layers) > 0 {
+		go fetch(0)
+	}
 	for i, layer := range m.Layers {
+		if progress != nil {
+			progress(i, len(m.Layers))
+		}
+		f := <-next
+		if i+1 < len(m.Layers) {
+			go fetch(i + 1)
+		}
+		if f.err != nil {
+			return nil, fmt.Errorf("layer %d: %w", i, f.err)
+		}
+		if err := applyLayerFiltered(root, f.body, layer.MediaType, store, c.SkipBodies); err != nil {
+			f.body.Close()
+			return nil, fmt.Errorf("layer %d: %w", i, err)
+		}
+		if err := f.body.Close(); err != nil {
+			return nil, fmt.Errorf("layer %d: %w", i, err)
+		}
+	}
+	return root, nil
+}
+
+// UnpackOnto applies onto an EXISTING tree the layers of m whose digests
+// are not in skip — the consumption side of live-overlay parity
+// artifacts (tunaOS#673): an overlay image is the base image plus
+// customize-delta layers; skipping the base's digests applies exactly
+// the delta.
+func (c *Client) UnpackOnto(root *Node, ref Ref, m *Manifest, store BlobStore, skip map[string]bool, progress func(layer, total int)) error {
+	applied := 0
+	for i, layer := range m.Layers {
+		if skip[layer.Digest] {
+			continue
+		}
 		if progress != nil {
 			progress(i, len(m.Layers))
 		}
 		body, err := c.Blob(ref, layer)
 		if err != nil {
-			return nil, fmt.Errorf("layer %d: %w", i, err)
+			return fmt.Errorf("overlay layer %d: %w", i, err)
 		}
 		if err := applyLayerFiltered(root, body, layer.MediaType, store, c.SkipBodies); err != nil {
 			body.Close()
-			return nil, fmt.Errorf("layer %d: %w", i, err)
+			return fmt.Errorf("overlay layer %d: %w", i, err)
 		}
 		if err := body.Close(); err != nil {
-			return nil, fmt.Errorf("layer %d: %w", i, err)
+			return err
 		}
+		applied++
 	}
-	return root, nil
+	if applied == 0 {
+		return fmt.Errorf("overlay added no layers beyond the base (%d shared)", len(m.Layers))
+	}
+	return nil
 }
 
 // SkipBodies, when set on a Client, drops the file bodies (and nodes)

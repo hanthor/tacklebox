@@ -54,6 +54,27 @@ if [ "$tboxroot" = "1" ]; then
     # moment a finished check passes, and waiting on the device would
     # let it exit before the settled queue (and thus our mounts) ever
     # ran on a device that was present from the start.
-    /sbin/initqueue --settled --unique /sbin/tbox-live-root
+    # initqueue is only present when a dracut module requested it at BUILD
+    # time (dracut_need_initqueue). A tbox-appended-overlay initramfs (the
+    # browser builder path) rides a stock initrd that may not include it —
+    # fall back to a udev rule that runs tbox-live-root when the labeled
+    # device appears. Both paths converge on the /run done marker.
+    if command -v initqueue > /dev/null 2>&1; then
+        initqueue --settled --unique /sbin/tbox-live-root
+    elif [ -x /sbin/initqueue ]; then
+        /sbin/initqueue --settled --unique /sbin/tbox-live-root
+    else
+        # No initqueue: drive tbox-live-root from udev directly. The label
+        # symlink appearing is the trigger; the script is idempotent and
+        # writes the done marker itself.
+        {
+            echo 'SUBSYSTEM=="block", ACTION=="add|change", ENV{ID_FS_LABEL}!="", RUN+="/sbin/tbox-live-root"'
+            echo 'SUBSYSTEM=="block", KERNEL=="sr[0-9]*", ACTION=="add|change", RUN+="/sbin/tbox-live-root"'
+        } > /etc/udev/rules.d/99-tbox-live.rules
+        udevadm control --reload 2> /dev/null || true
+        udevadm trigger --action=change --subsystem-match=block 2> /dev/null || true
+        # Also try immediately in case the device is already present.
+        /sbin/tbox-live-root 2> /dev/null || true
+    fi
     wait_for_dev -n /run/tacklebox-live-done
 fi

@@ -171,7 +171,17 @@ func main() {
 			keepRefs[n.Ref] = true
 		}
 	}
-	erofsStore := &consumingStore{inner: store, keep: keepRefs}
+	// Blob refcounts: skel copies (and any future tree surgery) may point
+	// several nodes at one blob — it may only be deleted after its LAST
+	// consumer, not its first.
+	refCount := map[string]int{}
+	root.Walk(func(_ string, n *oci.Node) error {
+		if n.Type == oci.TypeFile && n.Ref != "" {
+			refCount[n.Ref]++
+		}
+		return nil
+	})
+	erofsStore := &consumingStore{inner: store, keep: keepRefs, refs: refCount}
 
 	// Live rootfs (EROFS; tbox-live mounts with -t auto).
 	sfsName := envID + ".rootfs.sfs"
@@ -243,6 +253,7 @@ func main() {
 type consumingStore struct {
 	inner *oci.DirStore
 	keep  map[string]bool
+	refs  map[string]int
 }
 
 func (c *consumingStore) Put(r io.Reader) (string, int64, error) { return c.inner.Put(r) }
@@ -254,17 +265,21 @@ func (c *consumingStore) Open(ref string) (io.ReadCloser, error) {
 	if c.keep[ref] {
 		return rc, nil
 	}
-	return &deleteOnClose{ReadCloser: rc, path: ref}, nil
+	return &deleteOnClose{ReadCloser: rc, path: ref, store: c}, nil
 }
 
 type deleteOnClose struct {
 	io.ReadCloser
-	path string
+	path  string
+	store *consumingStore
 }
 
 func (d *deleteOnClose) Close() error {
 	err := d.ReadCloser.Close()
-	_ = os.Remove(d.path)
+	d.store.refs[d.path]--
+	if d.store.refs[d.path] <= 0 {
+		_ = os.Remove(d.path)
+	}
 	return err
 }
 

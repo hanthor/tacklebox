@@ -42,7 +42,7 @@ func TestYamlNormalizeMapAnyToMapString(t *testing.T) {
 	input := map[any]any{
 		"media_name": "Test Media",
 		"shared_store": map[any]any{
-			"dedup": true,
+			"dedup":  true,
 			"format": "ext4",
 		},
 	}

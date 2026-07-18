@@ -35,6 +35,18 @@ command -v getarg > /dev/null 2>&1 || . /lib/dracut-lib.sh
 dev=$1
 [ -z "$dev" ] && [ -f /run/tbox-live-root.dev ] && dev=$(cat /run/tbox-live-root.dev)
 
+# Filesystem/device modules: a dracut-built tbox initramfs carries these
+# with modules.dep entries; an appended-overlay initramfs (browser
+# builder) carries the .ko files alone — modprobe first, insmod fallback.
+_kv=$(uname -r)
+for _rel in drivers/cdrom/cdrom drivers/scsi/sr_mod drivers/block/loop \
+    fs/overlayfs/overlay fs/erofs/erofs fs/isofs/isofs fs/squashfs/squashfs; do
+    _b=${_rel##*/}
+    modprobe "$_b" 2> /dev/null && continue
+    [ -f "/usr/lib/modules/$_kv/kernel/$_rel.ko" ] &&
+        insmod "/usr/lib/modules/$_kv/kernel/$_rel.ko" 2> /dev/null
+done
+
 # Idempotence across initqueue passes; bail quietly until the device
 # exists (the wait_for_dev finished hook keeps initqueue looping until
 # the done marker below appears).

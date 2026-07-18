@@ -28,6 +28,7 @@ import (
 	"strings"
 	"syscall/js"
 
+	tacklebox "github.com/tuna-os/tacklebox"
 	"github.com/tuna-os/tacklebox/internal/oci"
 	"github.com/tuna-os/tacklebox/internal/purefs"
 )
@@ -190,14 +191,33 @@ func buildIso(_ js.Value, args []js.Value) any {
 		}
 		initrdSrc, initrdSize, err := blob("usr/lib/modules/" + kver + "/initramfs.img")
 		if len(initrd) > 0 {
+			// explicit override wins
 			initrdSrc = func() (io.ReadCloser, error) {
 				return io.NopCloser(bytes.NewReader(initrd)), nil
 			}
 			initrdSize = int64(len(initrd))
 			err = nil
+		} else if err == nil {
+			// Auto: append the tbox overlay segment (embedded dracut
+			// module scripts + the image's own fs/device kernel modules)
+			// to the stock initramfs — live-bootable with no supplied
+			// artifacts (the tacklebox engine "tackles the initramfs").
+			emitProgress("initrd", 0, 1)
+			overlay, oerr := purefs.BuildInitrdOverlay(root, store, kver, tacklebox.DracutModules)
+			if oerr != nil {
+				return nil, fmt.Errorf("initrd overlay: %w", oerr)
+			}
+			stock, oerr := blobBytes(initrdSrc)
+			if oerr != nil {
+				return nil, oerr
+			}
+			combined := append(stock, overlay...)
+			initrdSrc = bytesSource(combined)
+			initrdSize = int64(len(combined))
+			emitProgress("initrd", 1, 1)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("no initramfs in image and none supplied: %w", err)
+			return nil, fmt.Errorf("no initramfs in image: %w", err)
 		}
 		sdSrc, _, err := blob("usr/lib/systemd/boot/efi/systemd-bootx64.efi")
 		if err != nil {
@@ -249,6 +269,15 @@ func buildIso(_ js.Value, args []js.Value) any {
 		emitProgress("iso", 1, 1)
 		return jw.written, nil
 	})
+}
+
+func blobBytes(src func() (io.ReadCloser, error)) ([]byte, error) {
+	rc, err := src()
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	return io.ReadAll(rc)
 }
 
 func bytesSource(b []byte) func() (io.ReadCloser, error) {

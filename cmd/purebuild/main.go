@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	tacklebox "github.com/tuna-os/tacklebox"
 	"github.com/tuna-os/tacklebox/internal/oci"
 	"github.com/tuna-os/tacklebox/internal/purefs"
 )
@@ -142,7 +143,30 @@ func main() {
 		initrdOnDisk = *initrd
 		log.Printf(">>> using tbox initramfs %s", *initrd)
 	} else {
-		log.Printf("!!! stock initramfs — live boot will stop without tbox modules")
+		// Auto: stock initramfs + tbox overlay segment — no dracut, no
+		// container. The overlay carries the embedded module scripts and
+		// the image's own fs/device kernel modules (insmod fallback in
+		// tbox-live-root loads them without modules.dep).
+		log.Printf(">>> appending tbox initrd overlay (no --initrd supplied)")
+		overlay, err := purefs.BuildInitrdOverlay(root, store, kver, tacklebox.DracutModules)
+		if err != nil {
+			log.Fatal(err)
+		}
+		rc, err := initrdSource()
+		if err != nil {
+			log.Fatal(err)
+		}
+		stock, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			log.Fatal(err)
+		}
+		combined := filepath.Join(*workdir, "initrd-tbox.img")
+		if err := os.WriteFile(combined, append(stock, overlay...), 0o644); err != nil {
+			log.Fatal(err)
+		}
+		initrdSource = purefs.FileSource(combined)
+		initrdOnDisk = combined
 	}
 	// systemd-boot: prefer the image's own copy; EL10 images don't ship it,
 	// so fall back to the host binary exactly like production

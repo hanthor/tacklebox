@@ -546,6 +546,12 @@ func buildLiveKernelCmdlineDelta(envID, label string, isBase bool) string {
 // single bazzite/aurora/bluefin image pull without exceeding
 // the 16 GiB machines this ISO targets.
 func liveKernelCmdline(envID, label, squashimg, extra string) string {
+	// A label with a space would split the kernel cmdline into two args
+	// ("root=tbox:CDLABEL=TunaOS" + "Yellowfin") and the initramfs would
+	// wait forever on the wrong by-label path. Escape with udev's \x20
+	// convention: it survives cmdline tokenization untouched and matches
+	// the /dev/disk/by-label symlink name byte-for-byte.
+	label = strings.ReplaceAll(label, " ", "\\x20")
 	return fmt.Sprintf(
 		"root=tbox:CDLABEL=%s tacklebox.live.squashimg=%s"+
 			" tacklebox.live.overlay.size=8192 enforcing=0"+

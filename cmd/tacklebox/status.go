@@ -128,7 +128,7 @@ func runStatusOnDir(storeMount string) error {
 		}
 		id := e.Name()
 		envRoot := filepath.Join(tbxRoot, id)
-		
+
 		status := ""
 		if id == bootedRoot {
 			status = "BOOTED"
@@ -136,9 +136,9 @@ func runStatusOnDir(storeMount string) error {
 
 		// Try to read os-release from the deployment
 		osName, osVer := getOSInfo(envRoot, id)
-		
+
 		fmt.Printf("%-15s %-10s %-30s\n", id, status, fmt.Sprintf("%s %s", osName, osVer))
-		
+
 		// Show deployments if it's an ostree backend
 		showDeployments(envRoot, id)
 	}
@@ -157,7 +157,7 @@ func getOSInfo(envRoot, id string) (string, string) {
 		path := filepath.Join(deployDir, ds[0].Name(), "etc", "os-release")
 		return parseOSRelease(path)
 	}
-	
+
 	// Fallback: check /etc/os-release in the stateroot itself (might be there)
 	return parseOSRelease(filepath.Join(envRoot, "etc", "os-release"))
 }
@@ -186,20 +186,20 @@ func showDeployments(envRoot, id string) {
 	if err != nil || len(ds) == 0 {
 		return
 	}
-	
+
 	for i, d := range ds {
 		name := d.Name()
 		marker := "  "
 		if i == 0 {
 			marker = "* " // latest
 		}
-		
+
 		// Strip the .0 index
 		hash := name
 		if dot := strings.LastIndex(hash, "."); dot >= 0 {
 			hash = hash[:dot]
 		}
-		
+
 		fmt.Printf("  %s %s\n", marker, hash)
 	}
 }

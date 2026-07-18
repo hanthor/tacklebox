@@ -461,3 +461,15 @@ func TestAppendKargs(t *testing.T) {
 		t.Fatal("nil kargs must be a no-op")
 	}
 }
+
+func TestLiveKernelCmdlineEscapesSpaces(t *testing.T) {
+	got := liveKernelCmdline("env1", "TunaOS Yellowfin", "rootfs.sfs", "")
+	if !strings.Contains(got, `root=tbox:CDLABEL=TunaOS\x20Yellowfin`) {
+		t.Fatalf("label space not escaped: %q", got)
+	}
+	// One space means one token boundary less: the full cmdline must not
+	// contain the raw label with a space.
+	if strings.Contains(got, "CDLABEL=TunaOS Yellowfin") {
+		t.Fatalf("raw space survived: %q", got)
+	}
+}

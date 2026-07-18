@@ -17,22 +17,23 @@ import (
 //
 // Layout produced:
 //
-//   /EFI/efi.img                    FAT ESP — sd-boot + per-env kernels
-//       /EFI/BOOT/BOOTX64.EFI       systemd-boot
-//       /loader/loader.conf
-//       /loader/entries/<env>.conf
-//       /images/pxeboot/<env>/{vmlinuz,initrd.img}
-//   /EFI/BOOT/BOOTX64.EFI           fallback at ISO9660 root for
-//                                   firmware that ignores El Torito
-//   /images/pxeboot/<env>/{vmlinuz,initrd.img}    loopback boot copies
-//   /LiveOS/<env>.rootfs.sfs        per-env rootfs squashfs
-//   /LiveOS/combined.rootfs.sfs     (shared_store.dedup) ONE squashfs,
-//                                   one subtree per env, instead of the
-//                                   per-env files above
+//	/EFI/efi.img                    FAT ESP — sd-boot + per-env kernels
+//	    /EFI/BOOT/BOOTX64.EFI       systemd-boot
+//	    /loader/loader.conf
+//	    /loader/entries/<env>.conf
+//	    /images/pxeboot/<env>/{vmlinuz,initrd.img}
+//	/EFI/BOOT/BOOTX64.EFI           fallback at ISO9660 root for
+//	                                firmware that ignores El Torito
+//	/images/pxeboot/<env>/{vmlinuz,initrd.img}    loopback boot copies
+//	/LiveOS/<env>.rootfs.sfs        per-env rootfs squashfs
+//	/LiveOS/combined.rootfs.sfs     (shared_store.dedup) ONE squashfs,
+//	                                one subtree per env, instead of the
+//	                                per-env files above
 //
 // During Prepare we hand the orchestrator:
-//   EspMount   = <OutputBase>/iso/esp-staging   (becomes efi.img later)
-//   StoreMount = <OutputBase>/iso/iso-root/LiveOS  (per-env squashfs lives here)
+//
+//	EspMount   = <OutputBase>/iso/esp-staging   (becomes efi.img later)
+//	StoreMount = <OutputBase>/iso/iso-root/LiveOS  (per-env squashfs lives here)
 //
 // The orchestrator's per-env install loop writes:
 //   - <env>.rootfs.sfs into StoreMount  (via install.InstallLive)
@@ -78,10 +79,10 @@ func NewIsoTarget(outputBase, outputIso, label, efiSource string, defaultBootEnt
 		defaultEntry = defaultBootEntry[0]
 	}
 	return &IsoTarget{
-		OutputBase: outputBase,
-		OutputIso:  outputIso,
-		Label:      label,
-		EFISource:  efiSource,
+		OutputBase:       outputBase,
+		OutputIso:        outputIso,
+		Label:            label,
+		EFISource:        efiSource,
 		DefaultBootEntry: defaultEntry,
 	}
 }
@@ -102,7 +103,9 @@ func (i *IsoTarget) IsoLabel() string { return i.Label }
 // IsoTarget puts per-env kernel/initrd under /images/pxeboot/<env>/
 // inside the FAT ESP, where live ISOs conventionally keep them.
 func (i *IsoTarget) KernelPath(envID string) string { return "/images/pxeboot/" + envID + "/vmlinuz" }
-func (i *IsoTarget) InitrdPath(envID string) string { return "/images/pxeboot/" + envID + "/initrd.img" }
+func (i *IsoTarget) InitrdPath(envID string) string {
+	return "/images/pxeboot/" + envID + "/initrd.img"
+}
 
 func (i *IsoTarget) Prepare(_ Track) (*Mountpoints, error) {
 	i.root = filepath.Join(i.OutputBase, "iso")

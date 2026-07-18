@@ -61,6 +61,16 @@ func WriteEsp(outPath string, files []EspFile) error {
 		return fmt.Errorf("esp mkfs: %w", err)
 	}
 
+	if err := populateEsp(fs, files); err != nil {
+		return err
+	}
+	return out.Sync()
+}
+
+// populateEsp fills a freshly created FAT32 filesystem with the given
+// files, creating parent directories as needed. Shared by the file-backed
+// (WriteEsp) and in-memory (BuildEspBytes) paths.
+func populateEsp(fs *fat32.FileSystem, files []EspFile) error {
 	made := map[string]bool{}
 	var mkdirAll func(p string) error
 	mkdirAll = func(p string) error {
@@ -94,7 +104,7 @@ func WriteEsp(outPath string, files []EspFile) error {
 		}
 		src.Close()
 	}
-	return out.Sync()
+	return nil
 }
 
 // IsoFile is one file to place into the ISO9660 tree.

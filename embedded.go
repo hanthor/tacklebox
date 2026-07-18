@@ -16,3 +16,12 @@ import "embed"
 //
 //go:embed src/dracut/95tbox-root src/dracut/90tbox-live
 var DracutModules embed.FS
+
+// LiveBaseline is the distro-agnostic live-environment setup script that
+// CustomizeLive runs inside the image container before any recipe
+// live_customize script: live user, DM autologin for the detected
+// desktop, live networking, sleep masking. Consuming projects keep only
+// branding/flatpak polish in their own scripts.
+//
+//go:embed src/live/baseline.sh
+var LiveBaseline embed.FS

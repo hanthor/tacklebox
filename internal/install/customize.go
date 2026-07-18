@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	tacklebox "github.com/tuna-os/tacklebox"
 	"github.com/tuna-os/tacklebox/internal/runner"
 )
 
@@ -26,6 +27,18 @@ import (
 // /run/tbox-customize/<i> and is the script's working directory, so scripts
 // can reference sibling assets relatively.
 func CustomizeLive(image string, scripts []string) (string, error) {
+	// The embedded baseline runs before any recipe script (tuna-os/
+	// tacklebox#97): live user, autologin, networking, sleep masking —
+	// so consumers don't reimplement it per project. Media with no
+	// live_customize at all keep the passthrough contract (appliance
+	// ISOs shouldn't grow a live user unasked).
+	if len(scripts) > 0 {
+		baselineDir, err := materializeLiveBaseline()
+		if err != nil {
+			return "", err
+		}
+		scripts = append([]string{filepath.Join(baselineDir, "baseline.sh")}, scripts...)
+	}
 	if len(scripts) == 0 {
 		return image, nil
 	}
@@ -103,4 +116,22 @@ func customizeCacheKey(imageID string, scripts []string) (string, error) {
 		h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil))[:16], nil
+}
+
+// materializeLiveBaseline writes the embedded live baseline script to a
+// temp dir so it can be bind-mounted into the customize container like
+// any recipe script.
+func materializeLiveBaseline() (string, error) {
+	dir, err := os.MkdirTemp("", "tbox-live-baseline-*")
+	if err != nil {
+		return "", err
+	}
+	data, err := tacklebox.LiveBaseline.ReadFile("src/live/baseline.sh")
+	if err != nil {
+		return "", fmt.Errorf("embedded live baseline: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "baseline.sh"), data, 0o755); err != nil {
+		return "", err
+	}
+	return dir, nil
 }

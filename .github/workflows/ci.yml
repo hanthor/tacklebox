@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Daily live-ISO signal: base images drift under us (dracut, systemd,
+    # bootc) — a broken live boot should page this repo, not a downstream.
+    - cron: '20 4 * * *'
+
 
 jobs:
   # ── Stage 1+2: lint + unit + recipe schema parse ────────────────────────────
@@ -299,6 +304,20 @@ jobs:
 
       - name: verify per-env ISO
         run: ./tacklebox verify /mnt/tbx/smoke.iso
+
+      # Boot gate: verify checks structure; this checks the thing users
+      # do — boot it. Catches non-executable generators, sysroot.mount
+      # regressions, ESP/El Torito breakage, unmountable rootfs images.
+      - name: live boot gate (QEMU/OVMF to login)
+        run: sudo ./scripts/test-live-boot.sh /mnt/tbx/smoke.iso 900
+
+      - name: upload live boot log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: iso-smoke-live-boot-log
+          path: qemu-live-boot.log
+          if-no-files-found: ignore
 
       # alpha carries live_customize (fixtures/live-customize-smoke.sh); beta
       # doesn't. The marker must be inside alpha's squashed rootfs and absent

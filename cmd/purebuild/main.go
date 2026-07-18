@@ -16,6 +16,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -23,15 +24,19 @@ import (
 	"github.com/tuna-os/tacklebox/internal/purefs"
 )
 
+var initrdOnDisk string
+
 func main() {
 	var (
-		image    = flag.String("image", "", "image as <repo>:<tag>, e.g. tuna-os/sailfin:kde")
-		registry = flag.String("registry", "https://ghcr.io", "registry base URL (or CORS shim)")
-		out      = flag.String("out", "tunaos-pure.iso", "output ISO path")
-		label    = flag.String("label", "TUNAOS", "ISO volume label (CDLABEL)")
-		initrd   = flag.String("initrd", "", "path to a tbox-enabled initramfs (overrides the image's stock one)")
-		workdir  = flag.String("workdir", ".purebuild", "scratch directory")
-		rootTar  = flag.String("rootfs-tar", "", "build from this rootfs tar (podman export of a customized container) instead of pulling; the tar is DELETED after ingest to bound disk use")
+		image      = flag.String("image", "", "image as <repo>:<tag>, e.g. tuna-os/sailfin:kde")
+		registry   = flag.String("registry", "https://ghcr.io", "registry base URL (or CORS shim)")
+		out        = flag.String("out", "tunaos-pure.iso", "output ISO path")
+		label      = flag.String("label", "TUNAOS", "ISO volume label (CDLABEL)")
+		initrd     = flag.String("initrd", "", "path to a tbox-enabled initramfs (overrides the image's stock one)")
+		workdir    = flag.String("workdir", ".purebuild", "scratch directory")
+		rootTar    = flag.String("rootfs-tar", "", "build from this rootfs tar (podman export of a customized container) instead of pulling; the tar is DELETED after ingest to bound disk use")
+		useXorriso = flag.Bool("xorriso", false, "assemble the final ISO with xorriso (production args; native only) instead of the go-diskfs writer — avoids its staging copy")
+		trim       = flag.String("trim", "var/cache,var/log,var/tmp,tmp,run", "comma-separated rootfs paths emptied before authoring (boot-irrelevant caches)")
 	)
 	flag.Parse()
 	if *image == "" || !strings.Contains(*image, ":") {
@@ -53,8 +58,9 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		root, err = oci.ApplyTar(tf, store)
-		tf.Close()
+		pr := &punchReader{f: tf}
+		root, err = oci.ApplyTar(pr, store)
+		pr.Close()
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -76,6 +82,23 @@ func main() {
 		fmt.Println()
 		if err != nil {
 			log.Fatal(err)
+		}
+	}
+
+	// Empty boot-irrelevant cache/log dirs (their blobs are deleted too).
+	for _, t := range strings.Split(*trim, ",") {
+		t = strings.TrimSpace(t)
+		if t == "" {
+			continue
+		}
+		if n := root.Lookup(t); n != nil && n.Type == oci.TypeDir {
+			n.Walk(func(_ string, c *oci.Node) error {
+				if c.Type == oci.TypeFile && c.Ref != "" {
+					_ = os.Remove(c.Ref)
+				}
+				return nil
+			})
+			n.Children = map[string]*oci.Node{}
 		}
 	}
 
@@ -112,13 +135,29 @@ func main() {
 		return func() (io.ReadCloser, error) { return store.Open(n.Ref) }
 	}
 	initrdSource := blob("usr/lib/modules/" + kver + "/initramfs.img")
+	initrdOnDisk = root.Lookup("usr/lib/modules/" + kver + "/initramfs.img").Ref
 	if *initrd != "" {
 		initrdSource = purefs.FileSource(*initrd)
+		initrdOnDisk = *initrd
 		log.Printf(">>> using tbox initramfs %s", *initrd)
 	} else {
 		log.Printf("!!! stock initramfs — live boot will stop without tbox modules")
 	}
 	sdBoot := blob("usr/lib/systemd/boot/efi/systemd-bootx64.efi")
+
+	// Blobs still needed after the EROFS pass; everything else is deleted
+	// the moment the EROFS writer has consumed it (rolling disk peak).
+	keepRefs := map[string]bool{}
+	for _, kp := range []string{
+		"usr/lib/modules/" + kver + "/vmlinuz",
+		"usr/lib/modules/" + kver + "/initramfs.img",
+		"usr/lib/systemd/boot/efi/systemd-bootx64.efi",
+	} {
+		if n := root.Lookup(kp); n != nil {
+			keepRefs[n.Ref] = true
+		}
+	}
+	erofsStore := &consumingStore{inner: store, keep: keepRefs}
 
 	// Live rootfs (EROFS; tbox-live mounts with -t auto).
 	sfsName := envID + ".rootfs.sfs"
@@ -128,36 +167,14 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := purefs.WriteErofs(root, store, sf, 0); err != nil {
+	if err := purefs.WriteErofs(root, erofsStore, sf, 0); err != nil {
 		log.Fatal(err)
 	}
 	if err := sf.Close(); err != nil {
 		log.Fatal(err)
 	}
 
-	// The EROFS now holds every file body; keep only the blobs the ESP/ISO
-	// stages still need and delete the rest so peak disk stays bounded.
-	keep := map[string]bool{}
-	for _, p := range []string{
-		"usr/lib/modules/" + kver + "/vmlinuz",
-		"usr/lib/modules/" + kver + "/initramfs.img",
-		"usr/lib/systemd/boot/efi/systemd-bootx64.efi",
-	} {
-		if n := root.Lookup(p); n != nil {
-			keep[n.Ref] = true
-		}
-	}
-	pruned := 0
-	root.Walk(func(_ string, n *oci.Node) error {
-		if n.Type == oci.TypeFile && n.Ref != "" && !keep[n.Ref] {
-			if os.Remove(n.Ref) == nil {
-				pruned++
-			}
-			n.Ref = ""
-		}
-		return nil
-	})
-	log.Printf(">>> pruned %d staged blobs", pruned)
+	// (blobs were consumed during the EROFS pass; only keepRefs remain)
 
 	// BLS entry — same template as cmd/tacklebox's liveKernelCmdline.
 	kargs := fmt.Sprintf(
@@ -186,6 +203,14 @@ func main() {
 	}
 
 	log.Printf(">>> authoring ISO")
+	if *useXorriso {
+		if err := assembleWithXorriso(*workdir, *out, *label, envID, espPath, sfsPath, sfsName, store, root, kver); err != nil {
+			log.Fatal(err)
+		}
+		st, _ := os.Stat(*out)
+		log.Printf(">>> done: %s (%.1f GB)", *out, float64(st.Size())/1e9)
+		return
+	}
 	if err := purefs.WriteIso(*out, *label, []purefs.IsoFile{
 		{Path: "/EFI/efi.img", Source: purefs.FileSource(espPath)},
 		{Path: "/EFI/BOOT/BOOTX64.EFI", Source: sdBoot},
@@ -197,4 +222,106 @@ func main() {
 	}
 	st, _ := os.Stat(*out)
 	log.Printf(">>> done: %s (%.1f GB)", *out, float64(st.Size())/1e9)
+}
+
+// consumingStore deletes DirStore blobs as they are read (Close), except
+// the keep set — a rolling disk profile for the EROFS pass.
+type consumingStore struct {
+	inner *oci.DirStore
+	keep  map[string]bool
+}
+
+func (c *consumingStore) Put(r io.Reader) (string, int64, error) { return c.inner.Put(r) }
+func (c *consumingStore) Open(ref string) (io.ReadCloser, error) {
+	rc, err := c.inner.Open(ref)
+	if err != nil {
+		return nil, err
+	}
+	if c.keep[ref] {
+		return rc, nil
+	}
+	return &deleteOnClose{ReadCloser: rc, path: ref}, nil
+}
+
+type deleteOnClose struct {
+	io.ReadCloser
+	path string
+}
+
+func (d *deleteOnClose) Close() error {
+	err := d.ReadCloser.Close()
+	_ = os.Remove(d.path)
+	return err
+}
+
+// assembleWithXorriso lays out iso-root with hardlinks (zero copies) and
+// runs xorriso with the exact production argument set from
+// internal/target.IsoTarget.assembleIso. Native-only convenience; the
+// browser path uses the pure writer.
+func assembleWithXorriso(workdir, out, label, envID, espPath, sfsPath, sfsName string, store *oci.DirStore, root *oci.Node, kver string) error {
+	isoRoot := filepath.Join(workdir, "iso-root")
+	_ = os.RemoveAll(isoRoot)
+	px := filepath.Join(isoRoot, "images", "pxeboot", envID)
+	for _, d := range []string{filepath.Join(isoRoot, "EFI", "BOOT"), px, filepath.Join(isoRoot, "LiveOS")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return err
+		}
+	}
+	place := func(dst string, srcRef string) error {
+		if err := os.Link(srcRef, dst); err == nil {
+			return nil
+		}
+		in, err := os.Open(srcRef)
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		o, err := os.Create(dst)
+		if err != nil {
+			return err
+		}
+		defer o.Close()
+		_, err = io.Copy(o, in)
+		return err
+	}
+	if err := place(filepath.Join(isoRoot, "EFI", "efi.img"), espPath); err != nil {
+		return err
+	}
+	sdb := root.Lookup("usr/lib/systemd/boot/efi/systemd-bootx64.efi")
+	if err := place(filepath.Join(isoRoot, "EFI", "BOOT", "BOOTX64.EFI"), sdb.Ref); err != nil {
+		return err
+	}
+	if err := place(filepath.Join(px, "vmlinuz"), root.Lookup("usr/lib/modules/"+kver+"/vmlinuz").Ref); err != nil {
+		return err
+	}
+	// initrd was placed into the ESP already; reuse the ESP staging source
+	// is gone, so link from the workdir copy the caller made — the ESP file
+	// itself is inside efi.img. Callers pass --initrd; find it next to the
+	// workdir if present.
+	if err := place(filepath.Join(px, "initrd.img"), initrdOnDisk); err != nil {
+		return err
+	}
+	if err := place(filepath.Join(isoRoot, "LiveOS", sfsName), sfsPath); err != nil {
+		return err
+	}
+
+	_ = os.Remove(out)
+	cmd := exec.Command("xorriso",
+		"-dev", "stdio:"+out,
+		"-volid", label,
+		"-rockridge", "on",
+		"-joliet", "on",
+		"-map", isoRoot, "/",
+		"-boot_image", "any", "platform_id=0xef",
+		"-boot_image", "any", "efi_path=EFI/efi.img",
+		"-boot_image", "any", "part_like_isohybrid=on",
+		"-commit",
+	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("xorriso: %w", err)
+	}
+	_ = os.RemoveAll(isoRoot)
+	return nil
 }

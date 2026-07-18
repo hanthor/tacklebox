@@ -79,6 +79,14 @@ func main() {
 		}
 	}
 
+	// Distro-agnostic live baseline: bake the passwordless live user into
+	// the squash so the desktop adapter's autologin works on first boot
+	// (livesys-scripts is absent on EL10/openSUSE images).
+	if err := purefs.EnsureLiveUser(root, store, "liveuser", 1000); err != nil {
+		log.Fatal(err)
+	}
+	log.Printf(">>> liveuser baked into rootfs")
+
 	// Kernel + stock initramfs + systemd-boot out of the image tree.
 	modDir := root.Lookup("usr/lib/modules")
 	if modDir == nil {

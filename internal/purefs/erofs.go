@@ -105,9 +105,14 @@ func WriteErofs(root *oci.Node, store oci.BlobStore, w io.Writer, buildTime int6
 			p := path.Join(prefix, name)
 			switch c.Type {
 			case oci.TypeHardlink:
+				// Targets may be any non-directory — rpm hardlinks
+				// symlinks to each other (/etc/grub2.cfg ↔ grub2-efi.cfg
+				// on EL10). A missing target is logged and skipped
+				// rather than failing a long build over one entry.
 				target, ok := byPath[c.Target]
-				if !ok || target.node.Type != oci.TypeFile {
-					return fmt.Errorf("hardlink %s: target %s missing", p, c.Target)
+				if !ok || target.node.Type == oci.TypeDir {
+					fmt.Printf("!!! erofs: dropping hardlink %s -> %s (target missing)\n", p, c.Target)
+					continue
 				}
 				parent.children[name] = target
 			case oci.TypeDir:

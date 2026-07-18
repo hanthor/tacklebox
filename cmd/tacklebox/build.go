@@ -1001,6 +1001,18 @@ func prePullAll(r recipe.MediaRecipe, userStore bool) error {
 	}
 	wg.Wait()
 
+	// Parallel pulls of images sharing layers race in podman's storage
+	// ("rename …tar-split.gz: no such file or directory" mid-commit).
+	// Retry stragglers serially — the competing layer is committed by
+	// now, so the second attempt is cheap and deterministic.
+	for i, err := range errs {
+		if err == nil {
+			continue
+		}
+		fmt.Printf(">>> Pre-pull retry (serial) for %s\n", unique[i])
+		errs[i] = pull(unique[i])
+	}
+
 	var failed []string
 	for i, err := range errs {
 		if err != nil {

@@ -96,24 +96,32 @@ write_lightdm() {
 	groupadd -f autologin && usermod -aG autologin "${LIVE_USER}" || true
 }
 
+# Ensure the chosen display manager actually RUNS on boot: enable its
+# service and make graphical.target the default. GDM/SDDM are usually
+# already enabled by desktop images, but greetd (niri/cosmic) frequently
+# is NOT — without this the system boots to multi-user.target and lands on
+# a text console (observed: niri live boot → TTY, tunaOS#678).
+enable_dm() {
+	local unit="$1"
+	systemctl list-unit-files "$unit" --no-legend 2> /dev/null | grep -q "$unit" || return 1
+	systemctl enable "$unit" 2> /dev/null || true
+	ln -sf "/usr/lib/systemd/system/${unit}" /etc/systemd/system/display-manager.service 2> /dev/null || true
+	systemctl set-default graphical.target 2> /dev/null ||
+		ln -sf /usr/lib/systemd/system/graphical.target /etc/systemd/system/default.target 2> /dev/null || true
+}
+
 case "${DESKTOP}" in
-gnome) write_gdm ;;
-kde) write_sddm ;;
-niri)
-	if command -v dms-greeter &>/dev/null; then
-		write_greetd "niri-session"
-		sed -i 's|^type = .*|type = "login_manager"|' /etc/greetd/config.toml 2>/dev/null || true
-	else
-		write_greetd "niri-session"
-	fi
-	;;
-cosmic) write_greetd "cosmic-session" ;;
+gnome) write_gdm; enable_dm gdm.service || enable_dm gdm3.service || true ;;
+kde) write_sddm; enable_dm sddm.service || true ;;
+niri) write_greetd "niri-session"; enable_dm greetd.service || true ;;
+cosmic) write_greetd "cosmic-session"; enable_dm greetd.service || true ;;
 xfce)
 	session="startxfce4"
 	compgen -G "/usr/share/wayland-sessions/xfce*.desktop" >/dev/null && session="xfce-wayland-session"
 	write_lightdm
 	write_greetd "${session}"
 	write_gdm
+	enable_dm lightdm.service || enable_dm greetd.service || enable_dm gdm.service || true
 	;;
 esac
 

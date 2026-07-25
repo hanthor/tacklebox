@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 )
 
 // Client speaks the small read-only slice of the distribution API the
@@ -28,7 +29,30 @@ type Client struct {
 	// boot-irrelevant junk (tmp/, caches) never reaches the blob store.
 	SkipBodies func(path string) bool
 
-	token string
+	// FetchAhead is how many layer downloads may be in flight ahead of the one
+	// being applied. Layers are still APPLIED strictly in order (overlay
+	// semantics depend on it); only the network waits overlap.
+	//
+	// These images run 60-125 layers, so the old hardcoded depth of 1 left the
+	// link idle for most of every decompress+apply. Each in-flight fetch holds
+	// an open response body, so this trades registry connections and peak
+	// buffering for throughput. 0 means DefaultFetchAhead.
+	FetchAhead int
+
+	tokenMu sync.Mutex
+	token   string
+}
+
+// DefaultFetchAhead is deliberately modest: enough to keep the link busy
+// across a decompress+apply, few enough that a slow apply cannot age out a
+// pile of open registry connections.
+const DefaultFetchAhead = 4
+
+func (c *Client) fetchAhead() int {
+	if c.FetchAhead > 0 {
+		return c.FetchAhead
+	}
+	return DefaultFetchAhead
 }
 
 func NewClient(base string) *Client {
@@ -64,7 +88,15 @@ const acceptManifest = "application/vnd.oci.image.index.v1+json, " +
 	"application/vnd.docker.distribution.manifest.list.v2+json, " +
 	"application/vnd.docker.distribution.manifest.v2+json"
 
+// authorize fetches (once) the pull token for repo. Concurrent layer fetches
+// call this from several goroutines, so the token is mutex-guarded and the
+// whole fetch happens under the lock — that also collapses the thundering herd
+// of token requests a cold cache would otherwise issue, one per in-flight
+// layer. (Before the fetch pipeline had depth, only one goroutine ever reached
+// here, and the unsynchronised field was benign.)
 func (c *Client) authorize(repo string) error {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
 	if c.token != "" {
 		return nil
 	}
@@ -87,6 +119,13 @@ func (c *Client) authorize(repo string) error {
 	return nil
 }
 
+// bearer returns the token for request signing without racing authorize.
+func (c *Client) bearer() string {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+	return c.token
+}
+
 func (c *Client) get(repo, path, accept string) (*http.Response, error) {
 	if err := c.authorize(repo); err != nil {
 		return nil, err
@@ -95,8 +134,8 @@ func (c *Client) get(repo, path, accept string) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	if tok := c.bearer(); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 	if accept != "" {
 		req.Header.Set("Accept", accept)

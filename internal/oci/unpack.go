@@ -60,42 +60,110 @@ type BlobStore interface {
 func (c *Client) Unpack(ref Ref, m *Manifest, store BlobStore, progress func(layer int, total int)) (*Node, error) {
 	root := &Node{Type: TypeDir, Mode: 0o755, Children: map[string]*Node{}}
 
-	// Pipeline: the next layer's fetch begins while the current one is
-	// decompressing/applying — overlay semantics still apply strictly in
-	// order, only the network wait overlaps CPU work. One layer of
-	// lookahead keeps peak buffering bounded.
-	type fetched struct {
-		body io.ReadCloser
-		err  error
-	}
-	next := make(chan fetched, 1)
-	fetch := func(i int) {
-		body, err := c.Blob(ref, m.Layers[i])
-		next <- fetched{body, err}
-	}
-	if len(m.Layers) > 0 {
-		go fetch(0)
-	}
+	// Pipeline: several layer fetches run ahead of the one being applied, so
+	// the link stays busy through each decompress+apply. Overlay semantics
+	// still hold — layers are APPLIED strictly in order; only the network
+	// waits overlap. Depth is Client.FetchAhead (see DefaultFetchAhead): at
+	// depth 1 (the old behaviour) a 100-layer image spent most of its wall
+	// clock with an idle connection.
+	pipe := newLayerPipeline(len(m.Layers), c.fetchAhead(), func(i int) (io.ReadCloser, error) {
+		return c.Blob(ref, m.Layers[i])
+	})
+	defer pipe.close()
+
 	for i, layer := range m.Layers {
 		if progress != nil {
 			progress(i, len(m.Layers))
 		}
-		f := <-next
-		if i+1 < len(m.Layers) {
-			go fetch(i + 1)
-		}
-		if f.err != nil {
-			return nil, fmt.Errorf("layer %d: %w", i, f.err)
-		}
-		if err := applyLayerFiltered(root, f.body, layer.MediaType, store, c.SkipBodies); err != nil {
-			f.body.Close()
+		body, err := pipe.next()
+		if err != nil {
 			return nil, fmt.Errorf("layer %d: %w", i, err)
 		}
-		if err := f.body.Close(); err != nil {
+		if err := applyLayerFiltered(root, body, layer.MediaType, store, c.SkipBodies); err != nil {
+			body.Close()
+			return nil, fmt.Errorf("layer %d: %w", i, err)
+		}
+		if err := body.Close(); err != nil {
 			return nil, fmt.Errorf("layer %d: %w", i, err)
 		}
 	}
 	return root, nil
+}
+
+// layerPipeline fetches up to depth layers concurrently and hands them back in
+// index order. Results are delivered in order regardless of completion order,
+// so callers keep strict overlay semantics while the network runs ahead.
+type layerPipeline struct {
+	slots   []chan fetchedLayer
+	launch  func(i int)
+	depth   int
+	n       int
+	cur     int
+	started int
+}
+
+type fetchedLayer struct {
+	body io.ReadCloser
+	err  error
+}
+
+func newLayerPipeline(n, depth int, get func(i int) (io.ReadCloser, error)) *layerPipeline {
+	if depth < 1 {
+		depth = 1
+	}
+	p := &layerPipeline{slots: make([]chan fetchedLayer, n), depth: depth, n: n}
+	for i := range p.slots {
+		p.slots[i] = make(chan fetchedLayer, 1)
+	}
+	// Prime: start the first `depth` fetches. Each completed slot triggers the
+	// next unstarted index from next(), keeping exactly depth in flight.
+	start := depth
+	if start > n {
+		start = n
+	}
+	p.launch = func(i int) {
+		go func() {
+			body, err := get(i)
+			p.slots[i] <- fetchedLayer{body, err}
+		}()
+	}
+	for i := 0; i < start; i++ {
+		p.launch(i)
+	}
+	p.started = start
+	return p
+}
+
+// next returns the next layer body in index order, launching one more fetch to
+// keep the window full.
+func (p *layerPipeline) next() (io.ReadCloser, error) {
+	if p.cur >= p.n {
+		return nil, io.EOF
+	}
+	f := <-p.slots[p.cur]
+	p.cur++
+	if p.started < p.n {
+		p.launch(p.started)
+		p.started++
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.body, nil
+}
+
+// close drains and closes any bodies fetched but never consumed — on an error
+// path the in-flight window would otherwise leak connections.
+func (p *layerPipeline) close() {
+	for i := p.cur; i < p.started; i++ {
+		select {
+		case f := <-p.slots[i]:
+			if f.body != nil {
+				f.body.Close()
+			}
+		default:
+		}
+	}
 }
 
 // UnpackOnto applies onto an EXISTING tree the layers of m whose digests
@@ -104,19 +172,31 @@ func (c *Client) Unpack(ref Ref, m *Manifest, store BlobStore, progress func(lay
 // customize-delta layers; skipping the base's digests applies exactly
 // the delta.
 func (c *Client) UnpackOnto(root *Node, ref Ref, m *Manifest, store BlobStore, skip map[string]bool, progress func(layer, total int)) error {
-	applied := 0
+	// Only the non-skipped layers are fetched, and they are pipelined the same
+	// way Unpack does it — this path was fully serial (fetch, apply, fetch,
+	// apply), which on the browser's live-overlay pull meant the link idled
+	// through every decompress.
+	var todo []int
 	for i, layer := range m.Layers {
-		if skip[layer.Digest] {
-			continue
+		if !skip[layer.Digest] {
+			todo = append(todo, i)
 		}
+	}
+	pipe := newLayerPipeline(len(todo), c.fetchAhead(), func(k int) (io.ReadCloser, error) {
+		return c.Blob(ref, m.Layers[todo[k]])
+	})
+	defer pipe.close()
+
+	applied := 0
+	for _, i := range todo {
 		if progress != nil {
 			progress(i, len(m.Layers))
 		}
-		body, err := c.Blob(ref, layer)
+		body, err := pipe.next()
 		if err != nil {
 			return fmt.Errorf("overlay layer %d: %w", i, err)
 		}
-		if err := applyLayerFiltered(root, body, layer.MediaType, store, c.SkipBodies); err != nil {
+		if err := applyLayerFiltered(root, body, m.Layers[i].MediaType, store, c.SkipBodies); err != nil {
 			body.Close()
 			return fmt.Errorf("overlay layer %d: %w", i, err)
 		}

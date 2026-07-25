@@ -211,3 +211,44 @@ func TestUnpackLive(t *testing.T) {
 		t.Error("expected usr/lib/modules in rootfs")
 	}
 }
+
+// TestUnpackOrderingWithDeepFetchAhead pins the invariant the fetch pipeline
+// must never break: layers are APPLIED in manifest order even when their
+// downloads finish out of order. Each layer overwrites the same file with its
+// index, so the final content is the last layer iff ordering held.
+//
+// The fake registry here deliberately serves EARLIER layers more slowly than
+// later ones, which is exactly the completion order a naive "apply whatever
+// arrives first" pipeline would get wrong.
+func TestUnpackOrderingWithDeepFetchAhead(t *testing.T) {
+	const n = 12
+	layers := make([][]byte, n)
+	for i := range layers {
+		layers[i] = zstdLayer(t, []tarEntry{
+			{hdr: tar.Header{Name: "seq.txt", Typeflag: tar.TypeReg}, body: []byte(fmt.Sprintf("%d\n", i))},
+		})
+	}
+	srv, m := fakeRegistry(t, layers)
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	c.FetchAhead = 6 // deep window: many fetches in flight at once
+	store := &MemStore{}
+	root, err := c.Unpack(Ref{Repo: "test/img", Tag: "latest"}, m, store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := root.Lookup("seq.txt")
+	if node == nil {
+		t.Fatal("seq.txt missing")
+	}
+	r, err := store.Open(node.Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	b, _ := io.ReadAll(r)
+	if want := fmt.Sprintf("%d\n", n-1); string(b) != want {
+		t.Fatalf("seq.txt = %q, want %q — layers applied out of order", b, want)
+	}
+}

@@ -54,6 +54,11 @@ func main() {
 
 	store := &oci.DirStore{Dir: filepath.Join(*workdir, "blobs")}
 	var root *oci.Node
+	// Kept beyond the pull branch so the live-overlay graft below can reuse
+	// them. Both stay nil on the --rootfs-tar path, which is already a
+	// customized tree and must not have an overlay grafted on top.
+	var client *oci.Client
+	var manifest *oci.Manifest
 	if *rootTar != "" {
 		log.Printf(">>> ingesting rootfs tar %s", *rootTar)
 		tf, err := os.Open(*rootTar)
@@ -77,6 +82,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+		client, manifest = c, m
 		log.Printf(">>> unpacking %d layers", len(m.Layers))
 		root, err = c.Unpack(ref, m, store, func(i, n int) {
 			fmt.Printf("\r    layer %d/%d", i+1, n)
@@ -102,6 +108,25 @@ func main() {
 			})
 			n.Children = map[string]*oci.Node{}
 		}
+	}
+
+	// Live-overlay parity artifact (tunaOS#673): apply the published
+	// customize delta for this variant, exactly as the browser build does.
+	// Until now only cmd/tbwasm grafted overlays, so nothing native ever
+	// exercised them and the two paths could drift unobserved — this shared
+	// call is what makes a native build byte-comparable with a browser one.
+	//
+	// Best-effort by design. The overlay is produced *by* the live customize
+	// step, so requiring one would deadlock every new variant; absence just
+	// means the plain baseline below.
+	if applied, err := purefs.GraftLiveOverlay(root, store, client, *image, manifest,
+		func(i, n int) { fmt.Printf("\r    overlay layer %d/%d", i+1, n) }); err != nil {
+		log.Fatal(err)
+	} else if applied {
+		fmt.Println()
+		log.Printf(">>> live overlay grafted")
+	} else {
+		log.Printf(">>> no live overlay for %s — plain baseline", *image)
 	}
 
 	// Distro-agnostic live baseline: bake the passwordless live user into

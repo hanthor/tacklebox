@@ -156,8 +156,10 @@ func EnsureAutologin(root *oci.Node, store oci.BlobStore, desktop, user string) 
 		if err := writeSDDM(root, store, user); err != nil {
 			return err
 		}
-		if !enableDM(root, "sddm.service") {
-			enableDM(root, "plasmalogin.service") // KDE 6.5+ rename
+		// Prefer PlasmaLogin where present (see kdeDMUnit), falling back the
+		// same way the gnome arm falls back from gdm to gdm3.
+		if !enableDM(root, kdeDMUnit(root)) {
+			enableDM(root, "sddm.service")
 		}
 	case "niri":
 		if err := writeGreetd(root, store, user, "niri-session"); err != nil {
@@ -241,26 +243,66 @@ func writeGDM(root *oci.Node, store oci.BlobStore, user string) error {
 	return nil
 }
 
+// kdeDMUnit reports which display-manager unit this image actually uses for
+// KDE. Plasma 6.6 renamed SDDM to PlasmaLogin: EL10 ships plasmalogin.service
+// (package plasma-login-manager) reading /etc/plasmalogin.conf.d, while
+// Fedora/Debian/Ubuntu still ship sddm.service reading /etc/sddm.conf.d.
+// Images can carry both — plasma-login-manager does not Obsolete sddm — and
+// there PlasmaLogin wins, because its scriptlet claims display-manager.service
+// first. Defaults to sddm when neither unit is present, leaving behaviour on
+// trees without either unchanged.
+//
+// The rename lands mid-stream rather than at a release boundary — yellowfin:kde
+// carried sddm on 2026-07-19 and plasmalogin by 07-22 — so which unit an image
+// has is a property of when it was built, not of its base. That is why this
+// detects rather than assumes, and why getting it wrong is silent: the ISO
+// boots to a password prompt that no blank password satisfies (tunaOS#833).
+func kdeDMUnit(root *oci.Node) string {
+	if unitPath(root, "plasmalogin.service") != "" {
+		return "plasmalogin.service"
+	}
+	return "sddm.service"
+}
+
+// writeSDDM writes KDE autologin for whichever of SDDM / PlasmaLogin the image
+// ships — both, when it ships both. They share the [Autologin] schema, so the
+// config carries over verbatim; PlasmaLogin is Wayland-only and has no
+// equivalent of SDDM's [General] DisplayServer / CompositorCommand, so those
+// stay sddm-only rather than being emitted as keys it would ignore.
+//
+// Writing only /etc/sddm.conf.d on an EL10 image is precisely the bug that
+// left the KDE live ISO sitting at a password prompt (tunaOS installer-smoke
+// run 29914643652): the file landed in a directory nothing reads.
 func writeSDDM(root *oci.Node, store oci.BlobStore, user string) error {
 	session := "plasma"
 	if root.Lookup("usr/share/wayland-sessions/plasmawayland.desktop") != nil &&
 		root.Lookup("usr/share/wayland-sessions/plasma.desktop") == nil {
 		session = "plasmawayland"
 	}
-	body := "[General]\nDisplayServer=wayland\nCompositorCommand=kwin_wayland --no-lockscreen\n\n" +
-		"[Autologin]\nUser=" + user + "\nSession=" + session + "\nRelogin=false\n"
-	// KDE 6.5+ renames sddm to plasmalogin, config directory included. Both
-	// names ship in the wild (yellowfin:kde carried sddm on 2026-07-19 and
-	// plasmalogin by 07-22), and a drop-in in the directory the image's DM
-	// doesn't read is inert — so write both rather than detect. Getting this
-	// wrong is silent: the ISO boots to a password prompt no blank password
-	// satisfies, which is exactly how the CI ISO failed (tunaOS#833).
-	for _, dir := range []string{"/etc/sddm.conf.d", "/etc/plasmalogin.conf.d"} {
-		if err := writeFileNode(root, store, dir+"/tbox-live-autologin.conf", body, 0o644); err != nil {
+	autologin := "[Autologin]\nUser=" + user + "\nSession=" + session + "\nRelogin=false\n"
+	sddmBody := "[General]\nDisplayServer=wayland\nCompositorCommand=kwin_wayland --no-lockscreen\n\n" + autologin
+
+	wrote := false
+	if unitPath(root, "plasmalogin.service") != "" {
+		if err := writeFileNode(root, store,
+			"/etc/plasmalogin.conf.d/tbox-live-autologin.conf", autologin, 0o644); err != nil {
 			return err
 		}
+		wrote = true
 	}
-	return nil
+	if unitPath(root, "sddm.service") != "" {
+		if err := writeFileNode(root, store,
+			"/etc/sddm.conf.d/tbox-live-autologin.conf", sddmBody, 0o644); err != nil {
+			return err
+		}
+		wrote = true
+	}
+	if wrote {
+		return nil
+	}
+	// Neither unit present (unusual for a KDE tree) — keep the historical
+	// behaviour rather than silently writing nothing at all.
+	return writeFileNode(root, store, "/etc/sddm.conf.d/tbox-live-autologin.conf", sddmBody, 0o644)
 }
 
 func writeGreetd(root *oci.Node, store oci.BlobStore, user, cmd string) error {
@@ -490,18 +532,32 @@ func dmAutologinActive(root *oci.Node, store oci.BlobStore, desktop string) bool
 		return hasActiveLine(readIfFile(root, store, "etc/gdm/custom.conf"), on) ||
 			hasActiveLine(readIfFile(root, store, "etc/gdm3/custom.conf"), on)
 	}
+	// Both SDDM and PlasmaLogin (Plasma 6.6's rename, EL10) must be consulted,
+	// and specifically the one this image will actually boot — see kdeDMUnit.
+	// Checking only sddm broke both ways: an overlay that configured
+	// plasmalogin read as "no autologin", so the skip that protects the
+	// overlay's richer config didn't fire and writeSDDM clobbered it; and
+	// stale sddm config on a plasmalogin image read as "already done", so
+	// the DM that actually runs never got configured at all.
 	sddm := func() bool {
 		on := kvWithValue("User")
-		// Both the sddm and the KDE 6.5+ plasmalogin config locations.
-		for _, dir := range []string{"etc/sddm.conf.d", "etc/plasmalogin.conf.d"} {
+		dirs := []string{"etc/sddm.conf.d", "etc/plasmalogin.conf.d"}
+		if kdeDMUnit(root) == "plasmalogin.service" {
+			// PlasmaLogin is what boots; sddm.conf.d is inert here and must
+			// not be read as evidence that autologin is configured.
+			dirs = []string{"etc/plasmalogin.conf.d"}
+		}
+		for _, dir := range dirs {
 			for _, name := range dirChildren(root, dir) {
 				if hasActiveLine(readIfFile(root, store, dir+"/"+name), on) {
 					return true
 				}
 			}
 		}
-		return hasActiveLine(readIfFile(root, store, "etc/sddm.conf"), on) ||
-			hasActiveLine(readIfFile(root, store, "etc/plasmalogin.conf"), on)
+		if kdeDMUnit(root) == "plasmalogin.service" {
+			return hasActiveLine(readIfFile(root, store, "etc/plasmalogin.conf"), on)
+		}
+		return hasActiveLine(readIfFile(root, store, "etc/sddm.conf"), on)
 	}
 	greetd := func() bool {
 		// [initial_session] is greetd's autologin table (vs a bare greeter).

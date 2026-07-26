@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	tacklebox "github.com/tuna-os/tacklebox"
@@ -17,9 +18,10 @@ import (
 // returning its ref. The derived ref is what gets squashed/extracted, so the
 // original image is never mutated.
 //
-// The derived tag is keyed by the image ID plus every script's content —
-// rerunning with unchanged inputs reuses the committed image (and therefore
-// the downstream squashfs cache); any edit produces a new tag.
+// The derived tag is keyed by the image ID plus the content of every file in
+// each script's directory — rerunning with unchanged inputs reuses the
+// committed image (and therefore the downstream squashfs cache); any edit,
+// including to a sourced sibling, produces a new tag.
 //
 // Each script runs as root with CAP_SYS_ADMIN and network (the dakota-iso
 // configure-live environment: enough for flatpak install, dbus-daemon,
@@ -111,20 +113,68 @@ func CustomizeLive(image string, scripts []string) (string, error) {
 	return tag, nil
 }
 
-// customizeCacheKey hashes the base image ID and every script's path + content
-// into the derived image tag. Content (not mtime) keying means CI rebuilds
-// from a fresh checkout still hit the cache when nothing changed.
+// customizeCacheKey hashes the base image ID and the full contents of every
+// directory holding a customize script — not just the named scripts — into the
+// derived image tag. The whole directory is what gets mounted, and scripts
+// source siblings out of it, so anything less under-keys the cache.
+//
+// Content (not mtime) keying means CI rebuilds from a fresh checkout still hit
+// the cache when nothing changed.
 func customizeCacheKey(imageID string, scripts []string) (string, error) {
 	h := sha256.New()
 	fmt.Fprintf(h, "%s\n", imageID)
+
+	// Execution order is part of the identity: the scripts run in sequence and
+	// a later one can depend on an earlier one's effects. Hash the ordered
+	// invocation list first, separately from directory contents — the
+	// per-directory dedup below would otherwise collapse two orderings of the
+	// same directory to the same key.
+	for i, s := range scripts {
+		fmt.Fprintf(h, "run:%d:%s\n", i, filepath.Base(s))
+	}
+
+	seenDir := map[string]bool{}
 	for _, s := range scripts {
-		data, err := os.ReadFile(s)
+		abs, err := filepath.Abs(s)
 		if err != nil {
-			return "", fmt.Errorf("read customize script %s: %w", s, err)
+			return "", fmt.Errorf("resolve customize script %s: %w", s, err)
 		}
-		fmt.Fprintf(h, "%s\n", filepath.Base(s))
-		h.Write(data)
-		h.Write([]byte{0})
+		// Hash the script's whole directory, not just the named script. The
+		// entire directory is mounted at /run/tbox-customize/<i>, and scripts
+		// are expected to source siblings from it — tunaOS's customize-live.sh
+		// sources desktop-<flavor>.sh that way. Keying on the named scripts
+		// alone meant editing an adapter did not change the tag, so the build
+		// silently reused the previous derived image and shipped the OLD live
+		// payload while reporting success. That cost a full verification cycle
+		// on 2026-07-26: a rebuilt ISO still carried the pre-fix autostart
+		// entry, with "[customize] derived image cache hit" the only clue.
+		dir := filepath.Dir(abs)
+		if seenDir[dir] {
+			continue
+		}
+		seenDir[dir] = true
+
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return "", fmt.Errorf("read customize dir %s: %w", dir, err)
+		}
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			if !e.IsDir() {
+				names = append(names, e.Name())
+			}
+		}
+		sort.Strings(names) // ReadDir order is not guaranteed stable across platforms
+		fmt.Fprintf(h, "dir:%s\n", filepath.Base(dir))
+		for _, name := range names {
+			data, err := os.ReadFile(filepath.Join(dir, name))
+			if err != nil {
+				return "", fmt.Errorf("read customize file %s: %w", name, err)
+			}
+			fmt.Fprintf(h, "%s\n", name)
+			h.Write(data)
+			h.Write([]byte{0})
+		}
 	}
 	return hex.EncodeToString(h.Sum(nil))[:16], nil
 }

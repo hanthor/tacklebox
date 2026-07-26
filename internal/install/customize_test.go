@@ -95,3 +95,38 @@ func TestCustomizeLiveNoScriptsPassthrough(t *testing.T) {
 		t.Fatalf("no-scripts case must return the original ref, got %s", ref)
 	}
 }
+
+// Regression: the key hashed only the named scripts, but the whole directory
+// is mounted and customize-live.sh sources desktop-<flavor>.sh out of it. So
+// editing an adapter left the tag unchanged, the build reported
+// "derived image cache hit", and shipped the previous live payload while
+// looking successful — the ISO silently did not contain the change.
+func TestCustomizeCacheKeyVariesBySourcedSibling(t *testing.T) {
+	dir := t.TempDir()
+	main := filepath.Join(dir, "customize-live.sh")
+	sibling := filepath.Join(dir, "desktop-cosmic.sh")
+	if err := os.WriteFile(main, []byte("source ./desktop-cosmic.sh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sibling, []byte("OnlyShowIn=COSMIC;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	before, err := customizeCacheKey("sha256:img", []string{main})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Edit ONLY the sibling — the named script is untouched.
+	if err := os.WriteFile(sibling, []byte("# no OnlyShowIn\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	after, err := customizeCacheKey("sha256:img", []string{main})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if before == after {
+		t.Fatalf("editing a sourced sibling must change the cache key; got %q both times", before)
+	}
+}

@@ -187,7 +187,7 @@ if ! command -v dracut >/dev/null 2>&1; then
   echo "image lacks dracut; cannot inject$missing — bake the modules into the image and set skip_initramfs_rebuild" >&2
   exit 3
 fi
-dracut --force --no-hostonly --reproducible --add "%s" --kver "$kver" /tbox-out/initramfs.img
+dracut --force --no-hostonly --reproducible --add "%s" --omit "tpm2-tss pcsc" --kver "$kver" /tbox-out/initramfs.img
 echo "TBOX_INITRAMFS=rebuilt, added:$missing"
 `, modList, modList, modList, modList)
 }

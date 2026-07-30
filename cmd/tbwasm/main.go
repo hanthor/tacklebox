@@ -14,10 +14,15 @@
 // file or a download stream. State (tree + blob store) lives between the
 // two calls so the GUI can show facts before committing to a build.
 //
-// Memory model (MVP): MemStore holds unpacked file bodies and the EROFS
-// is buffered before streaming — peak ≈ 2× unpacked rootfs. Fine for
-// base images; desktop images need the OPFS-backed store (tracked in
-// tunaOS#667).
+// Memory model: nothing the size of the image is held in linear memory.
+// Layer bodies stream to an OPFS arena during unpack, post-unpack tree
+// surgery (live overlay, liveuser, autologin) streams to a second arena,
+// the authored EROFS streams to a third, and reads slice back out of
+// OPFS 4 MiB at a time. The wasm heap holds the oci.Node tree, the EROFS
+// inode table and chunk buffers only — metadata scale, not content
+// scale. That distinction is load-bearing: wasm32 gives a single 32-bit
+// linear memory, so ~4 GiB is a hard ceiling with no host tunable and no
+// Memory64 escape (Go cannot target it) — tacklebox#156.
 package main
 
 import (
@@ -25,6 +30,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"runtime"
 	"strings"
 	"syscall/js"
 
@@ -46,8 +52,8 @@ func main() {
 	js.Global().Set("tboxIntrospect", js.FuncOf(introspect))
 	js.Global().Set("tboxBuildIso", js.FuncOf(buildIso))
 	js.Global().Set("tboxReset", js.FuncOf(func(js.Value, []js.Value) any {
-		if gStore != nil && gStore.arena != nil {
-			gStore.arena.Destroy()
+		if gStore != nil {
+			gStore.destroy()
 		}
 		gRoot, gStore = nil, nil
 		return nil
@@ -62,11 +68,17 @@ func promise(fn func() (any, error)) js.Value {
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
+					// Console, not just the rejection: app.js routes the
+					// rejection to log(), which writes to the DOM, so a
+					// headless run's only record of WHY a build died was a
+					// screenshot. The e2e greps console for engine death.
+					fmt.Println("!!! tbox panic:", r)
 					reject.Invoke(fmt.Sprint(r))
 				}
 			}()
 			v, err := fn()
 			if err != nil {
+				fmt.Println("!!! tbox failed:", err)
 				reject.Invoke(err.Error())
 				return
 			}
@@ -81,6 +93,27 @@ func emitProgress(stage string, i, n int) {
 	if cb := js.Global().Get("tboxOnProgress"); cb.Type() == js.TypeFunction {
 		cb.Invoke(stage, i, n)
 	}
+}
+
+// reportMem prints the two numbers that distinguish "the heap holds
+// metadata" from "the heap holds image content" — the distinction the
+// whole wasm32 ceiling turns on (tacklebox#156). Heap alone is ambiguous;
+// heap next to bytes-parked-in-OPFS is not. Cheap enough to leave in: a
+// ReadMemStats per phase boundary, not per file.
+func reportMem(phase string) {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	var layerMB, postMB int64
+	if gStore != nil {
+		if gStore.arena != nil {
+			layerMB = gStore.arena.off >> 20
+		}
+		if gStore.post != nil {
+			postMB = gStore.post.off >> 20
+		}
+	}
+	fmt.Printf("tbox: phase=%s heap=%dMB sys=%dMB objects=%d opfs(layers=%dMB post=%dMB)\n",
+		phase, ms.HeapAlloc>>20, ms.Sys>>20, ms.HeapObjects, layerMB, postMB)
 }
 
 func introspect(_ js.Value, args []js.Value) any {
@@ -110,11 +143,11 @@ func introspect(_ js.Value, args []js.Value) any {
 		if err != nil {
 			return nil, err
 		}
-		arena, err := newOpfsArena("tbox-arena.bin")
+		arena, err := newOpfsArena("tbox-arena.bin", "a")
 		if err != nil {
 			return nil, err
 		}
-		gStore = &hybridStore{arena: arena, mem: &oci.MemStore{}}
+		gStore = &hybridStore{arena: arena}
 		root, err := c.Unpack(ref, m, arena, func(i, n int) {
 			emitProgress("unpack", i+1, n)
 		})
@@ -127,6 +160,7 @@ func introspect(_ js.Value, args []js.Value) any {
 		gRoot = root
 		gClient, gManifest, gImage = c, m, image
 		gFacts = purefs.Introspect(root)
+		reportMem("unpack")
 		b, _ := json.Marshal(gFacts)
 		return string(b), nil
 	})
@@ -174,6 +208,7 @@ func buildIso(_ js.Value, args []js.Value) any {
 			fmt.Println("!!! live overlay skipped:", err)
 		}
 		emitProgress("overlay", 1, 1)
+		reportMem("overlay")
 
 		if err := purefs.EnsureLiveUser(root, store, "liveuser", 1000); err != nil {
 			return nil, err
@@ -194,7 +229,15 @@ func buildIso(_ js.Value, args []js.Value) any {
 		sfsName := envID + ".rootfs.sfs"
 
 		emitProgress("erofs", 0, 1)
-		sfsArena, err := newOpfsArena("tbox-erofs.img")
+		// WriteErofs reads bodies from both arenas, and the post arena is
+		// still open for writes at this point — OPFS does not commit an
+		// open writable stream, so authoring before this seal would read
+		// short.
+		if err := store.seal(); err != nil {
+			return nil, fmt.Errorf("seal post-unpack arena: %w", err)
+		}
+		reportMem("pre-erofs")
+		sfsArena, err := newOpfsArena("tbox-erofs.img", "s")
 		if err != nil {
 			return nil, err
 		}
@@ -202,12 +245,13 @@ func buildIso(_ js.Value, args []js.Value) any {
 		if err := purefs.WriteErofs(root, store, arenaWriter{sfsArena}, 0); err != nil {
 			return nil, err
 		}
+		reportMem("erofs")
 		sfsSize := sfsArena.off
 		if err := sfsArena.Seal(); err != nil {
 			return nil, err
 		}
 		sfsSource := func() (io.ReadCloser, error) {
-			return sfsArena.Open(fmt.Sprintf("a:0:%d", sfsSize))
+			return sfsArena.Open(fmt.Sprintf("s:0:%d", sfsSize))
 		}
 		emitProgress("erofs", 1, 1)
 
@@ -252,9 +296,26 @@ func buildIso(_ js.Value, args []js.Value) any {
 		if err != nil {
 			return nil, fmt.Errorf("no initramfs in image: %w", err)
 		}
-		sdSrc, _, err := blob("usr/lib/systemd/boot/efi/systemd-bootx64.efi")
-		if err != nil {
-			return nil, fmt.Errorf("image ships no systemd-boot (EL10-style images need a supplied one): %w", err)
+		// Debian ships ONLY systemd-bootx64.efi.signed — the sbat-signed PE,
+		// not a detached signature, so it boots as BOOTX64.EFI unchanged.
+		// Fedora-family images ship the unsigned name. Preferring the
+		// unsigned one and falling back keeps images that carry both on
+		// their existing artifact. Nothing Debian-based had ever reached
+		// this line before tacklebox#156 was fixed: the OOM in EROFS
+		// authoring came first, so a hard error here read as "no Debian
+		// edition builds" rather than "wrong filename".
+		var sdSrc func() (io.ReadCloser, error)
+		for _, cand := range []string{
+			"usr/lib/systemd/boot/efi/systemd-bootx64.efi",
+			"usr/lib/systemd/boot/efi/systemd-bootx64.efi.signed",
+		} {
+			if src, _, berr := blob(cand); berr == nil {
+				sdSrc = src
+				break
+			}
+		}
+		if sdSrc == nil {
+			return nil, fmt.Errorf("image ships no systemd-boot at usr/lib/systemd/boot/efi/systemd-bootx64.efi[.signed] (EL10-style images need a supplied one)")
 		}
 
 		kargs := fmt.Sprintf(
@@ -311,6 +372,7 @@ func buildIso(_ js.Value, args []js.Value) any {
 			return nil, err
 		}
 		emitProgress("iso", 1, 1)
+		reportMem("iso")
 		return jw.written, nil
 	})
 }

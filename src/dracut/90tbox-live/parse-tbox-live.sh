@@ -47,46 +47,39 @@ if [ "$tboxroot" = "1" ]; then
     # 29627295208). A file survives any characters.
     printf '%s' "${root#tbox:}" > /run/tbox-live-root.dev
 
-    # A stock initramfs only contains the hook directories its own modules
-    # asked for at build time. On the appended-overlay path (the browser
-    # builder, and purebuild without --initrd) we ride an initrd that was
-    # never built with us in it, and EL10's ships no initqueue tree at all.
-    # Neither initqueue nor wait_for_dev creates $hookdir — they `mv` and
-    # redirect straight into it — so every hook below silently failed to
-    # install while dracut-cmdline still reported success:
+    # Whether we can use initqueue at all comes down to one thing: can we
+    # write into $hookdir. On the appended-overlay path (the browser
+    # builder, and purebuild without --initrd) we ride a stock initrd that
+    # was never built with us in it, so our queue directories were never
+    # created — and on EL10 they cannot be created afterwards:
     #
-    #   mv: cannot move '/tmp/352-tbox-live-root.sh' to
+    #   mkdir: cannot create directory '/lib/dracut/hooks/initqueue':
+    #   Read-only file system                       (run 30628621563)
+    #
+    # $hookdir is /lib/dracut/hooks there, which is on the image's
+    # read-only /usr. The existing fallback below tested the wrong thing:
+    # it asks whether initqueue EXISTS. It does — /usr/sbin/initqueue —
+    # and it then fails on a `mv` into a directory nothing can create:
+    #
+    #   mv: cannot move '/tmp/367-tbox-live-root.sh' to
     #       '/lib/dracut/hooks/initqueue/settled/tbox-live-root.sh':
     #       No such file or directory
     #
-    # tbox-live-root then never ran, and the boot fell through to the
-    # image's own bootc root setup, which died on
+    # tbox-live-root never ran, and the boot fell through to the image's
+    # own bootc root setup, dying on
     # `overlayfs: failed to resolve '/run/rootfsbase': -2`. That is the
-    # whole of tacklebox#166 — the overlay was unit-tested and had never
-    # been booted. First observed on tacklebox run 30626431386
-    # (yellowfin:niri, purebuild + pure-iso boot gate).
+    # whole of tacklebox#166: this path was unit-tested and had never been
+    # booted. Three boots of yellowfin:niri failed here before the hook
+    # was made to print $hookdir and the mkdir errno.
     #
-    # Creating the directories is safe on the built-in path too: dracut
-    # made them already, so this is a no-op there.
+    # Try to create them (a no-op on the built-in path, where dracut made
+    # them at build time), then decide from what actually exists.
+    hd=${hookdir:-/lib/dracut/hooks}
     for d in "" /settled /finished /online /timeout; do
-        mkdir -p "${hookdir:-/lib/dracut/hooks}/initqueue$d" ||
-            echo "!!!tbox: mkdir ${hookdir:-/lib/dracut/hooks}/initqueue$d FAILED" > /dev/console
+        mkdir -p "$hd/initqueue$d" 2> /dev/null || true
     done
-    mkdir -p "${hookdir:-/lib/dracut/hooks}/emergency" /etc/udev/rules.d
-
-    # TEMPORARY (tacklebox#166). Two boots have now failed with the exact
-    # mv error the mkdir above exists to prevent, on ISOs whose initrd was
-    # verified to carry this fixed script and no other copy. One of the
-    # facts I am inferring is wrong, so print them instead: which script is
-    # running, what dracut thinks hookdir is, and whether the directory is
-    # there immediately before initqueue writes into it. Remove once the
-    # boot is green.
-    {
-        echo "!!!tbox: parse hook rev=hookdir-mkdir hookdir=[${hookdir:-UNSET}]"
-        echo "!!!tbox: ls -ld ${hookdir:-/lib/dracut/hooks}/initqueue/settled"
-        ls -ld "${hookdir:-/lib/dracut/hooks}/initqueue/settled" 2>&1
-        echo "!!!tbox: initqueue=$(command -v initqueue || echo none) /sbin/initqueue=$([ -x /sbin/initqueue ] && echo yes || echo no)"
-    } > /dev/console 2>&1
+    mkdir -p "$hd/emergency" 2> /dev/null || true
+    mkdir -p /etc/udev/rules.d 2> /dev/null || true
 
     # Assemble the live root on the first udev-settled initqueue pass
     # where the ISO device exists (USB/CD enumeration can take a while).
@@ -95,19 +88,32 @@ if [ "$tboxroot" = "1" ]; then
     # moment a finished check passes, and waiting on the device would
     # let it exit before the settled queue (and thus our mounts) ever
     # ran on a device that was present from the start.
-    # initqueue is only present when a dracut module requested it at BUILD
-    # time (dracut_need_initqueue). A tbox-appended-overlay initramfs (the
-    # browser builder path) rides a stock initrd that may not include it —
-    # fall back to a udev rule that runs tbox-live-root when the labeled
-    # device appears. Both paths converge on the /run done marker.
-    if command -v initqueue > /dev/null 2>&1; then
+    #
+    # The test is the DIRECTORY, not the command: see above.
+    if [ -d "$hd/initqueue/settled" ] && command -v initqueue > /dev/null 2>&1; then
         initqueue --settled --unique /sbin/tbox-live-root
-    elif [ -x /sbin/initqueue ]; then
+        # wait_for_dev writes into $hookdir too, so it is only meaningful
+        # on this branch. On the fallback branch tbox-live-root has
+        # already run synchronously and the marker is either there or the
+        # boot is lost anyway.
+        wait_for_dev -n /run/tacklebox-live-done
+    elif [ -d "$hd/initqueue/settled" ] && [ -x /sbin/initqueue ]; then
         /sbin/initqueue --settled --unique /sbin/tbox-live-root
+        wait_for_dev -n /run/tacklebox-live-done
     else
-        # No initqueue: drive tbox-live-root from udev directly. The label
-        # symlink appearing is the trigger; the script is idempotent and
-        # writes the done marker itself.
+        # No usable queue directory (or no initqueue): drive
+        # tbox-live-root from udev directly. The label symlink appearing
+        # is the trigger; the script is idempotent and writes the done
+        # marker itself.
+        #
+        # Nothing waits for the marker on this branch, deliberately. udev
+        # is not running yet — systemd-udevd starts after
+        # dracut-cmdline.service — so blocking here would deadlock until
+        # timeout and the rule could never fire. The ordering that makes
+        # this safe is in tbox-live-generator: sysroot.mount is
+        # After=dracut-initqueue.service, which runs once udev has
+        # settled, by which time the rule has fired. The synchronous call
+        # below only covers a device that was already enumerated.
         {
             echo 'SUBSYSTEM=="block", ACTION=="add|change", ENV{ID_FS_LABEL}!="", RUN+="/sbin/tbox-live-root"'
             echo 'SUBSYSTEM=="block", KERNEL=="sr[0-9]*", ACTION=="add|change", RUN+="/sbin/tbox-live-root"'
@@ -117,5 +123,4 @@ if [ "$tboxroot" = "1" ]; then
         # Also try immediately in case the device is already present.
         /sbin/tbox-live-root 2> /dev/null || true
     fi
-    wait_for_dev -n /run/tacklebox-live-done
 fi

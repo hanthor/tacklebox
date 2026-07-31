@@ -69,9 +69,24 @@ if [ "$tboxroot" = "1" ]; then
     # Creating the directories is safe on the built-in path too: dracut
     # made them already, so this is a no-op there.
     for d in "" /settled /finished /online /timeout; do
-        mkdir -p "${hookdir:-/lib/dracut/hooks}/initqueue$d"
+        mkdir -p "${hookdir:-/lib/dracut/hooks}/initqueue$d" ||
+            echo "!!!tbox: mkdir ${hookdir:-/lib/dracut/hooks}/initqueue$d FAILED" > /dev/console
     done
     mkdir -p "${hookdir:-/lib/dracut/hooks}/emergency" /etc/udev/rules.d
+
+    # TEMPORARY (tacklebox#166). Two boots have now failed with the exact
+    # mv error the mkdir above exists to prevent, on ISOs whose initrd was
+    # verified to carry this fixed script and no other copy. One of the
+    # facts I am inferring is wrong, so print them instead: which script is
+    # running, what dracut thinks hookdir is, and whether the directory is
+    # there immediately before initqueue writes into it. Remove once the
+    # boot is green.
+    {
+        echo "!!!tbox: parse hook rev=hookdir-mkdir hookdir=[${hookdir:-UNSET}]"
+        echo "!!!tbox: ls -ld ${hookdir:-/lib/dracut/hooks}/initqueue/settled"
+        ls -ld "${hookdir:-/lib/dracut/hooks}/initqueue/settled" 2>&1
+        echo "!!!tbox: initqueue=$(command -v initqueue || echo none) /sbin/initqueue=$([ -x /sbin/initqueue ] && echo yes || echo no)"
+    } > /dev/console 2>&1
 
     # Assemble the live root on the first udev-settled initqueue pass
     # where the ISO device exists (USB/CD enumeration can take a while).

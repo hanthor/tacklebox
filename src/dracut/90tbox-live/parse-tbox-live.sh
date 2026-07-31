@@ -47,6 +47,32 @@ if [ "$tboxroot" = "1" ]; then
     # 29627295208). A file survives any characters.
     printf '%s' "${root#tbox:}" > /run/tbox-live-root.dev
 
+    # A stock initramfs only contains the hook directories its own modules
+    # asked for at build time. On the appended-overlay path (the browser
+    # builder, and purebuild without --initrd) we ride an initrd that was
+    # never built with us in it, and EL10's ships no initqueue tree at all.
+    # Neither initqueue nor wait_for_dev creates $hookdir — they `mv` and
+    # redirect straight into it — so every hook below silently failed to
+    # install while dracut-cmdline still reported success:
+    #
+    #   mv: cannot move '/tmp/352-tbox-live-root.sh' to
+    #       '/lib/dracut/hooks/initqueue/settled/tbox-live-root.sh':
+    #       No such file or directory
+    #
+    # tbox-live-root then never ran, and the boot fell through to the
+    # image's own bootc root setup, which died on
+    # `overlayfs: failed to resolve '/run/rootfsbase': -2`. That is the
+    # whole of tacklebox#166 — the overlay was unit-tested and had never
+    # been booted. First observed on tacklebox run 30626431386
+    # (yellowfin:niri, purebuild + pure-iso boot gate).
+    #
+    # Creating the directories is safe on the built-in path too: dracut
+    # made them already, so this is a no-op there.
+    for d in "" /settled /finished /online /timeout; do
+        mkdir -p "${hookdir:-/lib/dracut/hooks}/initqueue$d"
+    done
+    mkdir -p "${hookdir:-/lib/dracut/hooks}/emergency" /etc/udev/rules.d
+
     # Assemble the live root on the first udev-settled initqueue pass
     # where the ISO device exists (USB/CD enumeration can take a while).
     # The initqueue "finished" condition must be the DONE MARKER our

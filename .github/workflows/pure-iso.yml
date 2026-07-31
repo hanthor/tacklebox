@@ -1,0 +1,185 @@
+# Builds a live TunaOS ISO for one published edition with cmd/purebuild —
+# the pure-Go path — and boots it under QEMU/OVMF.
+#
+# Why this exists, and why it is not just another ISO workflow:
+#
+#   * purebuild is the NATIVE proving harness for the same packages the
+#     browser builder runs in WASM (internal/oci, internal/purefs). A green
+#     run here is evidence about the ISO9660 writer, the EROFS author and
+#     the OCI puller that iso-builder ships, measured without a browser,
+#     without OPFS and without a wasm32 address space in the way.
+#   * The auto-initrd path (no --initrd) appends the embedded tbox overlay
+#     to the image's stock initramfs — no dracut, no podman, no sudo for
+#     the build itself. That overlay is exactly what tacklebox#166 records
+#     as UNPROVEN AT BOOT: only a unit test backs it. The boot gate below
+#     is the first real evidence either way, which is why it defaults on.
+#
+# What this workflow does NOT prove:
+#
+#   * It is not the builder behind tunaOS's installer-smoke pass. That
+#     harness runs `just iso ... dev=1`, which rebuilds the image locally
+#     with sshd enabled and assembles it with build-iso-tacklebox.sh
+#     (podman + squashfs + xorriso). An ISO from here is a DIFFERENT
+#     builder over the PUBLISHED image, so it has no SSH and cannot be fed
+#     to `iso-e2e.sh --ssh-only` unmodified.
+#   * It says nothing about the browser full-matrix. Those cells move only
+#     when iso-builder's own run asserts them.
+name: pure-iso
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Published edition to build, <repo>:<tag>"
+        required: false
+        default: "tuna-os/yellowfin:niri"
+      boot_test:
+        description: "Boot the ISO under QEMU/OVMF and require a login prompt"
+        required: false
+        default: true
+        type: boolean
+      skip_upload:
+        description: "Build and boot but do not publish to R2"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: pure-iso-${{ github.event.inputs.image }}
+  cancel-in-progress: true
+
+jobs:
+  pure-iso:
+    runs-on: ubuntu-latest
+    # The pull, the EROFS pass and a TCG boot are each minutes; a large
+    # edition plus a 900s boot gate needs headroom over the 60 iso-smoke
+    # gets.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      # Job-level `if:` cannot see secrets, so the fork/no-secrets case is
+      # detected through env like the other publishing workflows here.
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      IMAGE: ${{ github.event.inputs.image || 'tuna-os/yellowfin:niri' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      # Measured on these runners: / has ~88 GB free before any reclaim and
+      # /mnt is the SAME filesystem (df -h / /mnt prints /dev/root twice),
+      # so this is about headroom for the blob store plus the EROFS image
+      # plus the ISO — not about moving work to a second disk.
+      - name: free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main as of 2026-06-09
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      # No podman, no xorriso, no squashfs-tools: purebuild authors
+      # everything itself. systemd-boot-efi is the one real dependency —
+      # EL10 images ship no systemd-bootx64.efi, so purebuild falls back to
+      # the host copy exactly as production ExtractEFIBinary does, and
+      # yellowfin is EL10-family. qemu/ovmf are for the boot gate.
+      - name: install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            systemd-boot systemd-boot-efi \
+            qemu-system-x86 ovmf rclone
+
+      - name: build purebuild
+        run: go build -o purebuild ./cmd/purebuild
+
+      - name: derive names
+        run: |
+          repo="${IMAGE%:*}"; tag="${IMAGE##*:}"
+          slug="$(basename "$repo")-${tag}"
+          echo "SLUG=${slug}" >> "$GITHUB_ENV"
+          echo "ISO=${PWD}/out/pure-${slug}.iso" >> "$GITHUB_ENV"
+          mkdir -p out
+
+      - name: build ISO (pure-Go, auto tbox initrd overlay)
+        run: |
+          ./purebuild \
+            --image "$IMAGE" \
+            --out "$ISO" \
+            --label "$(echo "${SLUG}" | tr 'a-z-' 'A-Z_' | cut -c1-32)" \
+            --workdir "${RUNNER_TEMP}/purebuild"
+
+      # Deliberately not `tacklebox verify`: that reads the multi-env
+      # recipe metadata a purebuild ISO never writes, so a failure there
+      # would read as a build failure when it is a harness mismatch. What
+      # is checked is what holds for any ISO9660 image — and it is a FORMAT
+      # proof only. The boot gate below is the proof that matters.
+      - name: verify ISO format
+        run: |
+          ls -l "$ISO"
+          size=$(stat -c%s "$ISO")
+          [ "$size" -gt 104857600 ] || { echo "::error::ISO is only ${size} bytes"; exit 1; }
+          magic=$(dd if="$ISO" bs=2048 skip=16 count=1 status=none | dd bs=1 skip=1 count=5 status=none)
+          [ "$magic" = "CD001" ] || { echo "::error::no CD001 at sector 16, got '${magic}'"; exit 1; }
+          echo ">>> ${ISO} ${size} bytes, CD001 present"
+
+      # The link this workflow is really for. tacklebox#166: the embedded
+      # initrd overlay has never been booted, only unit-tested. Anything
+      # short of a login prompt here leaves that issue open.
+      - name: live boot gate (QEMU/OVMF to login)
+        if: ${{ github.event.inputs.boot_test != 'false' }}
+        run: sudo ./scripts/test-live-boot.sh "$ISO" 900
+
+      - name: upload boot log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pure-iso-${{ env.SLUG }}-boot-log
+          path: qemu-live-boot.log
+          if-no-files-found: ignore
+
+      - name: checksum
+        run: |
+          cd out && sha256sum "pure-${SLUG}.iso" > "SHA256SUMS-${SLUG}" && cat "SHA256SUMS-${SLUG}"
+
+      - name: upload to R2
+        if: ${{ github.event.inputs.skip_upload != 'true' && env.R2_BUCKET != '' }}
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_REGION: auto
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          STAMP="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          PREFIX="R2:${R2_BUCKET}/tacklebox"
+          rclone copyto --log-level INFO --checksum --s3-no-check-bucket \
+            "$ISO" "${PREFIX}/pure-${SLUG}-${STAMP}.iso"
+          rclone copyto --log-level INFO --s3-no-check-bucket \
+            "$ISO" "${PREFIX}/pure-${SLUG}-latest.iso"
+          rclone copyto --log-level INFO --s3-no-check-bucket \
+            "out/SHA256SUMS-${SLUG}" "${PREFIX}/pure-${SLUG}-SHA256SUMS-${STAMP}"
+          # rclone's exit code has been trusted before and was wrong; ask the
+          # bucket what it actually holds (iso-builder#41).
+          remote=$(rclone size --json --s3-no-check-bucket "${PREFIX}/pure-${SLUG}-latest.iso" | python3 -c 'import sys,json;print(json.load(sys.stdin)["bytes"])')
+          local=$(stat -c%s "$ISO")
+          [ "$remote" = "$local" ] || { echo "::error::R2 object is ${remote} bytes, ISO is ${local}"; exit 1; }
+          echo "- https://download.tunaos.org/tacklebox/pure-${SLUG}-latest.iso (${local} bytes, verified)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "## pure-iso ${IMAGE}"
+            echo ""
+            ls -lh "$ISO" 2>/dev/null | awk '{print "- ISO: `" $NF "` (" $5 ")"}' || echo "- ISO: not produced"
+            echo "- builder: cmd/purebuild (pure-Go, auto tbox initrd overlay)"
+            echo "- boot gate: ${{ github.event.inputs.boot_test != 'false' && 'run' || 'SKIPPED — boots-live stays untested' }}"
+          } >> "$GITHUB_STEP_SUMMARY"

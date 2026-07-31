@@ -94,7 +94,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             systemd-boot systemd-boot-efi \
-            qemu-system-x86 ovmf rclone
+            qemu-system-x86 ovmf rclone \
+            dracut-core
 
       - name: build purebuild
         run: go build -o purebuild ./cmd/purebuild
@@ -114,6 +115,33 @@ jobs:
             --out "$ISO" \
             --label "$(echo "${SLUG}" | tr 'a-z-' 'A-Z_' | cut -c1-32)" \
             --workdir "${RUNNER_TEMP}/purebuild"
+
+      # Which copy of the parse hook actually boots. The combined initrd is
+      # overlay-then-stock, and the segment order is forced (the kernel
+      # allows exactly one trailing compressed segment), so if the image
+      # bakes an older tbox-live module the STOCK copy wins and the overlay
+      # is inert. Run 30626910583 fixed the hook and booted identically to
+      # the run before it, which is what that would look like. Non-fatal:
+      # this is evidence for tacklebox#166, not a gate.
+      - name: inspect the combined initrd
+        if: always()
+        run: |
+          img="${RUNNER_TEMP}/purebuild/initrd-tbox.img"
+          [ -f "$img" ] || { echo "no combined initrd (built with --initrd?)"; exit 0; }
+          echo "### every dracut cmdline hook and tbox path in the booted initrd"
+          lsinitrd "$img" 2>/dev/null | grep -E "dracut/hooks|tbox" || echo "(none listed)"
+          echo "### does the hook that runs contain the hookdir mkdir fix?"
+          for p in usr/lib/dracut/hooks/cmdline/30-parse-tbox-live.sh \
+                   lib/dracut/hooks/cmdline/30-parse-tbox-live.sh \
+                   var/lib/dracut/hooks/cmdline/30-parse-tbox-live.sh; do
+            body=$(lsinitrd -f "$p" "$img" 2>/dev/null) || continue
+            [ -n "$body" ] || continue
+            if printf '%s' "$body" | grep -q 'tacklebox#166'; then
+              echo "$p: FIXED copy"
+            else
+              echo "$p: STALE copy — this is the image's baked-in module overriding the overlay"
+            fi
+          done
 
       # Deliberately not `tacklebox verify`: that reads the multi-env
       # recipe metadata a purebuild ISO never writes, so a failure there

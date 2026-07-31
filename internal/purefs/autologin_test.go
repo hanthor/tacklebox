@@ -152,6 +152,105 @@ func TestEnsureAutologinKDEPlasmaWayland(t *testing.T) {
 	}
 }
 
+// Plasma 6.6 renamed SDDM to PlasmaLogin. On EL10 the image ships
+// plasmalogin.service and reads /etc/plasmalogin.conf.d — writing to
+// /etc/sddm.conf.d there is a no-op that leaves the live ISO at a password
+// prompt (tunaOS installer-smoke run 29914643652).
+func TestEnsureAutologinKDEPlasmaLogin(t *testing.T) {
+	root, store := newImageTree(t,
+		[]string{"usr/share/wayland-sessions/plasma.desktop"},
+		[]string{"plasmalogin.service"})
+	if err := EnsureAutologin(root, store, "kde", "liveuser"); err != nil {
+		t.Fatal(err)
+	}
+	conf := readNode(t, store, root, "etc/plasmalogin.conf.d/tbox-live-autologin.conf")
+	for _, want := range []string{"[Autologin]", "User=liveuser", "Session=plasma"} {
+		if !strings.Contains(conf, want) {
+			t.Errorf("plasmalogin conf missing %q:\n%s", want, conf)
+		}
+	}
+	// PlasmaLogin is Wayland-only and has no [General] DisplayServer /
+	// CompositorCommand — don't emit keys it would ignore.
+	if strings.Contains(conf, "CompositorCommand") {
+		t.Errorf("plasmalogin conf carries sddm-only [General] keys:\n%s", conf)
+	}
+	mustSymlink(t, root, "etc/systemd/system/graphical.target.wants/plasmalogin.service",
+		"/usr/lib/systemd/system/plasmalogin.service")
+	mustSymlink(t, root, "etc/systemd/system/display-manager.service",
+		"/usr/lib/systemd/system/plasmalogin.service")
+}
+
+// plasma-login-manager does not Obsolete sddm, so EL10 images carry both
+// units. PlasmaLogin is what actually boots (its scriptlet claims
+// display-manager.service first), so it must be the one enabled — but the
+// sddm config is still written, since sddm is installed and harmless.
+func TestEnsureAutologinKDEBothUnitsPrefersPlasmaLogin(t *testing.T) {
+	root, store := newImageTree(t,
+		[]string{"usr/share/wayland-sessions/plasma.desktop"},
+		[]string{"sddm.service", "plasmalogin.service"})
+	if err := EnsureAutologin(root, store, "kde", "liveuser"); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{
+		"etc/plasmalogin.conf.d/tbox-live-autologin.conf",
+		"etc/sddm.conf.d/tbox-live-autologin.conf",
+	} {
+		if !strings.Contains(readNode(t, store, root, p), "User=liveuser") {
+			t.Errorf("%s missing autologin", p)
+		}
+	}
+	mustSymlink(t, root, "etc/systemd/system/display-manager.service",
+		"/usr/lib/systemd/system/plasmalogin.service")
+}
+
+// Regression, direction 1: an overlay that configured PlasmaLogin must be
+// detected as active. Previously only sddm.conf.d was inspected, so this read
+// as "no autologin" and writeSDDM clobbered the overlay's richer config —
+// the exact case the skip exists to protect.
+func TestEnsureAutologinPreservesOverlayPlasmaLogin(t *testing.T) {
+	root, store := newImageTree(t,
+		[]string{"usr/share/wayland-sessions/plasma.desktop"},
+		[]string{"plasmalogin.service"})
+	overlay := "[Autologin]\nUser=liveuser\nSession=plasma\nRelogin=true\n"
+	addFile(t, store, root, "etc/plasmalogin.conf.d/live-autologin.conf", overlay, 0o644, 0, 0)
+	if err := EnsureAutologin(root, store, "kde", "liveuser"); err != nil {
+		t.Fatal(err)
+	}
+	if root.Lookup("etc/plasmalogin.conf.d/tbox-live-autologin.conf") != nil {
+		t.Error("wrote our conf on top of the overlay's — should have skipped")
+	}
+	if got := readNode(t, store, root, "etc/plasmalogin.conf.d/live-autologin.conf"); got != overlay {
+		t.Errorf("overlay plasmalogin conf changed:\n%s", got)
+	}
+	// The pre-fix failure was subtler than an overwritten file: not seeing the
+	// overlay's config, we fell through and wrote a *competing* autologin into
+	// sddm.conf.d. Harmless-looking, but it means the skip silently stopped
+	// protecting the overlay, so assert we wrote no second config at all.
+	if root.Lookup("etc/sddm.conf.d/tbox-live-autologin.conf") != nil {
+		t.Error("fell through and wrote a competing sddm conf despite the overlay")
+	}
+}
+
+// Regression, direction 2: stale sddm.conf.d on an image that boots
+// PlasmaLogin must NOT read as "autologin already configured". Previously it
+// did, so we early-returned and the DM that actually runs was never
+// configured — a greeter, with a config file sitting right there suggesting
+// otherwise.
+func TestEnsureAutologinStaleSDDMConfDoesNotSkipPlasmaLogin(t *testing.T) {
+	root, store := newImageTree(t,
+		[]string{"usr/share/wayland-sessions/plasma.desktop"},
+		[]string{"sddm.service", "plasmalogin.service"})
+	addFile(t, store, root, "etc/sddm.conf.d/live-autologin.conf",
+		"[Autologin]\nUser=someoneelse\nSession=plasma\n", 0o644, 0, 0)
+	if err := EnsureAutologin(root, store, "kde", "liveuser"); err != nil {
+		t.Fatal(err)
+	}
+	conf := readNode(t, store, root, "etc/plasmalogin.conf.d/tbox-live-autologin.conf")
+	if !strings.Contains(conf, "User=liveuser") {
+		t.Errorf("plasmalogin never configured despite stale sddm conf:\n%s", conf)
+	}
+}
+
 func TestEnsureAutologinNiri(t *testing.T) {
 	root, store := newImageTree(t,
 		[]string{"usr/share/wayland-sessions/niri.desktop"},

@@ -54,22 +54,56 @@ write_gdm() {
 	done
 }
 
-write_sddm() {
-	local session="plasma"
-	if [[ -f /usr/share/wayland-sessions/plasmawayland.desktop && ! -f /usr/share/wayland-sessions/plasma.desktop ]]; then
-		session="plasmawayland"
+# Plasma 6.6 renamed SDDM to PlasmaLogin: EL10 ships plasma-login-manager
+# (plasmalogin.service, reading /etc/plasmalogin.conf.d) where Fedora, Debian
+# and Ubuntu still ship sddm.service and /etc/sddm.conf.d. It does not
+# Obsolete sddm, so images carry both units and PlasmaLogin wins — its
+# scriptlet claims display-manager.service first. Writing only sddm.conf.d
+# there is a no-op that leaves the live ISO at a password prompt.
+kde_dm_unit() {
+	if [[ -e /usr/lib/systemd/system/plasmalogin.service ]]; then
+		echo plasmalogin.service
+	else
+		echo sddm.service
 	fi
+}
+
+_write_sddm_conf() {
 	mkdir -p /etc/sddm.conf.d
 	cat >/etc/sddm.conf.d/tbox-live-autologin.conf <<SDDMEOF
 [General]
 DisplayServer=wayland
 CompositorCommand=kwin_wayland --no-lockscreen
 
-[Autologin]
+${1}
+SDDMEOF
+}
+
+write_sddm() {
+	local session="plasma"
+	if [[ -f /usr/share/wayland-sessions/plasmawayland.desktop && ! -f /usr/share/wayland-sessions/plasma.desktop ]]; then
+		session="plasmawayland"
+	fi
+	local autologin="[Autologin]
 User=${LIVE_USER}
 Session=${session}
-Relogin=false
-SDDMEOF
+Relogin=false"
+
+	local wrote=false
+	# PlasmaLogin is Wayland-only and has no equivalent of SDDM's [General]
+	# DisplayServer/CompositorCommand, so those stay sddm-only.
+	if [[ -e /usr/lib/systemd/system/plasmalogin.service ]]; then
+		mkdir -p /etc/plasmalogin.conf.d
+		printf '%s\n' "${autologin}" >/etc/plasmalogin.conf.d/tbox-live-autologin.conf
+		wrote=true
+	fi
+	if [[ -e /usr/lib/systemd/system/sddm.service ]]; then
+		_write_sddm_conf "${autologin}"
+		wrote=true
+	fi
+	# Neither unit present (unusual for a KDE image) — keep the historical
+	# behaviour rather than writing nothing at all.
+	[[ "${wrote}" == true ]] || _write_sddm_conf "${autologin}"
 }
 
 write_greetd() {
@@ -112,7 +146,7 @@ enable_dm() {
 
 case "${DESKTOP}" in
 gnome) write_gdm; enable_dm gdm.service || enable_dm gdm3.service || true ;;
-kde) write_sddm; enable_dm sddm.service || true ;;
+kde) write_sddm; enable_dm "$(kde_dm_unit)" || enable_dm sddm.service || true ;;
 niri) write_greetd "niri-session"; enable_dm greetd.service || true ;;
 cosmic) write_greetd "cosmic-session"; enable_dm greetd.service || true ;;
 xfce)

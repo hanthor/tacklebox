@@ -106,14 +106,20 @@ if [ "$tboxroot" = "1" ]; then
         # is the trigger; the script is idempotent and writes the done
         # marker itself.
         #
-        # Nothing waits for the marker on this branch, deliberately. udev
-        # is not running yet — systemd-udevd starts after
-        # dracut-cmdline.service — so blocking here would deadlock until
-        # timeout and the rule could never fire. The ordering that makes
-        # this safe is in tbox-live-generator: sysroot.mount is
-        # After=dracut-initqueue.service, which runs once udev has
-        # settled, by which time the rule has fired. The synchronous call
-        # below only covers a device that was already enumerated.
+        # Nothing waits for the marker on this branch, and nothing may:
+        # udev is not running yet (systemd-udevd starts after
+        # dracut-cmdline.service), so blocking here would deadlock until
+        # timeout and the rule could never fire.
+        #
+        # This branch is belt and braces only. It cannot carry the boot
+        # on its own and an earlier version of this comment claiming
+        # otherwise was disproven by run 30629145076: the block device
+        # does not exist until sr_mod is loaded, and on this path
+        # tbox-live-root is what loads it, so a udev trigger on the
+        # device can never bootstrap it. sr0 attached at 64s there, long
+        # after sysroot.mount had failed. What actually carries the boot
+        # is tbox-live-prepare.service, which tbox-live-generator emits
+        # and orders Before=sysroot.mount.
         {
             echo 'SUBSYSTEM=="block", ACTION=="add|change", ENV{ID_FS_LABEL}!="", RUN+="/sbin/tbox-live-root"'
             echo 'SUBSYSTEM=="block", KERNEL=="sr[0-9]*", ACTION=="add|change", RUN+="/sbin/tbox-live-root"'

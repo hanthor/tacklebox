@@ -36,10 +36,38 @@ GENERATOR_DIR="$2"
 lower=/run/rootfsbase
 [ -n "$(getarg tacklebox.live.delta)" ] && lower=/run/tbox-delta:/run/rootfsbase
 
+# The live root is prepared by a unit we emit here, not by whatever
+# queued tbox-live-root. On the appended-overlay path there is no usable
+# initqueue at all ($hookdir is on the image's read-only /usr — see
+# parse-tbox-live.sh), and the udev fallback cannot bootstrap: the block
+# device does not exist until sr_mod is loaded, and on that path
+# tbox-live-root is what loads it. Run 30629145076 is that deadlock —
+# sr0 attached at 64s, tens of seconds after sysroot.mount had already
+# failed on a lowerdir that nothing had created.
+#
+# Ordering both paths through one unit keeps sysroot.mount's dependency
+# a fact we state here rather than a property of the queueing mechanism.
+{
+    echo "[Unit]"
+    echo "DefaultDependencies=no"
+    echo "Before=sysroot.mount initrd-root-fs.target"
+    echo "After=systemd-udevd.service dracut-initqueue.service"
+    echo "[Service]"
+    echo "Type=oneshot"
+    echo "RemainAfterExit=yes"
+    # --wait polls for the device and fails loudly if it never arrives,
+    # so a dead live medium reports itself instead of surfacing as
+    # `overlayfs: failed to resolve '/run/rootfsbase'` three units later.
+    echo "ExecStart=/sbin/tbox-live-root --wait"
+    echo "StandardOutput=journal+console"
+    echo "StandardError=journal+console"
+} > "$GENERATOR_DIR"/tbox-live-prepare.service
+
 {
     echo "[Unit]"
     echo "Before=initrd-root-fs.target"
-    echo "After=dracut-initqueue.service"
+    echo "After=dracut-initqueue.service tbox-live-prepare.service"
+    echo "Requires=tbox-live-prepare.service"
     echo "[Mount]"
     echo "Where=/sysroot"
     echo "What=LiveOS_rootfs"

@@ -30,6 +30,19 @@
 
 command -v getarg > /dev/null 2>&1 || . /lib/dracut-lib.sh
 
+# --wait: poll for the device instead of bailing when it is absent, and
+# fail loudly if it never arrives. Used by tbox-live-prepare.service,
+# which is the only caller that has nothing behind it to retry — the
+# initqueue caller is re-run on every settled pass and wants the quiet
+# bail below.
+wait=0
+case "$1" in
+--wait)
+    wait=1
+    shift
+    ;;
+esac
+
 # argv is unreliable through initqueue's shell re-parse (see
 # parse-tbox-live.sh); the parse hook hands the path over in a file.
 dev=$1
@@ -51,6 +64,21 @@ done
 # exists (the wait_for_dev finished hook keeps initqueue looping until
 # the done marker below appears).
 [ -f /run/tacklebox-live-done ] && exit 0
+
+# The device does not exist until sr_mod is loaded and udev has probed
+# the medium — and on the appended-overlay path sr_mod is loaded by the
+# insmod loop just above, i.e. by THIS script. Anything triggered by the
+# block device appearing therefore cannot bootstrap the device: measured
+# on run 30629145076, where sr0 attached at 64s, long after sysroot.mount
+# had already failed. Under --wait we poll instead.
+if [ "$wait" = "1" ]; then
+    _i=0
+    while [ ! -e "$dev" ] && [ "$_i" -lt 60 ]; do
+        udevadm settle --timeout=1 > /dev/null 2>&1 || sleep 1
+        _i=$((_i + 1))
+    done
+    [ -e "$dev" ] || die "Tacklebox: live device $dev did not appear within 60s"
+fi
 [ -e "$dev" ] || exit 0
 
 livedir=$(getarg tacklebox.live.dir)

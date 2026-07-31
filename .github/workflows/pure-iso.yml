@@ -128,18 +128,31 @@ jobs:
         run: |
           img="${RUNNER_TEMP}/purebuild/initrd-tbox.img"
           [ -f "$img" ] || { echo "no combined initrd (built with --initrd?)"; exit 0; }
-          echo "### every dracut cmdline hook and tbox path in the booted initrd"
-          lsinitrd "$img" 2>/dev/null | grep -E "dracut/hooks|tbox" || echo "(none listed)"
-          echo "### does the hook that runs contain the hookdir mkdir fix?"
-          for p in usr/lib/dracut/hooks/cmdline/30-parse-tbox-live.sh \
-                   lib/dracut/hooks/cmdline/30-parse-tbox-live.sh \
-                   var/lib/dracut/hooks/cmdline/30-parse-tbox-live.sh; do
-            body=$(lsinitrd -f "$p" "$img" 2>/dev/null) || continue
-            [ -n "$body" ] || continue
-            if printf '%s' "$body" | grep -q 'tacklebox#166'; then
-              echo "$p: FIXED copy"
-            else
-              echo "$p: STALE copy — this is the image's baked-in module overriding the overlay"
+          # The first version of this step grepped lsinitrd's output and
+          # concluded the overlay's copy was the only one present. It was
+          # not evidence: every path it printed was from the early cpio,
+          # no stock hook appeared at all, and stderr was discarded — so a
+          # main-image listing that failed outright is indistinguishable
+          # from one that contained nothing. Print the whole thing, per
+          # section, with errors, and let the counts show which sections
+          # were actually read.
+          lsinitrd "$img" > /tmp/ls.txt 2> /tmp/ls.err || true
+          echo "### lsinitrd: $(wc -l < /tmp/ls.txt) lines, stderr:"
+          cat /tmp/ls.err
+          echo "### section headers"
+          grep -n -i "image:\|early cpio\|^Version" /tmp/ls.txt || true
+          echo "### total entries vs dracut cmdline hooks seen"
+          echo "entries: $(grep -c '^[-dl]' /tmp/ls.txt || true)"
+          grep -n "dracut/hooks/cmdline" /tmp/ls.txt || echo "(no cmdline hooks listed at all — listing is incomplete)"
+          echo "### every copy of the parse hook, in listing order"
+          grep -n "parse-tbox-live" /tmp/ls.txt || echo "(none)"
+          echo "### stock initramfs from the image, listed on its own"
+          stock=$(find "${RUNNER_TEMP}/purebuild/blobs" -type f -size +10M -size -400M 2>/dev/null | head -20)
+          for f in $stock; do
+            if lsinitrd "$f" > /tmp/s.txt 2>/dev/null && grep -q "dracut" /tmp/s.txt; then
+              echo "--- $f ($(wc -l < /tmp/s.txt) entries)"
+              grep "parse-tbox-live\|hooks/cmdline" /tmp/s.txt || echo "  (image bakes no tbox hook)"
+              break
             fi
           done
 

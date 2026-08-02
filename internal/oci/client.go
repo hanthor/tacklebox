@@ -64,7 +64,7 @@ type Client struct {
 // DefaultFetchAhead is deliberately modest: enough to keep the link busy
 // across a decompress+apply, few enough that a slow apply cannot age out a
 // pile of open registry connections.
-const DefaultFetchAhead = 4
+const DefaultFetchAhead = 2
 
 func (c *Client) fetchAhead() int {
 	if c.FetchAhead > 0 {
@@ -138,6 +138,12 @@ func (c *Client) authorize(repo string) error {
 }
 
 // bearer returns the token for request signing without racing authorize.
+func (c *Client) invalidateToken() {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+	c.token = ""
+}
+
 func (c *Client) bearer() string {
 	c.tokenMu.Lock()
 	defer c.tokenMu.Unlock()
@@ -200,6 +206,9 @@ func (c *Client) getRange(repo, path, accept string, offset int64) (*http.Respon
 	timedOut := !headerTimer.Stop()
 	if err != nil {
 		cancel()
+		if offset > 0 {
+			c.invalidateToken()
+		}
 		if timedOut {
 			return nil, fmt.Errorf("%w: GET %s: no response headers within %s", ErrStalled, path, c.headerTimeout())
 		}
@@ -212,8 +221,11 @@ func (c *Client) getRange(repo, path, accept string, offset int64) (*http.Respon
 	if resp.StatusCode != want {
 		resp.Body.Close()
 		cancel()
-		if offset > 0 && resp.StatusCode == http.StatusOK {
-			return nil, fmt.Errorf("GET %s: resume from %d unsupported (got 200, want 206)", path, offset)
+		if offset > 0 {
+			c.invalidateToken()
+			if resp.StatusCode == http.StatusOK {
+				return nil, fmt.Errorf("GET %s: resume from %d unsupported (got 200, want 206)", path, offset)
+			}
 		}
 		return nil, fmt.Errorf("GET %s: HTTP %d", path, resp.StatusCode)
 	}

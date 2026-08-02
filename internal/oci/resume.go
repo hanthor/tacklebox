@@ -199,7 +199,18 @@ func (r *resumingReader) resume(why string) bool {
 		return false
 	}
 	r.attempts--
-	rc, err := r.open(r.off)
+	var rc io.ReadCloser
+	var err error
+	for retry := 0; retry < 3; retry++ {
+		if retry > 0 {
+			time.Sleep(time.Duration(retry*2) * time.Second)
+			fmt.Printf("tbox: layer resume retry %d/3 at byte %d...\n", retry, r.off)
+		}
+		rc, err = r.open(r.off)
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
 		r.err = fmt.Errorf("%w at byte %d: %s: reopen: %v", ErrStalled, r.off, why, err)
 		return false

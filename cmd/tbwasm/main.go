@@ -230,6 +230,12 @@ func buildIso(_ js.Value, args []js.Value) any {
 		if err := purefs.EnsureAutologin(root, store, purefs.DetectDesktop(root), "liveuser"); err != nil {
 			return nil, err
 		}
+		// Readiness marker for the e2e harness — tunaOS images ship it,
+		// reference images (aurora et al.) don't, and without it a
+		// perfectly booted live ISO times the harness out.
+		if err := purefs.EnsureLiveReadyMarker(root, store); err != nil {
+			return nil, err
+		}
 
 		kver := gFacts.KernelVer
 		if kver == "" {

@@ -174,6 +174,13 @@ func main() {
 	}
 	log.Printf(">>> autologin + display-manager configured")
 
+	// Readiness marker for the e2e harness — tunaOS images ship it,
+	// reference images (aurora et al.) don't, and without it a perfectly
+	// booted live ISO times the harness out.
+	if err := purefs.EnsureLiveReadyMarker(root, store); err != nil {
+		log.Fatal(err)
+	}
+
 	// Kernel + stock initramfs + systemd-boot out of the image tree.
 	modDir := root.Lookup("usr/lib/modules")
 	if modDir == nil {

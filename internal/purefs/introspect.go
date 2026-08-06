@@ -61,9 +61,13 @@ func DetectPackaging(root *oci.Node) (pm, family string) {
 
 // ImageFacts is what the builder GUI shows after introspection.
 type ImageFacts struct {
-	Desktop    string `json:"desktop"`
-	KernelVer  string `json:"kernelVer"`
-	HasSdBoot  bool   `json:"hasSdBoot"`
+	Desktop   string `json:"desktop"`
+	KernelVer string `json:"kernelVer"`
+	HasSdBoot bool   `json:"hasSdBoot"`
+	// Bootloader is the resolved live-ISO boot chain: "systemd-boot",
+	// "grub2" (bootupd shim+GRUB pair), or "none" when the image ships
+	// neither (see DetectBootChain).
+	Bootloader string `json:"bootloader"`
 	FileCount  int    `json:"fileCount"`
 	PkgManager string `json:"pkgManager"`
 	RepoFamily string `json:"repoFamily"`
@@ -80,6 +84,14 @@ func Introspect(root *oci.Node) ImageFacts {
 		}
 	}
 	facts.HasSdBoot = root.Lookup("usr/lib/systemd/boot/efi/systemd-bootx64.efi") != nil
+	facts.Bootloader = "none"
+	if bc, err := DetectBootChain(root); err == nil {
+		if bc.Kind == "sdboot" {
+			facts.Bootloader = "systemd-boot"
+		} else {
+			facts.Bootloader = "grub2"
+		}
+	}
 	facts.PkgManager, facts.RepoFamily = DetectPackaging(root)
 	root.Walk(func(_ string, n *oci.Node) error {
 		if n.Type == oci.TypeFile {

@@ -35,50 +35,9 @@ import (
 // modules is the embedded src/dracut tree (tacklebox.DracutModules).
 func BuildInitrdOverlay(root *oci.Node, store oci.BlobStore, kver string, modules fs.FS) ([]byte, error) {
 	w := newCpioWriter()
-
-	script := func(embedded string) ([]byte, error) {
-		b, err := fs.ReadFile(modules, embedded)
-		if err != nil {
-			return nil, fmt.Errorf("embedded %s: %w", embedded, err)
-		}
-		return b, nil
+	if err := overlayScripts(w, modules); err != nil {
+		return nil, err
 	}
-
-	// dracut hook + script installs (mirrors 90tbox-live/95tbox-root
-	// module-setup.sh, at the paths the built initramfs would contain).
-	type inst struct {
-		src  string
-		dsts []string
-		mode uint32
-	}
-	insts := []inst{
-		{"src/dracut/90tbox-live/parse-tbox-live.sh", []string{
-			"usr/lib/dracut/hooks/cmdline/30-parse-tbox-live.sh",
-			"var/lib/dracut/hooks/cmdline/30-parse-tbox-live.sh",
-		}, 0o755},
-		{"src/dracut/90tbox-live/tbox-live-root.sh", []string{"sbin/tbox-live-root"}, 0o755},
-		{"src/dracut/90tbox-live/tbox-live-generator.sh", []string{
-			"usr/lib/systemd/system-generators/tbox-live-generator",
-		}, 0o755},
-		{"src/dracut/95tbox-root/tbox-root-mount.sh", []string{"usr/bin/tbox-root-mount.sh"}, 0o755},
-		{"src/dracut/95tbox-root/tbox-root.service", []string{
-			"usr/lib/systemd/system/tbox-root.service",
-		}, 0o644},
-	}
-	for _, in := range insts {
-		b, err := script(in.src)
-		if err != nil {
-			return nil, err
-		}
-		for _, d := range in.dsts {
-			w.file(d, in.mode, b)
-		}
-	}
-	w.symlink("usr/lib/systemd/system/initrd-root-fs.target.wants/tbox-root.service",
-		"../tbox-root.service")
-	w.symlink("usr/lib/systemd/system/ostree-prepare-root.service.requires/tbox-root.service",
-		"../tbox-root.service")
-
 	// Kernel modules out of the image tree, decompressed so insmod never
 	// depends on kernel-side decompression support.
 	wanted := map[string]bool{
@@ -163,6 +122,69 @@ func BuildInitrdOverlay(root *oci.Node, store oci.BlobStore, kver string, module
 		fmt.Println("!!! initrd overlay: no loadable fs/device modules found (builtin kernel?)")
 	}
 	return w.finish(), nil
+}
+
+// BuildInitrdOverlayScriptsOnly is the tree-less overlay for DDI input
+// (tacklebox#172): there is no unpacked image to harvest kernel modules
+// from, and none is needed — a mkosi A/B image's initrd already carries
+// the storage modules that mount its EROFS root on the installed
+// system. Only the tbox live scripts/units are prepended.
+func BuildInitrdOverlayScriptsOnly(modules fs.FS) ([]byte, error) {
+	w := newCpioWriter()
+	if err := overlayScripts(w, modules); err != nil {
+		return nil, err
+	}
+	return w.finish(), nil
+}
+
+// overlayScripts writes the tbox dracut module scripts, the systemd
+// generator + tbox-root unit and its wants/requires links — the
+// tree-independent half of the overlay. modules is the embedded
+// src/dracut tree (tacklebox.DracutModules).
+func overlayScripts(w *cpioWriter, modules fs.FS) error {
+	script := func(embedded string) ([]byte, error) {
+		b, err := fs.ReadFile(modules, embedded)
+		if err != nil {
+			return nil, fmt.Errorf("embedded %s: %w", embedded, err)
+		}
+		return b, nil
+	}
+
+	// dracut hook + script installs (mirrors 90tbox-live/95tbox-root
+	// module-setup.sh, at the paths the built initramfs would contain).
+	type inst struct {
+		src  string
+		dsts []string
+		mode uint32
+	}
+	insts := []inst{
+		{"src/dracut/90tbox-live/parse-tbox-live.sh", []string{
+			"usr/lib/dracut/hooks/cmdline/30-parse-tbox-live.sh",
+			"var/lib/dracut/hooks/cmdline/30-parse-tbox-live.sh",
+		}, 0o755},
+		{"src/dracut/90tbox-live/tbox-live-root.sh", []string{"sbin/tbox-live-root"}, 0o755},
+		{"src/dracut/90tbox-live/tbox-live-generator.sh", []string{
+			"usr/lib/systemd/system-generators/tbox-live-generator",
+		}, 0o755},
+		{"src/dracut/95tbox-root/tbox-root-mount.sh", []string{"usr/bin/tbox-root-mount.sh"}, 0o755},
+		{"src/dracut/95tbox-root/tbox-root.service", []string{
+			"usr/lib/systemd/system/tbox-root.service",
+		}, 0o644},
+	}
+	for _, in := range insts {
+		b, err := script(in.src)
+		if err != nil {
+			return err
+		}
+		for _, d := range in.dsts {
+			w.file(d, in.mode, b)
+		}
+	}
+	w.symlink("usr/lib/systemd/system/initrd-root-fs.target.wants/tbox-root.service",
+		"../tbox-root.service")
+	w.symlink("usr/lib/systemd/system/ostree-prepare-root.service.requires/tbox-root.service",
+		"../tbox-root.service")
+	return nil
 }
 
 // ── minimal newc cpio writer ────────────────────────────────────────────────

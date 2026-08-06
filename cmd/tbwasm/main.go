@@ -51,6 +51,7 @@ var (
 func main() {
 	js.Global().Set("tboxIntrospect", js.FuncOf(introspect))
 	js.Global().Set("tboxBuildIso", js.FuncOf(buildIso))
+	js.Global().Set("tboxBuildDdiIso", js.FuncOf(buildDdiIso))
 	js.Global().Set("tboxReset", js.FuncOf(func(js.Value, []js.Value) any {
 		if gStore != nil {
 			gStore.destroy()

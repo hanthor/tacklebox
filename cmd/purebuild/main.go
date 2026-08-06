@@ -62,8 +62,14 @@ func main() {
 		rootTar    = flag.String("rootfs-tar", "", "build from this rootfs tar (podman export of a customized container) instead of pulling; the tar is DELETED after ingest to bound disk use")
 		useXorriso = flag.Bool("xorriso", false, "assemble the final ISO with xorriso (production args; native only) instead of the go-diskfs writer — avoids its staging copy")
 		trim       = flag.String("trim", "var/cache,var/log,var/tmp,tmp,run", "comma-separated rootfs paths emptied before authoring (boot-irrelevant caches)")
+		ddi        = flag.String("ddi", "", "build from a systemd-sysupdate v1 artifact directory (URL or local path containing SHA256SUMS + UKI + root.raw[.xz]) instead of an OCI image — tacklebox#172")
+		ddiStem    = flag.String("ddi-stem", "", "artifact stem to select in the DDI manifest (e.g. snow-ab); required when the manifest lists several")
 	)
 	flag.Parse()
+	if *ddi != "" {
+		buildFromDdi(*ddi, *ddiStem, *label, *workdir, *out)
+		return
+	}
 	if *image == "" || !strings.Contains(*image, ":") {
 		log.Fatal("--image <repo>:<tag> is required")
 	}

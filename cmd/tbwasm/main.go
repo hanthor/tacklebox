@@ -305,26 +305,16 @@ func buildIso(_ js.Value, args []js.Value) any {
 		if err != nil {
 			return nil, fmt.Errorf("no initramfs in image: %w", err)
 		}
-		// Debian ships ONLY systemd-bootx64.efi.signed — the sbat-signed PE,
-		// not a detached signature, so it boots as BOOTX64.EFI unchanged.
-		// Fedora-family images ship the unsigned name. Preferring the
-		// unsigned one and falling back keeps images that carry both on
-		// their existing artifact. Nothing Debian-based had ever reached
-		// this line before tacklebox#156 was fixed: the OOM in EROFS
-		// authoring came first, so a hard error here read as "no Debian
-		// edition builds" rather than "wrong filename".
-		var sdSrc func() (io.ReadCloser, error)
-		for _, cand := range []string{
-			"usr/lib/systemd/boot/efi/systemd-bootx64.efi",
-			"usr/lib/systemd/boot/efi/systemd-bootx64.efi.signed",
-		} {
-			if src, _, berr := blob(cand); berr == nil {
-				sdSrc = src
-				break
-			}
-		}
-		if sdSrc == nil {
-			return nil, fmt.Errorf("image ships no systemd-boot at usr/lib/systemd/boot/efi/systemd-bootx64.efi[.signed] (EL10-style images need a supplied one)")
+		// Two boot chains, resolved wootc-style from the tree (see
+		// purefs.DetectBootChain): systemd-boot when the image ships it
+		// (Debian ships only the .signed name — an sbat-signed PE that
+		// boots unchanged), else the signed shim+GRUB pair from the
+		// image's bootupd payload. aurora/bluefin-family images carry no
+		// systemd-boot at all — this used to hard-error here with
+		// "EL10-style images need a supplied one".
+		chain, err := purefs.DetectBootChain(root)
+		if err != nil {
+			return nil, err
 		}
 
 		kargs := fmt.Sprintf(
@@ -332,19 +322,69 @@ func buildIso(_ js.Value, args []js.Value) any {
 				" tacklebox.live.overlay.size=8192 enforcing=0"+
 				" tacklebox.env=%s console=ttyS0,115200n8",
 			label, sfsName, envID)
-		entry := fmt.Sprintf("title TunaOS %s (live)\nlinux /images/pxeboot/%s/vmlinuz\ninitrd /images/pxeboot/%s/initrd.img\noptions %s\n",
-			envID, envID, envID, kargs)
 		kernelPath := "/images/pxeboot/" + envID + "/vmlinuz"
 		initrdPath := "/images/pxeboot/" + envID + "/initrd.img"
 
+		var espFiles []purefs.EspFile
+		// The ISO tree carries the same boot files outside efi.img as
+		// inside it (some firmware reads the ISO filesystem directly);
+		// whatever the chain stages on the ESP is mirrored here.
+		var bootInputs []purefs.IsoInput
+		switch chain.Kind {
+		case "sdboot":
+			sdSrc, sdSize, berr := blob(chain.SdBoot)
+			if berr != nil {
+				return nil, berr
+			}
+			entry := fmt.Sprintf("title TunaOS %s (live)\nlinux %s\ninitrd %s\noptions %s\n",
+				envID, kernelPath, initrdPath, kargs)
+			espFiles = []purefs.EspFile{
+				{Path: "/EFI/BOOT/BOOTX64.EFI", Source: sdSrc},
+				{Path: "/loader/loader.conf", Source: purefs.StringSource("timeout 3\n")},
+				{Path: "/loader/entries/" + envID + ".conf", Source: purefs.StringSource(entry)},
+			}
+			bootInputs = []purefs.IsoInput{
+				{Path: "/EFI/BOOT/BOOTX64.EFI", Size: sdSize, Source: sdSrc},
+			}
+		case "grub2":
+			shimSrc, shimSize, berr := blob(chain.Shim)
+			if berr != nil {
+				return nil, berr
+			}
+			grubSrc, grubSize, berr := blob(chain.Grub)
+			if berr != nil {
+				return nil, berr
+			}
+			cfg := purefs.LiveGrubCfg("TunaOS "+envID+" (live)", kernelPath, initrdPath, kargs)
+			// shim boots as BOOTX64.EFI and loads grubx64.efi from its own
+			// directory; grub.cfg goes to every prefix a signed GRUB has
+			// been observed to search (its own dir and the vendor dir).
+			espFiles = []purefs.EspFile{
+				{Path: "/EFI/BOOT/BOOTX64.EFI", Source: shimSrc},
+				{Path: "/EFI/BOOT/grubx64.efi", Source: grubSrc},
+				{Path: "/EFI/BOOT/grub.cfg", Source: purefs.StringSource(cfg)},
+				{Path: "/EFI/" + chain.Vendor + "/grub.cfg", Source: purefs.StringSource(cfg)},
+			}
+			bootInputs = []purefs.IsoInput{
+				{Path: "/EFI/BOOT/BOOTX64.EFI", Size: shimSize, Source: shimSrc},
+				{Path: "/EFI/BOOT/grubx64.efi", Size: grubSize, Source: grubSrc},
+				{Path: "/EFI/BOOT/grub.cfg", Size: int64(len(cfg)), Source: bytesSource([]byte(cfg))},
+			}
+			if chain.MokMgr != "" {
+				mmSrc, mmSize, merr := blob(chain.MokMgr)
+				if merr == nil {
+					espFiles = append(espFiles, purefs.EspFile{Path: "/EFI/BOOT/mmx64.efi", Source: mmSrc})
+					bootInputs = append(bootInputs, purefs.IsoInput{Path: "/EFI/BOOT/mmx64.efi", Size: mmSize, Source: mmSrc})
+				}
+			}
+		}
+		espFiles = append(espFiles,
+			purefs.EspFile{Path: kernelPath, Source: kernelSrc},
+			purefs.EspFile{Path: initrdPath, Source: initrdSrc},
+		)
+
 		emitProgress("esp", 0, 1)
-		esp, err := purefs.BuildEspBytes([]purefs.EspFile{
-			{Path: "/EFI/BOOT/BOOTX64.EFI", Source: sdSrc},
-			{Path: "/loader/loader.conf", Source: purefs.StringSource("timeout 3\n")},
-			{Path: "/loader/entries/" + envID + ".conf", Source: purefs.StringSource(entry)},
-			{Path: kernelPath, Source: kernelSrc},
-			{Path: initrdPath, Source: initrdSrc},
-		})
+		esp, err := purefs.BuildEspBytes(espFiles)
 		if err != nil {
 			return nil, err
 		}
@@ -352,13 +392,14 @@ func buildIso(_ js.Value, args []js.Value) any {
 
 		emitProgress("iso", 0, 1)
 		jw := &jsChunkWriter{cb: onChunk}
-		inputs := []purefs.IsoInput{
+		inputs := append([]purefs.IsoInput{
 			{Path: "/EFI/efi.img", Size: int64(len(esp)), Source: bytesSource(esp)},
-			{Path: "/EFI/BOOT/BOOTX64.EFI", Size: mustSize(sdSrc), Source: sdSrc},
-			{Path: kernelPath, Size: kernelSize, Source: kernelSrc},
-			{Path: initrdPath, Size: initrdSize, Source: initrdSrc},
-			{Path: "/LiveOS/" + sfsName, Size: sfsSize, Source: sfsSource},
-		}
+		}, bootInputs...)
+		inputs = append(inputs,
+			purefs.IsoInput{Path: kernelPath, Size: kernelSize, Source: kernelSrc},
+			purefs.IsoInput{Path: initrdPath, Size: initrdSize, Source: initrdSrc},
+			purefs.IsoInput{Path: "/LiveOS/" + sfsName, Size: sfsSize, Source: sfsSource},
+		)
 		if len(flatpaks) > 0 {
 			manifest, _ := json.Marshal(map[string]any{"preload": flatpaks})
 			inputs = append(inputs, purefs.IsoInput{

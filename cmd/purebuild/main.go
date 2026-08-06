@@ -28,6 +28,16 @@ import (
 var initrdOnDisk string
 var sdBootDisk string
 
+// bootDiskFile is one chain-staged boot file: its path inside the ISO/ESP
+// and its on-disk source (a DirStore ref, the workdir grub.cfg, or the
+// host systemd-boot fallback).
+type bootDiskFile struct {
+	path string
+	disk string
+}
+
+var bootDiskFiles []bootDiskFile
+
 // mustStatSize is the declared size of an ISO input. It exits rather than
 // returning, because every caller is building the layout and there is no
 // useful way to continue with an unknown size — the previous code wrote
@@ -214,19 +224,25 @@ func main() {
 		initrdSource = purefs.FileSource(combined)
 		initrdOnDisk = combined
 	}
-	// systemd-boot: prefer the image's own copy; EL10 images don't ship it,
-	// so fall back to the host binary exactly like production
-	// ExtractEFIBinary does (CI installs systemd-boot-efi).
-	var sdBoot func() (io.ReadCloser, error)
-	if n := root.Lookup("usr/lib/systemd/boot/efi/systemd-bootx64.efi"); n != nil && n.Type == oci.TypeFile {
-		sdBoot = func() (io.ReadCloser, error) { return store.Open(n.Ref) }
-		sdBootDisk = n.Ref
+	// Boot chain: two code paths resolved from the tree (see
+	// purefs.DetectBootChain) — the image's own systemd-boot, or the
+	// signed shim+GRUB pair from its bootupd payload (aurora/bluefin-
+	// family images ship no systemd-boot). When the image carries
+	// neither, fall back to the host's systemd-boot exactly like
+	// production ExtractEFIBinary does (CI installs systemd-boot-efi).
+	// DirStore refs are file paths, so every chain file has an on-disk
+	// source the ISO writers can stat and stream.
+	chain, chainErr := purefs.DetectBootChain(root)
+	if chainErr == nil && chain.Kind == "sdboot" {
+		sdBootDisk = root.Lookup(chain.SdBoot).Ref
+	} else if chainErr == nil && chain.Kind == "grub2" {
+		log.Printf(">>> boot chain: bootupd shim+GRUB (vendor %s) — image ships no systemd-boot", chain.Vendor)
 	} else if _, err := os.Stat("/usr/lib/systemd/boot/efi/systemd-bootx64.efi"); err == nil {
+		chain = &purefs.BootChain{Kind: "sdboot"}
 		sdBootDisk = "/usr/lib/systemd/boot/efi/systemd-bootx64.efi"
-		sdBoot = purefs.FileSource(sdBootDisk)
 		log.Printf(">>> systemd-boot from host (image ships none)")
 	} else {
-		log.Fatal("no systemd-boot EFI binary in image or on host (install systemd-boot-efi)")
+		log.Fatalf("no bootable EFI loader in image or on host (install systemd-boot-efi): %v", chainErr)
 	}
 
 	// Blobs still needed after the EROFS pass; everything else is deleted
@@ -235,8 +251,11 @@ func main() {
 	for _, kp := range []string{
 		"usr/lib/modules/" + kver + "/vmlinuz",
 		"usr/lib/modules/" + kver + "/initramfs.img",
-		"usr/lib/systemd/boot/efi/systemd-bootx64.efi",
+		chain.SdBoot, chain.Shim, chain.Grub, chain.MokMgr,
 	} {
+		if kp == "" {
+			continue
+		}
 		if n := root.Lookup(kp); n != nil {
 			keepRefs[n.Ref] = true
 		}
@@ -270,29 +289,63 @@ func main() {
 
 	// (blobs were consumed during the EROFS pass; only keepRefs remain)
 
-	// BLS entry — same template as cmd/tacklebox's liveKernelCmdline.
+	// Kernel cmdline — same template as cmd/tacklebox's liveKernelCmdline.
 	kargs := fmt.Sprintf(
 		"root=tbox:CDLABEL=%s tacklebox.live.squashimg=%s"+
 			" tacklebox.live.overlay.size=8192 enforcing=0"+
 			" tacklebox.env=%s console=ttyS0,115200n8",
 		*label, sfsName, envID,
 	)
-	entry := fmt.Sprintf("title TunaOS %s (live)\nlinux /images/pxeboot/%s/vmlinuz\ninitrd /images/pxeboot/%s/initrd.img\noptions %s\n",
-		envID, envID, envID, kargs)
-	loaderConf := "timeout 3\n"
-
 	kernelPath := "/images/pxeboot/" + envID + "/vmlinuz"
 	initrdPath := "/images/pxeboot/" + envID + "/initrd.img"
 
+	// Chain-specific boot files. bootDiskFiles is mirrored into the ISO
+	// tree by every writer (streaming, WriteIso, xorriso); espExtras are
+	// config files that live only inside efi.img.
+	var espExtras []purefs.EspFile
+	switch chain.Kind {
+	case "sdboot":
+		entry := fmt.Sprintf("title TunaOS %s (live)\nlinux %s\ninitrd %s\noptions %s\n",
+			envID, kernelPath, initrdPath, kargs)
+		bootDiskFiles = []bootDiskFile{{"/EFI/BOOT/BOOTX64.EFI", sdBootDisk}}
+		espExtras = []purefs.EspFile{
+			{Path: "/loader/loader.conf", Source: purefs.StringSource("timeout 3\n")},
+			{Path: "/loader/entries/" + envID + ".conf", Source: purefs.StringSource(entry)},
+		}
+	case "grub2":
+		cfg := purefs.LiveGrubCfg("TunaOS "+envID+" (live)", kernelPath, initrdPath, kargs)
+		cfgPath := filepath.Join(*workdir, "grub.cfg")
+		if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+			log.Fatal(err)
+		}
+		// shim boots as BOOTX64.EFI and loads grubx64.efi from its own
+		// directory; grub.cfg goes to every prefix a signed GRUB has been
+		// observed to search (its own dir and the vendor dir).
+		bootDiskFiles = []bootDiskFile{
+			{"/EFI/BOOT/BOOTX64.EFI", root.Lookup(chain.Shim).Ref},
+			{"/EFI/BOOT/grubx64.efi", root.Lookup(chain.Grub).Ref},
+			{"/EFI/BOOT/grub.cfg", cfgPath},
+		}
+		if chain.MokMgr != "" {
+			bootDiskFiles = append(bootDiskFiles, bootDiskFile{"/EFI/BOOT/mmx64.efi", root.Lookup(chain.MokMgr).Ref})
+		}
+		espExtras = []purefs.EspFile{
+			{Path: "/EFI/" + chain.Vendor + "/grub.cfg", Source: purefs.FileSource(cfgPath)},
+		}
+	}
+
 	log.Printf(">>> authoring ESP")
 	espPath := filepath.Join(*workdir, "efi.img")
-	if err := purefs.WriteEsp(espPath, []purefs.EspFile{
-		{Path: "/EFI/BOOT/BOOTX64.EFI", Source: sdBoot},
-		{Path: "/loader/loader.conf", Source: purefs.StringSource(loaderConf)},
-		{Path: "/loader/entries/" + envID + ".conf", Source: purefs.StringSource(entry)},
-		{Path: kernelPath, Source: blob("usr/lib/modules/" + kver + "/vmlinuz")},
-		{Path: initrdPath, Source: initrdSource},
-	}); err != nil {
+	espFiles := make([]purefs.EspFile, 0, len(bootDiskFiles)+len(espExtras)+2)
+	for _, bf := range bootDiskFiles {
+		espFiles = append(espFiles, purefs.EspFile{Path: bf.path, Source: purefs.FileSource(bf.disk)})
+	}
+	espFiles = append(espFiles, espExtras...)
+	espFiles = append(espFiles,
+		purefs.EspFile{Path: kernelPath, Source: blob("usr/lib/modules/" + kver + "/vmlinuz")},
+		purefs.EspFile{Path: initrdPath, Source: initrdSource},
+	)
+	if err := purefs.WriteEsp(espPath, espFiles); err != nil {
 		log.Fatal(err)
 	}
 
@@ -323,11 +376,15 @@ func main() {
 		// both branches, so stat that and there is only one expression left.
 		inputs := []purefs.IsoInput{
 			{Path: "/EFI/efi.img", Size: mustStatSize(espPath), Source: purefs.FileSource(espPath)},
-			{Path: "/EFI/BOOT/BOOTX64.EFI", Size: mustStatSize(sdBootDisk), Source: purefs.FileSource(sdBootDisk)},
-			{Path: kernelPath, Size: kn.Size, Source: blob("usr/lib/modules/" + kver + "/vmlinuz")},
-			{Path: initrdPath, Size: mustStatSize(initrdOnDisk), Source: initrdSource},
-			{Path: "/LiveOS/" + sfsName, Size: mustStatSize(sfsPath), Source: purefs.FileSource(sfsPath)},
 		}
+		for _, bf := range bootDiskFiles {
+			inputs = append(inputs, purefs.IsoInput{Path: bf.path, Size: mustStatSize(bf.disk), Source: purefs.FileSource(bf.disk)})
+		}
+		inputs = append(inputs,
+			purefs.IsoInput{Path: kernelPath, Size: kn.Size, Source: blob("usr/lib/modules/" + kver + "/vmlinuz")},
+			purefs.IsoInput{Path: initrdPath, Size: mustStatSize(initrdOnDisk), Source: initrdSource},
+			purefs.IsoInput{Path: "/LiveOS/" + sfsName, Size: mustStatSize(sfsPath), Source: purefs.FileSource(sfsPath)},
+		)
 		if err := purefs.WriteIso9660(f, *label, inputs, "/EFI/efi.img"); err != nil {
 			log.Fatal(err)
 		}
@@ -346,13 +403,18 @@ func main() {
 		log.Printf(">>> done: %s (%.1f GB)", *out, float64(st.Size())/1e9)
 		return
 	}
-	if err := purefs.WriteIso(*out, *label, []purefs.IsoFile{
+	isoFiles := []purefs.IsoFile{
 		{Path: "/EFI/efi.img", Source: purefs.FileSource(espPath)},
-		{Path: "/EFI/BOOT/BOOTX64.EFI", Source: sdBoot},
-		{Path: kernelPath, Source: blob("usr/lib/modules/" + kver + "/vmlinuz")},
-		{Path: initrdPath, Source: initrdSource},
-		{Path: "/LiveOS/" + sfsName, Source: purefs.FileSource(sfsPath)},
-	}, "/EFI/efi.img"); err != nil {
+	}
+	for _, bf := range bootDiskFiles {
+		isoFiles = append(isoFiles, purefs.IsoFile{Path: bf.path, Source: purefs.FileSource(bf.disk)})
+	}
+	isoFiles = append(isoFiles,
+		purefs.IsoFile{Path: kernelPath, Source: blob("usr/lib/modules/" + kver + "/vmlinuz")},
+		purefs.IsoFile{Path: initrdPath, Source: initrdSource},
+		purefs.IsoFile{Path: "/LiveOS/" + sfsName, Source: purefs.FileSource(sfsPath)},
+	)
+	if err := purefs.WriteIso(*out, *label, isoFiles, "/EFI/efi.img"); err != nil {
 		log.Fatal(err)
 	}
 	st, _ := os.Stat(*out)
@@ -427,8 +489,10 @@ func assembleWithXorriso(workdir, out, label, envID, espPath, sfsPath, sfsName s
 	if err := place(filepath.Join(isoRoot, "EFI", "efi.img"), espPath); err != nil {
 		return err
 	}
-	if err := place(filepath.Join(isoRoot, "EFI", "BOOT", "BOOTX64.EFI"), sdBootDisk); err != nil {
-		return err
+	for _, bf := range bootDiskFiles {
+		if err := place(filepath.Join(isoRoot, filepath.FromSlash(strings.TrimPrefix(bf.path, "/"))), bf.disk); err != nil {
+			return err
+		}
 	}
 	if err := place(filepath.Join(px, "vmlinuz"), root.Lookup("usr/lib/modules/"+kver+"/vmlinuz").Ref); err != nil {
 		return err

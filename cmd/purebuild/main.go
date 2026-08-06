@@ -64,6 +64,7 @@ func main() {
 		trim       = flag.String("trim", "var/cache,var/log,var/tmp,tmp,run", "comma-separated rootfs paths emptied before authoring (boot-irrelevant caches)")
 		ddi        = flag.String("ddi", "", "build from a systemd-sysupdate v1 artifact directory (URL or local path containing SHA256SUMS + UKI + root.raw[.xz]) instead of an OCI image — tacklebox#172")
 		ddiStem    = flag.String("ddi-stem", "", "artifact stem to select in the DDI manifest (e.g. snow-ab); required when the manifest lists several")
+		liveMarker = flag.String("live-marker", "", "readiness string the baked tbox-live-ready.service prints to the serial console (default "+purefs.DefaultLiveMarker+")")
 	)
 	flag.Parse()
 	if *ddi != "" {
@@ -174,10 +175,9 @@ func main() {
 	}
 	log.Printf(">>> autologin + display-manager configured")
 
-	// Readiness marker for the e2e harness — tunaOS images ship it,
-	// reference images (aurora et al.) don't, and without it a perfectly
-	// booted live ISO times the harness out.
-	if err := purefs.EnsureLiveReadyMarker(root, store); err != nil {
+	// Readiness marker for serial-polling e2e harnesses; images shipping
+	// their own readiness unit are left untouched.
+	if err := purefs.EnsureLiveReadyMarker(root, store, *liveMarker); err != nil {
 		log.Fatal(err)
 	}
 

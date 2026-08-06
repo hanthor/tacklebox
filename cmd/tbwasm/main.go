@@ -202,6 +202,10 @@ func buildIso(_ js.Value, args []js.Value) any {
 	}
 	packages := strSlice("packages")
 	extraRun := strSlice("extraRun")
+	liveMarker := ""
+	if v := opts.Get("liveMarker"); v.Type() == js.TypeString {
+		liveMarker = v.String()
+	}
 	return promise(func() (any, error) {
 		if gRoot == nil {
 			return nil, fmt.Errorf("introspect an image first")
@@ -230,10 +234,10 @@ func buildIso(_ js.Value, args []js.Value) any {
 		if err := purefs.EnsureAutologin(root, store, purefs.DetectDesktop(root), "liveuser"); err != nil {
 			return nil, err
 		}
-		// Readiness marker for the e2e harness — tunaOS images ship it,
-		// reference images (aurora et al.) don't, and without it a
-		// perfectly booted live ISO times the harness out.
-		if err := purefs.EnsureLiveReadyMarker(root, store); err != nil {
+		// Readiness marker for serial-polling e2e harnesses; images
+		// shipping their own readiness unit are left untouched.
+		// opts.liveMarker overrides the neutral default.
+		if err := purefs.EnsureLiveReadyMarker(root, store, liveMarker); err != nil {
 			return nil, err
 		}
 

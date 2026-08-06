@@ -158,3 +158,69 @@ func TestLiveGrubCfg(t *testing.T) {
 		}
 	}
 }
+
+// addHardlink plants a TypeHardlink node the way Unpack stores tar link
+// entries: root-relative Target, no Ref of its own.
+func addHardlink(t *testing.T, root *oci.Node, p, target string) {
+	t.Helper()
+	parts := strings.Split(p, "/")
+	n := root
+	for _, d := range parts[:len(parts)-1] {
+		c, ok := n.Children[d]
+		if !ok {
+			c = &oci.Node{Type: oci.TypeDir, Mode: 0o755, Children: map[string]*oci.Node{}}
+			n.Children[d] = c
+		}
+		n = c
+	}
+	n.Children[parts[len(parts)-1]] = &oci.Node{Type: oci.TypeHardlink, Target: target}
+}
+
+func TestDetectBootChainAuroraHardlinkFarm(t *testing.T) {
+	// The exact aurora:stable shape that run 31069841619 failed on: the
+	// versioned layout is present, but rpm ships the shim payload as one
+	// inode under many names, so tar delivers most of them as hardlink
+	// entries. Here the only REGULAR file is EFI/BOOT/BOOTX64.EFI; the
+	// vendor-dir names all arrive as links to it.
+	root := bootTree(t,
+		"usr/lib/bootupd/updates/EFI.json",
+		"usr/lib/efi/grub2/1:2.12-60.fc44/EFI/fedora/grubia32.efi",
+		"usr/lib/efi/grub2/1:2.12-60.fc44/EFI/fedora/grubx64.efi",
+		"usr/lib/efi/shim/16.1-5/EFI/BOOT/BOOTX64.EFI",
+	)
+	addHardlink(t, root, "usr/lib/efi/shim/16.1-5/EFI/fedora/shimx64.efi",
+		"usr/lib/efi/shim/16.1-5/EFI/BOOT/BOOTX64.EFI")
+	addHardlink(t, root, "usr/lib/efi/shim/16.1-5/EFI/fedora/shim.efi",
+		"usr/lib/efi/shim/16.1-5/EFI/BOOT/BOOTX64.EFI")
+	addHardlink(t, root, "usr/lib/efi/shim/16.1-5/EFI/fedora/mmx64.efi",
+		"usr/lib/efi/shim/16.1-5/EFI/BOOT/fbx64.efi") // dangling target: must not be reported
+
+	bc, err := DetectBootChain(root)
+	if err != nil {
+		t.Fatalf("aurora hardlink layout not detected: %v", err)
+	}
+	if bc.Kind != "grub2" || bc.Vendor != "fedora" {
+		t.Fatalf("got %+v", bc)
+	}
+	// The stored shim path must be the RESOLVED regular file so the
+	// builders can open its blob directly.
+	if bc.Shim != "usr/lib/efi/shim/16.1-5/EFI/BOOT/BOOTX64.EFI" {
+		t.Fatalf("shim not hardlink-resolved: %+v", bc)
+	}
+	if bc.MokMgr != "" {
+		t.Fatalf("dangling mm hardlink must resolve to absent, got %+v", bc)
+	}
+}
+
+func TestDetectBootChainHardlinkedSdBoot(t *testing.T) {
+	root := bootTree(t, "usr/lib/systemd/boot/efi/systemd-bootx64.efi.real")
+	addHardlink(t, root, "usr/lib/systemd/boot/efi/systemd-bootx64.efi",
+		"usr/lib/systemd/boot/efi/systemd-bootx64.efi.real")
+	bc, err := DetectBootChain(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bc.Kind != "sdboot" || !strings.HasSuffix(bc.SdBoot, ".real") {
+		t.Fatalf("got %+v", bc)
+	}
+}

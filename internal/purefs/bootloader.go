@@ -59,8 +59,8 @@ var sdBootCandidates = []string{
 // GRUB path cannot change any previously-working build.
 func DetectBootChain(root *oci.Node) (*BootChain, error) {
 	for _, p := range sdBootCandidates {
-		if n := root.Lookup(p); n != nil && n.Type == oci.TypeFile {
-			return &BootChain{Kind: "sdboot", SdBoot: p}, nil
+		if rp, n := resolveFile(root, p); n != nil {
+			return &BootChain{Kind: "sdboot", SdBoot: rp}, nil
 		}
 	}
 
@@ -79,13 +79,11 @@ func DetectBootChain(root *oci.Node) (*BootChain, error) {
 			if vd == nil || vd.Type != oci.TypeDir {
 				continue
 			}
-			shim := base + "/" + vendor + "/shimx64.efi"
-			grub := base + "/" + vendor + "/grubx64.efi"
-			if isFile(root, shim) && isFile(root, grub) {
+			shim, sn := resolveFile(root, base+"/"+vendor+"/shimx64.efi")
+			grub, gn := resolveFile(root, base+"/"+vendor+"/grubx64.efi")
+			if sn != nil && gn != nil {
 				bc := &BootChain{Kind: "grub2", Shim: shim, Grub: grub, Vendor: vendor}
-				if mm := base + "/" + vendor + "/mmx64.efi"; isFile(root, mm) {
-					bc.MokMgr = mm
-				}
+				bc.MokMgr, _ = resolveFile(root, base+"/"+vendor+"/mmx64.efi")
 				return bc, nil
 			}
 		}
@@ -94,13 +92,20 @@ func DetectBootChain(root *oci.Node) (*BootChain, error) {
 	// bootupd's current Fedora layout: versioned shim and GRUB payloads
 	// under /usr/lib/efi/{shim,grub2}/<version>/EFI/<vendor>/, matched
 	// into a coherent pair by vendor directory (only EFI.json remains
-	// under bootupd/updates).
+	// under bootupd/updates). Vendor comes from the MATCHED location;
+	// the stored paths are hardlink-resolved (see resolveFile).
 	if grub := findFirst(root, "usr/lib/efi/grub2", "grubx64.efi", ""); grub != "" {
 		vendor := path.Base(path.Dir(grub))
 		if shim := findFirst(root, "usr/lib/efi/shim", "shimx64.efi", "EFI/"+vendor+"/shimx64.efi"); shim != "" {
-			bc := &BootChain{Kind: "grub2", Shim: shim, Grub: grub, Vendor: vendor}
-			bc.MokMgr = findFirst(root, "usr/lib/efi/shim", "mmx64.efi", "EFI/"+vendor+"/mmx64.efi")
-			return bc, nil
+			grubR, gn := resolveFile(root, grub)
+			shimR, sn := resolveFile(root, shim)
+			if gn != nil && sn != nil {
+				bc := &BootChain{Kind: "grub2", Shim: shimR, Grub: grubR, Vendor: vendor}
+				if mm := findFirst(root, "usr/lib/efi/shim", "mmx64.efi", "EFI/"+vendor+"/mmx64.efi"); mm != "" {
+					bc.MokMgr, _ = resolveFile(root, mm)
+				}
+				return bc, nil
+			}
 		}
 	}
 
@@ -119,9 +124,32 @@ func LiveGrubCfg(title, kernelPath, initrdPath, kargs string) string {
 		title, kernelPath, kargs, initrdPath)
 }
 
-func isFile(root *oci.Node, p string) bool {
-	n := root.Lookup(p)
-	return n != nil && n.Type == oci.TypeFile
+// resolveFile follows hardlinks to the regular file that carries the
+// bytes, returning the resolved path and node ("" / nil when p does not
+// lead to one). rpm ships the shim payload as a hardlink farm —
+// shimx64.efi, shim.efi and EFI/BOOT/BOOTX64.EFI are ONE inode on
+// Fedora — and tar represents every occurrence after the first as a
+// link entry, which Unpack stores as TypeHardlink with a root-relative
+// Target (the same convention the EROFS writer resolves). Matching only
+// TypeFile made the whole chain read as absent on aurora:stable, whose
+// versioned shim probe found nothing but link entries
+// (iso-builder run 31069841619).
+func resolveFile(root *oci.Node, p string) (string, *oci.Node) {
+	for hops := 0; hops < 8; hops++ {
+		n := root.Lookup(p)
+		if n == nil {
+			return "", nil
+		}
+		switch n.Type {
+		case oci.TypeFile:
+			return p, n
+		case oci.TypeHardlink:
+			p = n.Target
+		default:
+			return "", nil
+		}
+	}
+	return "", nil
 }
 
 func sortedNames(d *oci.Node) []string {
@@ -133,11 +161,12 @@ func sortedNames(d *oci.Node) []string {
 	return names
 }
 
-// findFirst returns the tree path of the first file named `name` under
-// `base` (sorted depth-first, so deterministic). A non-empty `suffix`
-// additionally requires the path to end with it — that is how the
-// versioned shim payload is matched to the vendor directory the GRUB
-// payload named.
+// findFirst returns the tree path of the first file (or hardlink that
+// resolves to one) named `name` under `base` (sorted depth-first, so
+// deterministic). A non-empty `suffix` additionally requires the path to
+// end with it — that is how the versioned shim payload is matched to the
+// vendor directory the GRUB payload named. The MATCHED path is returned
+// (it carries the vendor location); callers resolve it before staging.
 func findFirst(root *oci.Node, base, name, suffix string) string {
 	d := root.Lookup(base)
 	if d == nil || d.Type != oci.TypeDir {
@@ -148,9 +177,12 @@ func findFirst(root *oci.Node, base, name, suffix string) string {
 		if found != "" {
 			return nil
 		}
-		if n.Type == oci.TypeFile && path.Base(p) == name {
+		if (n.Type == oci.TypeFile || n.Type == oci.TypeHardlink) && path.Base(p) == name {
 			full := base + "/" + p
-			if suffix == "" || strings.HasSuffix(full, suffix) {
+			if suffix != "" && !strings.HasSuffix(full, suffix) {
+				return nil
+			}
+			if _, fn := resolveFile(root, full); fn != nil {
 				found = full
 			}
 		}

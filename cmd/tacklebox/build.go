@@ -89,6 +89,18 @@ func runBuild(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Resolve remora manifests (if any) against the recipe directory.
+	// Inline manifests are validated for well-formedness; path/URL forms
+	// are resolved to absolute paths and checked for existence.
+	remoraManifests := make([]*install.RemoraManifest, len(r.BootableEnvironments))
+	for i := range r.BootableEnvironments {
+		rm, err := resolveRemora(r.BootableEnvironments[i], recipeDir)
+		if err != nil {
+			return fmt.Errorf("remora for env %s: %w", r.BootableEnvironments[i].ID, err)
+		}
+		remoraManifests[i] = rm
+	}
+
 	// Validate the target argument shape before doing any filesystem work,
 	// so a typo like `tacklebox build recipe.json sdaX` fails instantly
 	// instead of after creating an output directory.
@@ -263,7 +275,7 @@ func runBuild(cmd *cobra.Command, args []string) error {
 		useVFS = true
 	}
 
-	if err := runEnvs(r, tgt, mp.StoreMount, mp.EspMount, parallelN, track); err != nil {
+	if err := runEnvs(r, tgt, mp.StoreMount, mp.EspMount, parallelN, track, remoraManifests); err != nil {
 		return err
 	}
 
@@ -425,18 +437,18 @@ func confirmDestructive(target string, assumeYes bool) error {
 // because we haven't broadly battle-tested it across image families. Stick
 // with parallel=1 for production builds; use --parallel-install=N to try
 // the faster path when total wall time matters more than risk.
-func runEnvs(r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, parallel int, track func(string, func() error) error) error {
+func runEnvs(r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, parallel int, track func(string, func() error) error, remoraManifests []*install.RemoraManifest) error {
 	// Cross-env dedup (ISO only): envs share squashfs content, so the
 	// per-env loop shape doesn't apply.
 	if tgt.InstallMode() == target.InstallModeLive && r.SharedStore.Dedup {
 		if r.SharedStore.DedupLayout == "delta" {
-			return installEnvsLiveDelta(r, tgt, storeMount, espMount, track)
+			return installEnvsLiveDelta(r, tgt, storeMount, espMount, track, remoraManifests)
 		}
-		return installEnvsLiveCombined(r, tgt, storeMount, espMount, track)
+		return installEnvsLiveCombined(r, tgt, storeMount, espMount, track, remoraManifests)
 	}
 	if parallel <= 1 {
-		for _, env := range r.BootableEnvironments {
-			if err := installEnv(env, r, tgt, storeMount, espMount, track); err != nil {
+		for i, env := range r.BootableEnvironments {
+			if err := installEnv(env, r, tgt, storeMount, espMount, track, remoraManifests[i]); err != nil {
 				return err
 			}
 		}
@@ -453,7 +465,7 @@ func runEnvs(r recipe.MediaRecipe, tgt target.Target, storeMount, espMount strin
 		go func(i int, env recipe.BootableEnvironment) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			errs[i] = installEnv(env, r, tgt, storeMount, espMount, track)
+			errs[i] = installEnv(env, r, tgt, storeMount, espMount, track, remoraManifests[i])
 		}(i, env)
 	}
 	wg.Wait()
@@ -502,6 +514,41 @@ func validateDedupLayout(r recipe.MediaRecipe) error {
 		return fmt.Errorf("shared_store.delta_base %q does not name a bootable environment", r.SharedStore.DeltaBase)
 	}
 	return nil
+}
+
+// resolveRemora resolves env.Remora into an install.RemoraManifest.
+// Returns nil when env.Remora is empty (no remora customization).
+// String form is resolved relative to recipeDir; object form is parsed
+// inline.
+func resolveRemora(env recipe.BootableEnvironment, recipeDir string) (*install.RemoraManifest, error) {
+	if len(env.Remora) == 0 {
+		return nil, nil
+	}
+
+	// Try string form first: a path or URL to a remora manifest file.
+	var path string
+	if err := json.Unmarshal(env.Remora, &path); err == nil {
+		if path == "" {
+			return nil, nil
+		}
+		// URLs pass through as-is (remora handles fetching).
+		if !strings.Contains(path, "://") && !filepath.IsAbs(path) {
+			path = filepath.Join(recipeDir, path)
+		}
+		if !strings.Contains(path, "://") {
+			if _, err := os.Stat(path); err != nil {
+				return nil, fmt.Errorf("remora manifest %s: %w", path, err)
+			}
+		}
+		return &install.RemoraManifest{Path: path}, nil
+	}
+
+	// Object form: inline manifest.
+	var rm install.RemoraManifest
+	if err := json.Unmarshal(env.Remora, &rm); err != nil {
+		return nil, fmt.Errorf("remora: must be a path/URL string or an inline object with packages/remove/configs: %w", err)
+	}
+	return &rm, nil
 }
 
 // deltaBaseEnv resolves the delta layout's base env: delta_base if set,
@@ -641,12 +688,12 @@ func buildKernelCmdline(envID string, mode recipe.BootMode, backend install.Back
 // installEnv runs the per-env install pipeline. Dispatches on the
 // target's InstallMode: bootc (block targets) or live (iso targets).
 // Safe to invoke concurrently for distinct envs.
-func installEnv(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, track func(string, func() error) error) error {
+func installEnv(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, track func(string, func() error) error, remoraManifest *install.RemoraManifest) error {
 	switch tgt.InstallMode() {
 	case target.InstallModeBootc:
 		return installEnvBootc(env, r, tgt, storeMount, espMount, track)
 	case target.InstallModeLive:
-		return installEnvLive(env, r, tgt, storeMount, espMount, track)
+		return installEnvLive(env, r, tgt, storeMount, espMount, track, remoraManifest)
 	}
 	return fmt.Errorf("unsupported install mode %q", tgt.InstallMode())
 }
@@ -735,7 +782,7 @@ func installEnvBootc(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt t
 // writes a tbox-live BLS entry. ISO label comes from the IsoTarget;
 // we reach it via a small interface to avoid a hard target.IsoTarget
 // import.
-func installEnvLive(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, track func(string, func() error) error) error {
+func installEnvLive(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, track func(string, func() error) error, remoraManifest *install.RemoraManifest) error {
 	type labelled interface{ IsoLabel() string }
 	label := "TACKLEBOX"
 	if l, ok := tgt.(labelled); ok {
@@ -754,6 +801,24 @@ func installEnvLive(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt ta
 			return err
 		}); err != nil {
 			return fmt.Errorf("live customize for %s: %w", env.ID, err)
+		}
+	}
+
+	// Remora package/config layering: runs /usr/bin/remora apply inside a
+	// container of the (possibly already customized) image, commits the
+	// result, and squashes the derived image. Must happen after
+	// live_customize so remora sees any filesystem changes those scripts
+	// made, and before squash/extract so the layered packages land in the
+	// final rootfs.
+	if remoraManifest != nil {
+		if err := track("remora:"+env.ID, func() error {
+			derived, err := install.RemoraCustomize(env.Image, remoraManifest)
+			if err == nil {
+				env.Image = derived
+			}
+			return err
+		}); err != nil {
+			return fmt.Errorf("remora customize for %s: %w", env.ID, err)
 		}
 	}
 
@@ -808,7 +873,7 @@ func installEnvLive(env recipe.BootableEnvironment, r recipe.MediaRecipe, tgt ta
 // files shared between images. Each env still gets its own kernel,
 // initrd, and BLS entry; the entry pivots into the env's subtree via
 // tacklebox.root= (see buildLiveKernelCmdlineCombined).
-func installEnvsLiveCombined(r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, track func(string, func() error) error) error {
+func installEnvsLiveCombined(r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, track func(string, func() error) error, remoraManifests []*install.RemoraManifest) error {
 	type labelled interface{ IsoLabel() string }
 	label := "TACKLEBOX"
 	if l, ok := tgt.(labelled); ok {
@@ -831,6 +896,23 @@ func installEnvsLiveCombined(r recipe.MediaRecipe, tgt target.Target, storeMount
 			return err
 		}); err != nil {
 			return fmt.Errorf("live customize for %s: %w", env.ID, err)
+		}
+	}
+
+	// Remora layering for each env (after customize, before squash).
+	for i := range localEnvs {
+		env := &localEnvs[i]
+		if remoraManifests[i] == nil {
+			continue
+		}
+		if err := track("remora:"+env.ID, func() error {
+			derived, err := install.RemoraCustomize(env.Image, remoraManifests[i])
+			if err == nil {
+				env.Image = derived
+			}
+			return err
+		}); err != nil {
+			return fmt.Errorf("remora customize for %s: %w", env.ID, err)
 		}
 	}
 
@@ -898,7 +980,7 @@ func installEnvsLiveCombined(r recipe.MediaRecipe, tgt target.Target, storeMount
 // Compared to the combined layout: slightly weaker dedup (the diff is
 // against one base, not global), but updating a single env's image only
 // re-squashes that env's delta instead of the whole store.
-func installEnvsLiveDelta(r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, track func(string, func() error) error) error {
+func installEnvsLiveDelta(r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, track func(string, func() error) error, remoraManifests []*install.RemoraManifest) error {
 	type labelled interface{ IsoLabel() string }
 	label := "TACKLEBOX"
 	if l, ok := tgt.(labelled); ok {
@@ -922,6 +1004,23 @@ func installEnvsLiveDelta(r recipe.MediaRecipe, tgt target.Target, storeMount, e
 			return err
 		}); err != nil {
 			return fmt.Errorf("live customize for %s: %w", env.ID, err)
+		}
+	}
+
+	// Remora layering for each env (after customize, before squash).
+	for i := range localEnvs {
+		env := &localEnvs[i]
+		if remoraManifests[i] == nil {
+			continue
+		}
+		if err := track("remora:"+env.ID, func() error {
+			derived, err := install.RemoraCustomize(env.Image, remoraManifests[i])
+			if err == nil {
+				env.Image = derived
+			}
+			return err
+		}); err != nil {
+			return fmt.Errorf("remora customize for %s: %w", env.ID, err)
 		}
 	}
 

@@ -87,6 +87,24 @@ type BootableEnvironment struct {
 	// and the script runs with that as its working directory, so scripts can
 	// reference sibling assets (icons, configs) relatively.
 	LiveCustomize []string `json:"live_customize,omitempty"`
+	// Remora is an optional remora manifest that drives package and config
+	// customizations at ISO build time (github.com/tuna-os/remora).
+	//
+	// Inline form (maps to `remora apply` arguments):
+	//   "remora": {"packages": ["vim"], "remove": ["nano"],
+	//               "configs": [{"path": "/etc/issue", "content": "..."}]}
+	//
+	// Path/URL form (resolved relative to the recipe file's directory):
+	//   "remora": "./manifests/dev.json"
+	//   "remora": "https://example.com/remora.json"
+	//
+	// Build-time: tacklebox runs /usr/bin/remora apply inside a container
+	// of the env's image after live_customize scripts, commits the result,
+	// and squashes/extracts the derived image. The manifest is embedded at
+	// /usr/share/tbox/remora-manifest.json in the squashfs for the
+	// installer to replay post-install (install persistence is follow-up;
+	// see PR body).
+	Remora json.RawMessage `json:"remora,omitempty"`
 }
 
 // OfflinePayload describes an image copied into Tacklebox's read-only

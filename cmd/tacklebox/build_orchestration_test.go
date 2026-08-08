@@ -202,7 +202,7 @@ func TestRunEnvsBootcSequentialStopsOnFirstError(t *testing.T) {
 	secondRoot := filepath.Join(storeMount, "tbox-install", "second")
 	m.runErr["sudo mkdir -p "+secondRoot] = fmt.Errorf("no space left on device")
 
-	err := runEnvs(r, tgt, storeMount, espMount, 1, noopTrack)
+	err := runEnvs(r, tgt, storeMount, espMount, 1, noopTrack, nil)
 	if err == nil {
 		t.Fatal("expected an error")
 	}

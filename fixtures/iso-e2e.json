@@ -1,0 +1,29 @@
+{
+  "media_name": "TBX_E2E_OFFLINE",
+  "size": "30G",
+  "default_boot": "alpha",
+  "offline_payloads": [
+    "localhost/tbox-iso-alpha:latest",
+    "localhost/tbox-iso-beta:latest"
+  ],
+  "shared_store": {
+    "format": "ext4",
+    "dedup": true
+  },
+  "bootable_environments": [
+    {
+      "id": "alpha",
+      "image": "localhost/tbox-iso-alpha:latest",
+      "title": "Fixture Alpha (E2E)",
+      "modes": ["live"],
+      "live_customize": ["e2e-sshd-setup.sh"]
+    },
+    {
+      "id": "beta",
+      "image": "localhost/tbox-iso-beta:latest",
+      "title": "Fixture Beta (E2E)",
+      "modes": ["live"],
+      "live_customize": ["e2e-sshd-setup.sh"]
+    }
+  ]
+}

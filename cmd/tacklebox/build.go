@@ -233,17 +233,49 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	if parallelN > len(r.BootableEnvironments) {
 		parallelN = len(r.BootableEnvironments)
 	}
+
+	// VFS embed for composefs-only ISO targets: build the VFS store BEFORE
+	// env installs so InstallLive can embed it into each per-env rootfs
+	// squashfs. The store lands at /var/lib/containers/storage inside the
+	// squashfs — no separate store.squashfs.img, no additionalimagestores,
+	// no driver matching required (tuna-os/tacklebox#92).
+	useVFS := false
+	if len(r.OfflinePayloads) > 0 && tgt.InstallMode() == target.InstallModeLive && allComposefs(r) {
+		payloads := make([]install.OfflinePayload, 0, len(r.OfflinePayloads))
+		for _, payload := range r.OfflinePayloads {
+			payloads = append(payloads, install.OfflinePayload{Source: payload.Source, Ref: payload.Ref})
+		}
+		var vfsRoot string
+		if err := track("offline-store:vfs", func() error {
+			var verr error
+			vfsRoot, verr = install.BuildVFSStorePayloads(payloads, outputBase)
+			return verr
+		}); err != nil {
+			return err
+		}
+		defer func() {
+			if vfsRoot != "" {
+				_ = runner.Run("sudo", "rm", "-rf", vfsRoot)
+			}
+		}()
+		install.SetVFSStorePath(vfsRoot)
+		defer install.SetVFSStorePath("")
+		useVFS = true
+	}
+
 	if err := runEnvs(r, tgt, mp.StoreMount, mp.EspMount, parallelN, track); err != nil {
 		return err
 	}
 
 	// Build the offline image store if the recipe lists offline_payloads.
+	// For composefs-only ISO targets the VFS store was embedded in each
+	// env's rootfs squashfs above — skip the separate overlay store.
 	// For IsoTarget the squashfs lands at LiveOS/store.squashfs.img where the
 	// live container's superiso-store.mount unit expects it.
 	// For BlockTarget it lands at the root of TBOX_STORE as
 	// tbox-containers.squashfs and each deployed env gets a mount unit +
 	// storage.conf drop-in provisioned so the store is visible at boot.
-	if len(r.OfflinePayloads) > 0 {
+	if len(r.OfflinePayloads) > 0 && !useVFS {
 		payloads := make([]install.OfflinePayload, 0, len(r.OfflinePayloads))
 		for _, payload := range r.OfflinePayloads {
 			payloads = append(payloads, install.OfflinePayload{Source: payload.Source, Ref: payload.Ref})
@@ -1155,6 +1187,26 @@ func estimateStoreUsage(r recipe.MediaRecipe) (uint64, uint64, bool) {
 		}
 	}
 	return needed, store, true
+}
+
+// allComposefs reports whether every bootable environment uses the composefs
+// backend. When true and the recipe has offline_payloads, the orchestrator
+// can use the VFS embed path (tuna-os/tacklebox#92).
+func allComposefs(r recipe.MediaRecipe) bool {
+	if len(r.BootableEnvironments) == 0 {
+		return false
+	}
+	for _, env := range r.BootableEnvironments {
+		backend := install.Backend(env.Backend)
+		if backend == "" {
+			// Auto-detect: treat as non-composefs for safety.
+			return false
+		}
+		if backend != install.BackendComposefs {
+			return false
+		}
+	}
+	return true
 }
 
 // parseSize accepts forms like "32G", "16384M", "1T", "500K" (decimal G=2^30 here

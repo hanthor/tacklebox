@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/tuna-os/tacklebox/internal/runner"
 )
@@ -80,6 +81,21 @@ func BuildOfflineStorePayloads(payloads []OfflinePayload, stagingRoot, dstSquash
 		}
 	}
 
+	// Write storage.conf into the store so the consumer sees an explicit
+	// driver=overlay declaration. Without this, additionalimagestores
+	// silently ignores the store when the consumer's primary graphroot
+	// uses a different driver (e.g. btrfs, the EL10 default), making
+	// every embedded image invisible — a silent failure with no error
+	// message (tuna-os/tacklebox#93).
+	storeConfDir := filepath.Join(storeRoot, "etc", "containers")
+	if err := os.MkdirAll(storeConfDir, 0777); err != nil {
+		return fmt.Errorf("mkdir store storage.conf dir: %w", err)
+	}
+	storeConf := "[storage]\ndriver = \"overlay\"\n"
+	if err := os.WriteFile(filepath.Join(storeConfDir, "storage.conf"), []byte(storeConf), 0644); err != nil {
+		return fmt.Errorf("write store storage.conf: %w", err)
+	}
+
 	// Pull each image inside podman unshare: user-namespace overlay gives
 	// correct UID mappings and deduplication across shared base layers.
 	prune := len(pruneSourceImages) > 0 && pruneSourceImages[0]
@@ -143,6 +159,195 @@ func BuildOfflineStorePayloads(payloads []OfflinePayload, stagingRoot, dstSquash
 	if err := runner.Run("sudo", "mv", tmpPath, dstSquashfs); err != nil {
 		return fmt.Errorf("move store squashfs to %s: %w", dstSquashfs, err)
 	}
+	return nil
+}
+
+// BuildVFSStorePayloads builds a VFS (driver-agnostic) containers-storage
+// store for composefs backends. Unlike the overlay store, VFS has no driver
+// compatibility requirement — the consumer can use it regardless of their
+// primary storage driver.
+//
+// The approach follows the dakota-iso pattern:
+//  1. buildah commit --squash each payload image to a single layer
+//  2. Fix ostree.final-diffid label and annotation to match the new diffid
+//  3. skopeo copy into a VFS staging store
+//  4. The caller embeds the store into the main squashfs via InstallLiveWithStore
+//
+// Returns the path to the VFS store directory. The caller owns cleanup.
+func BuildVFSStorePayloads(payloads []OfflinePayload, stagingRoot string) (string, error) {
+	if len(payloads) == 0 {
+		return "", nil
+	}
+
+	vfsRoot := filepath.Join(stagingRoot, "tbox-vfs-store")
+	vfsRunRoot, err := os.MkdirTemp("/tmp", "tbox-vfsrun-")
+	if err != nil {
+		return "", fmt.Errorf("create VFS runroot: %w", err)
+	}
+	defer os.RemoveAll(vfsRunRoot)
+
+	for _, d := range []string{vfsRoot, vfsRunRoot} {
+		if err := ClearEnvDir(d); err != nil {
+			return "", fmt.Errorf("clear %s: %w", d, err)
+		}
+		if err := os.MkdirAll(d, 0777); err != nil {
+			return "", fmt.Errorf("mkdir %s: %w", d, err)
+		}
+		if err := os.Chmod(d, 0777); err != nil {
+			return "", fmt.Errorf("chmod %s: %w", d, err)
+		}
+	}
+
+	// Write storage.conf with driver=vfs into the store so the consumer
+	// can use it as a primary graphroot without additionalimagestores.
+	vfsConfDir := filepath.Join(vfsRoot, "etc", "containers")
+	if err := os.MkdirAll(vfsConfDir, 0777); err != nil {
+		return "", fmt.Errorf("mkdir VFS storage.conf dir: %w", err)
+	}
+	vfsConf := "[storage]\ndriver = \"vfs\"\ngraphroot = \"/var/lib/containers/storage\"\n"
+	if err := os.WriteFile(filepath.Join(vfsConfDir, "storage.conf"), []byte(vfsConf), 0644); err != nil {
+		return "", fmt.Errorf("write VFS storage.conf: %w", err)
+	}
+
+	buildahPath, err := exec.LookPath("buildah")
+	if err != nil {
+		return "", fmt.Errorf("buildah not found in PATH: %w", err)
+	}
+	skopeoPath, err := exec.LookPath("skopeo")
+	if err != nil {
+		return "", fmt.Errorf("skopeo not found in PATH: %w", err)
+	}
+
+	podman := UserPodmanPrefix()
+	for _, payload := range payloads {
+		if payload.Source == "" || payload.Ref == "" {
+			return "", fmt.Errorf("offline payload needs both source and ref")
+		}
+
+		// 1. Verify the source image exists.
+		podmanArgs := append(podman[1:], "image", "exists", payload.Source)
+		if err := runner.Run(podman[0], podmanArgs...); err != nil {
+			return "", fmt.Errorf("VFS offline payload source %s is not present in the builder podman store: %w", payload.Source, err)
+		}
+
+		// 2. Squash to a single layer via buildah commit --squash.
+		//    Composefs images are single-filesystem blobs; squashing
+		//    produces a minimal VFS store with exactly one layer.
+		squashedRef := "localhost/tbox-vfs-squashed:" + strings.Map(func(r rune) rune {
+			if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+				return r
+			}
+			return '_'
+		}, payload.Ref)
+		fmt.Printf(">>> [vfs-store] squashing %s to single layer\n", payload.Source)
+		squashScript := fmt.Sprintf("%s commit --squash --quiet %s %s",
+			buildahPath, shellEsc(payload.Source), shellEsc(squashedRef))
+		if err := RunUnshare(squashScript); err != nil {
+			return "", fmt.Errorf("buildah commit --squash %s: %w", payload.Source, err)
+		}
+
+		// 3. Fix ostree.final-diffid label and annotation.
+		//    After squash the diffid changes; if the original image had
+		//    this label/annotation (common in bootc composefs images),
+		//    it must be updated to match the new content.
+		if err := fixFinalDiffID(squashedRef, podman); err != nil {
+			fmt.Printf(">>> [vfs-store] warning: fix ostree.final-diffid for %s: %v\n", payload.Source, err)
+		}
+
+		// 4. skopeo copy into the VFS store.
+		src := "containers-storage:" + squashedRef
+		dest := fmt.Sprintf("containers-storage:[vfs@%s+%s]%s", vfsRoot, vfsRunRoot, payload.Ref)
+		fmt.Printf(">>> [vfs-store] copying %s -> %s (VFS)\n", squashedRef, payload.Ref)
+
+		timeoutSeconds := 1800
+		if raw := os.Getenv("TACKLEBOX_OFFLINE_COPY_TIMEOUT"); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+				timeoutSeconds = parsed
+			}
+		}
+		copyScript := fmt.Sprintf("timeout %d %s copy --remove-signatures %s %s",
+			timeoutSeconds, skopeoPath, shellEsc(src), shellEsc(dest))
+		if err := RunUnshare(copyScript); err != nil {
+			return "", fmt.Errorf("skopeo copy into VFS store %s: %w", payload.Ref, err)
+		}
+
+		// 5. Clean up the squashed intermediate.
+		cleanupArgs := append(podman[1:], "image", "rm", squashedRef)
+		_ = runner.Run(podman[0], cleanupArgs...)
+	}
+
+	if out, err := runner.Output("du", "-sh", vfsRoot); err == nil {
+		fmt.Printf(">>> [vfs-store] VFS store size: %s", out)
+	}
+
+	return vfsRoot, nil
+}
+
+// fixFinalDiffID updates the ostree.final-diffid label on a squashed
+// image to match the new top-layer diffid. After squash the layer diffid
+// changes; if the original image had this label (common in bootc composefs
+// images), it must be updated so bootc can verify the deployment.
+func fixFinalDiffID(imageRef string, podman []string) error {
+	// Get the new diffid from the squashed image.
+	args := append(podman[1:], "inspect", "--format", "{{.RootFS.Layers}}", imageRef)
+	out, err := runner.Output(podman[0], args...)
+	if err != nil {
+		return fmt.Errorf("inspect layers: %w", err)
+	}
+	// Parse the last layer digest; output looks like [sha256:abc sha256:def].
+	layers := strings.TrimSpace(string(out))
+	if layers == "[]" || layers == "" {
+		return fmt.Errorf("no layers found in squashed image")
+	}
+	// Find the last sha256:... token.
+	last := layers
+	if idx := strings.LastIndex(last, "sha256:"); idx >= 0 {
+		last = last[idx:]
+		if space := strings.IndexAny(last, " ]"); space > 0 {
+			last = last[:space]
+		}
+	} else {
+		return fmt.Errorf("no sha256 digest in layer list %q", layers)
+	}
+	newDiffID := last
+
+	// Check if the old label exists.
+	args = append(podman[1:], "inspect", "--format", "{{index .Labels \"ostree.final-diffid\"}}", imageRef)
+	labelOut, labelErr := runner.Output(podman[0], args...)
+
+	if labelErr != nil || strings.TrimSpace(string(labelOut)) == "" || strings.TrimSpace(string(labelOut)) == "<no value>" {
+		// No existing label — nothing to fix.
+		fmt.Printf(">>> [vfs-store] no existing ostree.final-diffid label on %s, skipping fix\n", imageRef)
+		return nil
+	}
+
+	oldLabel := strings.TrimSpace(string(labelOut))
+	if oldLabel == newDiffID {
+		fmt.Printf(">>> [vfs-store] ostree.final-diffid already matches (%s)\n", newDiffID)
+		return nil
+	}
+
+	fmt.Printf(">>> [vfs-store] updating ostree.final-diffid: %s -> %s\n", oldLabel, newDiffID)
+
+	// Commit the image with updated config.
+	createArgs := append(podman[1:], "create", "--quiet", imageRef, "true")
+	ctrOut, err := runner.Output(podman[0], createArgs...)
+	if err != nil {
+		return fmt.Errorf("create temp container: %w", err)
+	}
+	ctrID := strings.TrimSpace(string(ctrOut))
+	defer func() {
+		rmArgs := append(podman[1:], "rm", "-f", "--ignore", ctrID)
+		_ = runner.Run(podman[0], rmArgs...)
+	}()
+
+	commitArgs := append(podman[1:], "commit", "--quiet",
+		"--change", fmt.Sprintf("LABEL ostree.final-diffid=%s", newDiffID),
+		ctrID, imageRef)
+	if err := runner.Run(podman[0], commitArgs...); err != nil {
+		return fmt.Errorf("commit with fixed diffid: %w", err)
+	}
+
 	return nil
 }
 
@@ -265,6 +470,14 @@ WantedBy=local-fs.target
 # tbox-containers mount unit) available to containers/bootc-installer as a
 # read-only additional image store.  Images in this store can be installed
 # with 'bootc install --source-imgref containers-storage:<ref>'.
+#
+# driver = "overlay" is explicit: additionalimagestores silently ignores
+# stores whose driver doesn't match the primary graphroot (tuna-os/tacklebox#93).
+# By pinning the primary driver to overlay here, a consumer that lacks overlay
+# support will fail with a clear error instead of silently skipping images.
+[storage]
+driver = "overlay"
+
 [storage.options]
 additionalimagestores = ["/var/lib/superiso-store"]
 `

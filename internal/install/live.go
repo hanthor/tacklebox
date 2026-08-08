@@ -14,6 +14,17 @@ import (
 	"github.com/tuna-os/tacklebox/internal/runner"
 )
 
+// vfsStorePath, when non-empty, causes InstallLive to embed a VFS
+// containers-storage store into the rootfs squashfs instead of excluding
+// var/lib/containers/storage. Set by the orchestrator when the recipe uses
+// composefs backends with offline_payloads (tuna-os/tacklebox#92).
+var vfsStorePath string
+
+// SetVFSStorePath sets the VFS store directory to embed in every subsequent
+// InstallLive call. Callers must set this before running env installs and
+// clear it afterwards.
+func SetVFSStorePath(p string) { vfsStorePath = p }
+
 // InstallLive packs the rootfs of image into a single squashfs file at
 // dstSquashfs, suitable for a live ISO consumed by tbox-live.
 //
@@ -36,6 +47,10 @@ import (
 // shared_store.compression value ("release"/"max" for distribution
 // quality; anything else means the fast default).
 func InstallLive(image, dstSquashfs, compression string) error {
+	if vfsStorePath != "" {
+		return InstallLiveWithStore(image, vfsStorePath, dstSquashfs, compression)
+	}
+
 	mountSerialise.Lock()
 	defer mountSerialise.Unlock()
 
@@ -87,6 +102,93 @@ trap 'podman image unmount %s' EXIT
 	}
 
 	return stashSquashfs(tmpPath, cachePath, dstSquashfs)
+}
+
+// InstallLiveWithStore is the composefs VFS-embed variant of InstallLive.
+// It packs env's rootfs into a squashfs with the VFS store embedded at
+// /var/lib/containers/storage, so the consumer can find offline payloads
+// directly in the primary graphroot — no additionalimagestores or driver
+// matching required.
+//
+// The approach uses overlayfs inside podman unshare:
+//  1. Mount the image (read-only lower layer)
+//  2. Create an overlay upper dir with the VFS store at
+//     /var/lib/containers/storage + /etc/containers/storage.conf
+//  3. Mount the overlay
+//  4. mksquashfs the overlay mount (without excluding var/lib/containers/storage)
+//
+// This is zero-copy for the image rootfs — only the store is copied into the
+// upper dir. The approach follows dakota-iso's pattern for composefs targets.
+func InstallLiveWithStore(image, storePath, dstSquashfs, compression string) error {
+	mountSerialise.Lock()
+	defer mountSerialise.Unlock()
+
+	mksquashfsPath, err := exec.LookPath("mksquashfs")
+	if err != nil {
+		return fmt.Errorf("mksquashfs not found in PATH: %w", err)
+	}
+	level, block := squashParams(compression)
+
+	tmpPath, err := tempSquashFile()
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmpPath)
+
+	// VFS store path may be under a root-owned staging tree; podman unshare
+	// runs as the original user. Make storePath world-readable so the unshare
+	// user can copy from it.
+	if err := os.Chmod(storePath, 0755); err != nil {
+		return fmt.Errorf("chmod VFS store %s: %w", storePath, err)
+	}
+
+	script := fmt.Sprintf(`set -eu
+LOWER=$(podman image mount %[1]s)
+trap 'podman image unmount %[1]s >/dev/null 2>&1 || true' EXIT
+
+STAGE=$(mktemp -d)
+UPPER=$(mktemp -d)
+WORK=$(mktemp -d)
+trap 'umount "$STAGE" 2>/dev/null || true; rm -rf "$STAGE" "$UPPER" "$WORK"' EXIT
+
+# Copy VFS store into upper.
+mkdir -p "$UPPER"/var/lib/containers/storage
+cp -a %[2]s/* "$UPPER"/var/lib/containers/storage/
+
+# Copy storage.conf from the VFS store root (etc/containers/storage.conf).
+if [ -d %[2]s/etc/containers ]; then
+  mkdir -p "$UPPER"/etc/containers
+  cp -a %[2]s/etc/containers/* "$UPPER"/etc/containers/
+fi
+
+# Overlay mount: lower=image rootfs, upper=VFS store additions.
+mount -t overlay overlay -o lowerdir="$LOWER",upperdir="$UPPER",workdir="$WORK" "$STAGE"
+
+%[3]s "$STAGE" %[4]s \
+  -noappend -comp zstd -Xcompression-level %[5]s -b %[6]s \
+  -processors 4 \
+  -e proc -e sys -e dev -e run -e tmp
+`,
+		shellEsc(image), shellEsc(storePath),
+		mksquashfsPath, shellEsc(tmpPath),
+		level, block)
+
+	fmt.Printf(">>> [live+vfs] squashing %s + VFS store -> %s (podman unshare, overlay merge)\n", image, dstSquashfs)
+	if err := RunUnshare(script); err != nil {
+		return fmt.Errorf("squashfs with VFS store %s: %w", image, err)
+	}
+
+	// Cache disabled for VFS-embed builds: the cache key would need to
+	// include the VFS store content hash, which we haven't implemented.
+	// The store is built once and shared across envs, so the extra build
+	// time is acceptable.
+	if err := runner.Run("sudo", "mkdir", "-p", filepath.Dir(dstSquashfs)); err != nil {
+		return err
+	}
+	if err := runner.Run("sudo", "mv", tmpPath, dstSquashfs); err != nil {
+		return fmt.Errorf("move squashfs to %s: %w", dstSquashfs, err)
+	}
+	return nil
 }
 
 // LiveEnv is the (env ID, image ref) pair InstallLiveCombined needs from

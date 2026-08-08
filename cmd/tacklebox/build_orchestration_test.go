@@ -223,7 +223,7 @@ func TestRunEnvsBootcParallelAggregatesFailures(t *testing.T) {
 
 	m.runErr["sudo mkdir -p "+filepath.Join(storeMount, "tbox-install", "bad")] = fmt.Errorf("boom")
 
-	err := runEnvs(r, tgt, storeMount, espMount, 2, noopTrack)
+	err := runEnvs(r, tgt, storeMount, espMount, 2, noopTrack, nil)
 	if err == nil {
 		t.Fatal("expected an aggregated error")
 	}
@@ -242,7 +242,7 @@ func TestRunEnvsBootcParallelAllSucceed(t *testing.T) {
 	r := recipe.MediaRecipe{BootableEnvironments: envs}
 	tgt := &fakeTarget{mode: target.InstallModeBootc}
 
-	if err := runEnvs(r, tgt, storeMount, espMount, 2, noopTrack); err != nil {
+	if err := runEnvs(r, tgt, storeMount, espMount, 2, noopTrack, nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	for _, id := range []string{"e1", "e2"} {

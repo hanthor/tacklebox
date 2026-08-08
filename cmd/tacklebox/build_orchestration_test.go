@@ -63,7 +63,7 @@ func TestInstallEnvDispatchesToBootc(t *testing.T) {
 	r := recipe.MediaRecipe{DefaultBoot: "aurora", BootableEnvironments: []recipe.BootableEnvironment{env}}
 	tgt := &fakeTarget{mode: target.InstallModeBootc}
 
-	if err := installEnv(env, r, tgt, storeMount, espMount, noopTrack); err != nil {
+	if err := installEnv(env, r, tgt, storeMount, espMount, noopTrack, nil); err != nil {
 		t.Fatalf("installEnv: %v", err)
 	}
 	entry := filepath.Join(espMount, "loader", "entries", "aurora-persistent.conf")
@@ -78,7 +78,7 @@ func TestInstallEnvRejectsUnsupportedMode(t *testing.T) {
 	r := recipe.MediaRecipe{BootableEnvironments: []recipe.BootableEnvironment{env}}
 	tgt := &fakeTarget{mode: target.InstallMode("unknown")}
 
-	err := installEnv(env, r, tgt, t.TempDir(), t.TempDir(), noopTrack)
+	err := installEnv(env, r, tgt, t.TempDir(), t.TempDir(), noopTrack, nil)
 	if err == nil {
 		t.Fatal("expected an error for an unsupported install mode")
 	}

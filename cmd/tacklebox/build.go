@@ -437,6 +437,17 @@ func confirmDestructive(target string, assumeYes bool) error {
 // because we haven't broadly battle-tested it across image families. Stick
 // with parallel=1 for production builds; use --parallel-install=N to try
 // the faster path when total wall time matters more than risk.
+
+// remoraAt returns the remora manifest for environment i, or nil when the
+// manifest slice is absent or shorter than the environment list (remora
+// layering is optional per environment).
+func remoraAt(manifests []*install.RemoraManifest, i int) *install.RemoraManifest {
+	if i >= 0 && i < len(manifests) {
+		return manifests[i]
+	}
+	return nil
+}
+
 func runEnvs(r recipe.MediaRecipe, tgt target.Target, storeMount, espMount string, parallel int, track func(string, func() error) error, remoraManifests []*install.RemoraManifest) error {
 	// Cross-env dedup (ISO only): envs share squashfs content, so the
 	// per-env loop shape doesn't apply.
@@ -448,7 +459,7 @@ func runEnvs(r recipe.MediaRecipe, tgt target.Target, storeMount, espMount strin
 	}
 	if parallel <= 1 {
 		for i, env := range r.BootableEnvironments {
-			if err := installEnv(env, r, tgt, storeMount, espMount, track, remoraManifests[i]); err != nil {
+			if err := installEnv(env, r, tgt, storeMount, espMount, track, remoraAt(remoraManifests, i)); err != nil {
 				return err
 			}
 		}
@@ -465,7 +476,7 @@ func runEnvs(r recipe.MediaRecipe, tgt target.Target, storeMount, espMount strin
 		go func(i int, env recipe.BootableEnvironment) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			errs[i] = installEnv(env, r, tgt, storeMount, espMount, track, remoraManifests[i])
+			errs[i] = installEnv(env, r, tgt, storeMount, espMount, track, remoraAt(remoraManifests, i))
 		}(i, env)
 	}
 	wg.Wait()
@@ -902,11 +913,11 @@ func installEnvsLiveCombined(r recipe.MediaRecipe, tgt target.Target, storeMount
 	// Remora layering for each env (after customize, before squash).
 	for i := range localEnvs {
 		env := &localEnvs[i]
-		if remoraManifests[i] == nil {
+		if remoraAt(remoraManifests, i) == nil {
 			continue
 		}
 		if err := track("remora:"+env.ID, func() error {
-			derived, err := install.RemoraCustomize(env.Image, remoraManifests[i])
+			derived, err := install.RemoraCustomize(env.Image, remoraAt(remoraManifests, i))
 			if err == nil {
 				env.Image = derived
 			}
@@ -1010,11 +1021,11 @@ func installEnvsLiveDelta(r recipe.MediaRecipe, tgt target.Target, storeMount, e
 	// Remora layering for each env (after customize, before squash).
 	for i := range localEnvs {
 		env := &localEnvs[i]
-		if remoraManifests[i] == nil {
+		if remoraAt(remoraManifests, i) == nil {
 			continue
 		}
 		if err := track("remora:"+env.ID, func() error {
-			derived, err := install.RemoraCustomize(env.Image, remoraManifests[i])
+			derived, err := install.RemoraCustomize(env.Image, remoraAt(remoraManifests, i))
 			if err == nil {
 				env.Image = derived
 			}

@@ -1,10 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/tuna-os/tacklebox/internal/recipe"
 )
 
 func TestBelongsToEnv(t *testing.T) {
@@ -112,5 +116,132 @@ func TestCheckESPFit(t *testing.T) {
 	tooMany := int(free/espHeadroomPerEnv) + 2
 	if err := checkESPFit(dir, tooMany); err == nil {
 		t.Errorf("expected ESP-fit failure requesting %d envs (free=%d MiB)", tooMany, free>>20)
+	}
+}
+
+// --- validateMutationTarget ---
+
+func TestValidateMutationTargetRejectsISO(t *testing.T) {
+	err := validateMutationTarget("media.iso")
+	if err == nil {
+		t.Fatal("expected error for ISO target")
+	}
+	if !strings.Contains(err.Error(), "immutable") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateMutationTargetRejectsISOUppercase(t *testing.T) {
+	err := validateMutationTarget("MEDIA.ISO")
+	if err == nil {
+		t.Fatal("expected error for uppercase .ISO target")
+	}
+}
+
+func TestValidateMutationTargetAcceptsBlockDevice(t *testing.T) {
+	if err := validateMutationTarget("/dev/sdb"); err != nil {
+		t.Errorf("expected /dev/sdb to be accepted, got: %v", err)
+	}
+}
+
+func TestValidateMutationTargetRejectsMissingFile(t *testing.T) {
+	err := validateMutationTarget("/nonexistent/target.img")
+	if err == nil {
+		t.Fatal("expected error for nonexistent image file")
+	}
+}
+
+func TestValidateMutationTargetAcceptsExistingFile(t *testing.T) {
+	img := filepath.Join(t.TempDir(), "media.img")
+	if err := os.WriteFile(img, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateMutationTarget(img); err != nil {
+		t.Errorf("expected existing image to be accepted, got: %v", err)
+	}
+}
+
+// --- confirmMutation ---
+
+func TestConfirmMutationYesSkipsPrompt(t *testing.T) {
+	newMockRunner(t)
+	if err := confirmMutation("/dev/sdb", "summary", true); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConfirmMutationRefusesNonInteractive(t *testing.T) {
+	newMockRunner(t)
+	err := confirmMutation("/dev/sdb", "summary", false)
+	if err == nil {
+		t.Fatal("expected error when stdin is not a terminal and --yes is unset")
+	}
+	if !strings.Contains(err.Error(), "without --yes") && !strings.Contains(err.Error(), "read confirmation") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// --- installedEnvs / readPersistedRecipe ---
+
+func TestInstalledEnvs(t *testing.T) {
+	storeMount := t.TempDir()
+	os.MkdirAll(filepath.Join(storeMount, "tbox-install", "bluefin"), 0755)
+	os.MkdirAll(filepath.Join(storeMount, "tbox-install", "bazzite"), 0755)
+	os.WriteFile(filepath.Join(storeMount, "tbox-install", "not-an-env"), []byte("x"), 0644)
+
+	got, err := installedEnvs(storeMount)
+	if err != nil {
+		t.Fatalf("installedEnvs: %v", err)
+	}
+	want := []string{"bazzite", "bluefin"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestInstalledEnvsMissingDir(t *testing.T) {
+	storeMount := t.TempDir()
+	_, err := installedEnvs(storeMount)
+	if err == nil {
+		t.Fatal("expected error when tbox-install is missing")
+	}
+}
+
+func TestReadPersistedRecipe(t *testing.T) {
+	storeMount := t.TempDir()
+
+	// Two envs: only baz has a recipe.
+	os.MkdirAll(filepath.Join(storeMount, "tbox-install", "foo"), 0755)
+	recipeDir := filepath.Join(storeMount, "tbox-install", "baz", "etc", "tacklebox")
+	os.MkdirAll(recipeDir, 0755)
+	r := recipe.MediaRecipe{MediaName: "test-media", DefaultBoot: "baz"}
+	data, _ := json.Marshal(r)
+	os.WriteFile(filepath.Join(recipeDir, "recipe.json"), data, 0644)
+
+	got, err := readPersistedRecipe(storeMount)
+	if err != nil {
+		t.Fatalf("readPersistedRecipe: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected a recipe, got nil")
+	}
+	if got.MediaName != "test-media" {
+		t.Errorf("MediaName = %q, want test-media", got.MediaName)
+	}
+	if got.DefaultBoot != "baz" {
+		t.Errorf("DefaultBoot = %q, want baz", got.DefaultBoot)
+	}
+}
+
+func TestReadPersistedRecipeNoRecipe(t *testing.T) {
+	storeMount := t.TempDir()
+	os.MkdirAll(filepath.Join(storeMount, "tbox-install", "foo"), 0755)
+
+	got, err := readPersistedRecipe(storeMount)
+	if err != nil {
+		t.Fatalf("readPersistedRecipe: %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil when no env has a recipe, got %+v", got)
 	}
 }

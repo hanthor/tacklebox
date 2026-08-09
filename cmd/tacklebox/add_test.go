@@ -79,7 +79,8 @@ func TestSelectEnvsToAdd_AllAlreadyPresentReturnsEmpty(t *testing.T) {
 }
 
 func TestSelectEnvsToAdd_MixedUnknownAndAlreadyPresent(t *testing.T) {
-	envs := envList("a", "b", "c")
+	// "a" must NOT be in envs so it is genuinely unknown.
+	envs := envList("b", "c")
 	present := map[string]bool{"b": true}
 	// "a" is unknown to recipe, "b" is already present, "c" should succeed.
 	// selectEnvsToAdd returns the first error (unknown takes priority over already-present).

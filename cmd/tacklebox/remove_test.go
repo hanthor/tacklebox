@@ -53,6 +53,10 @@ func TestRemoveEnvClearsStoreDirAndBootDir(t *testing.T) {
 	if err := os.MkdirAll(bootDir, 0755); err != nil {
 		t.Fatalf("setup boot dir: %v", err)
 	}
+	// removeEnv reads BLS entries from loader/entries — pre-create it (empty).
+	if err := os.MkdirAll(filepath.Join(espMount, "loader", "entries"), 0755); err != nil {
+		t.Fatalf("setup entries dir: %v", err)
+	}
 
 	if err := removeEnv(storeMount, espMount, "test-env"); err != nil {
 		t.Fatalf("removeEnv: %v", err)
@@ -105,7 +109,10 @@ func TestRemoveEnvHandlesEmptyEntriesDir(t *testing.T) {
 	storeMount := t.TempDir()
 	espMount := t.TempDir()
 
-	// No entries dir at all — removeEnv must not crash.
+	// Empty entries dir — removeEnv must not crash and must succeed.
+	if err := os.MkdirAll(filepath.Join(espMount, "loader", "entries"), 0755); err != nil {
+		t.Fatalf("setup entries dir: %v", err)
+	}
 	if err := removeEnv(storeMount, espMount, "ghost"); err != nil {
 		t.Fatalf("removeEnv with no entries dir: %v", err)
 	}

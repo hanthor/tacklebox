@@ -274,6 +274,7 @@ func TestUpdateEnvPullFailurePropagates(t *testing.T) {
 }
 
 func TestUpdateEnvNonBootedMissingRepo(t *testing.T) {
+	_ = newMockRunner(t)
 	env := recipe.BootableEnvironment{ID: "missing-repo", Image: "ghcr.io/test/missing:latest"}
 	tbxRoot := t.TempDir()
 

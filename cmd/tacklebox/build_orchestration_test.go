@@ -63,7 +63,7 @@ func TestInstallEnvDispatchesToBootc(t *testing.T) {
 	r := recipe.MediaRecipe{DefaultBoot: "aurora", BootableEnvironments: []recipe.BootableEnvironment{env}}
 	tgt := &fakeTarget{mode: target.InstallModeBootc}
 
-	if err := installEnv(env, r, tgt, storeMount, espMount, noopTrack); err != nil {
+	if err := installEnv(env, r, tgt, storeMount, espMount, noopTrack, nil); err != nil {
 		t.Fatalf("installEnv: %v", err)
 	}
 	entry := filepath.Join(espMount, "loader", "entries", "aurora-persistent.conf")
@@ -78,7 +78,7 @@ func TestInstallEnvRejectsUnsupportedMode(t *testing.T) {
 	r := recipe.MediaRecipe{BootableEnvironments: []recipe.BootableEnvironment{env}}
 	tgt := &fakeTarget{mode: target.InstallMode("unknown")}
 
-	err := installEnv(env, r, tgt, t.TempDir(), t.TempDir(), noopTrack)
+	err := installEnv(env, r, tgt, t.TempDir(), t.TempDir(), noopTrack, nil)
 	if err == nil {
 		t.Fatal("expected an error for an unsupported install mode")
 	}
@@ -202,7 +202,7 @@ func TestRunEnvsBootcSequentialStopsOnFirstError(t *testing.T) {
 	secondRoot := filepath.Join(storeMount, "tbox-install", "second")
 	m.runErr["sudo mkdir -p "+secondRoot] = fmt.Errorf("no space left on device")
 
-	err := runEnvs(r, tgt, storeMount, espMount, 1, noopTrack)
+	err := runEnvs(r, tgt, storeMount, espMount, 1, noopTrack, nil)
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -223,7 +223,7 @@ func TestRunEnvsBootcParallelAggregatesFailures(t *testing.T) {
 
 	m.runErr["sudo mkdir -p "+filepath.Join(storeMount, "tbox-install", "bad")] = fmt.Errorf("boom")
 
-	err := runEnvs(r, tgt, storeMount, espMount, 2, noopTrack)
+	err := runEnvs(r, tgt, storeMount, espMount, 2, noopTrack, nil)
 	if err == nil {
 		t.Fatal("expected an aggregated error")
 	}
@@ -242,7 +242,7 @@ func TestRunEnvsBootcParallelAllSucceed(t *testing.T) {
 	r := recipe.MediaRecipe{BootableEnvironments: envs}
 	tgt := &fakeTarget{mode: target.InstallModeBootc}
 
-	if err := runEnvs(r, tgt, storeMount, espMount, 2, noopTrack); err != nil {
+	if err := runEnvs(r, tgt, storeMount, espMount, 2, noopTrack, nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	for _, id := range []string{"e1", "e2"} {

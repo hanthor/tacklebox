@@ -92,24 +92,37 @@ echo ">>> Tacklebox: live root from $dev ($livedir/$squashimg, overlay ${ovlsize
 
 mkdir -p /run/initramfs/live /run/rootfsbase /run/tbox-overlay
 
+fail() {
+    if [ "$wait" = "1" ]; then
+        die "$1"
+    else
+        warn "$1"
+        return 1
+    fi
+}
+
 mount -o ro "$dev" /run/initramfs/live \
-    || die "Tacklebox: cannot mount live device $dev"
+    || fail "Tacklebox: cannot mount live device $dev" || return 1
 
 sfs="/run/initramfs/live/$livedir/$squashimg"
-[ -f "$sfs" ] || die "Tacklebox: $sfs not found on live device"
+if [ ! -f "$sfs" ]; then
+    fail "Tacklebox: $sfs not found on live device" || return 1
+fi
 
 # -t auto: the rootfs image may be squashfs (mksquashfs path) or erofs
 # (pure-Go writer path) — the kernel probes; both modules are installed.
 mount -o ro,loop "$sfs" /run/rootfsbase \
-    || die "Tacklebox: cannot loop-mount $sfs"
+    || fail "Tacklebox: cannot loop-mount $sfs" || return 1
 
 delta=$(getarg tacklebox.live.delta)
 if [ -n "$delta" ]; then
     dsfs="/run/initramfs/live/$livedir/$delta"
-    [ -f "$dsfs" ] || die "Tacklebox: $dsfs not found on live device"
+    if [ ! -f "$dsfs" ]; then
+        fail "Tacklebox: $dsfs not found on live device" || return 1
+    fi
     mkdir -p /run/tbox-delta
     mount -o ro,loop "$dsfs" /run/tbox-delta \
-        || die "Tacklebox: cannot loop-mount $dsfs"
+        || fail "Tacklebox: cannot loop-mount $dsfs" || return 1
 fi
 
 # Dedicated tmpfs for the writable upper layer: /run itself is capped at
@@ -117,7 +130,7 @@ fi
 # own (recipe-tunable) budget — see liveKernelCmdline in build.go for why
 # the default is 8 GiB.
 mount -t tmpfs -o "mode=0755,size=${ovlsize}m" tbox-overlay /run/tbox-overlay \
-    || die "Tacklebox: cannot mount overlay tmpfs"
+    || fail "Tacklebox: cannot mount overlay tmpfs" || return 1
 mkdir -p /run/tbox-overlay/upper /run/tbox-overlay/work
 
 : > /run/tacklebox-live-done

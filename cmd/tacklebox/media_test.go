@@ -63,6 +63,7 @@ func TestRewriteSortKeyLeavesNonTboxKeys(t *testing.T) {
 }
 
 func TestReassignDefaultBLS(t *testing.T) {
+	newMockRunner(t)
 	esp := t.TempDir()
 	entries := filepath.Join(esp, "loader", "entries")
 	if err := os.MkdirAll(entries, 0755); err != nil {

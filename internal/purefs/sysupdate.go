@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -117,9 +116,11 @@ func versionLess(a, b string) bool {
 		ad, an := splitLead(a)
 		bd, bn := splitLead(b)
 		if isNum(ad) && isNum(bd) {
-			ai, bi := parseNum(ad), parseNum(bd)
-			if ai != bi {
-				return ai < bi
+			switch compareNum(ad, bd) {
+			case -1:
+				return true
+			case 1:
+				return false
 			}
 		} else if ad != bd {
 			return ad < bd
@@ -141,11 +142,30 @@ func splitLead(s string) (lead, rest string) {
 
 func isNum(s string) bool { return s != "" && s[0] >= '0' && s[0] <= '9' }
 
-func parseNum(s string) uint64 {
-	s = strings.TrimLeft(s, "0")
-	if s == "" {
-		return 0
+// compareNum compares decimal runs without converting them to a machine
+// integer. Release versions are normally timestamps, but keeping this
+// arbitrary-width avoids silently ordering very large future versions as 0
+// when strconv.ParseUint overflows.
+func compareNum(a, b string) int {
+	a = strings.TrimLeft(a, "0")
+	b = strings.TrimLeft(b, "0")
+	if a == "" {
+		a = "0"
 	}
-	v, _ := strconv.ParseUint(s, 10, 64)
-	return v
+	if b == "" {
+		b = "0"
+	}
+	if len(a) != len(b) {
+		if len(a) < len(b) {
+			return -1
+		}
+		return 1
+	}
+	if a < b {
+		return -1
+	}
+	if a > b {
+		return 1
+	}
+	return 0
 }

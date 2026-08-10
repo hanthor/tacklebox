@@ -87,6 +87,11 @@ func (m *mockRunner) run(name string, args ...string) error {
 	if err == nil && name == "sudo" && len(args) == 3 && args[0] == "mkdir" && args[1] == "-p" {
 		os.MkdirAll(args[2], 0755)
 	}
+	if err == nil && name == "sudo" && len(args) == 3 && args[0] == "cp" {
+		if data, readErr := os.ReadFile(args[1]); readErr == nil {
+			os.WriteFile(args[2], data, 0644)
+		}
+	}
 	return err
 }
 

@@ -181,7 +181,7 @@ func readKernelArg(key string) string {
 // ostree/container/image/* ref in repo. ostree's container-image pull
 // always writes such a ref, so the freshest one is what we just pulled.
 func latestContainerRef(repo string) (string, error) {
-	out, err := exec.Command("ostree", "refs", "--repo", repo).Output()
+	out, err := runner.Output("ostree", "refs", "--repo", repo)
 	if err != nil {
 		return "", err
 	}

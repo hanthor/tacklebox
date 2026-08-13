@@ -27,6 +27,14 @@ func HostArgs(name string, args []string) (string, []string) {
 	return name, args
 }
 
+func truncateStderrTail(b []byte) string {
+	tail := strings.TrimSpace(string(b))
+	if len(tail) > 400 {
+		return "..." + tail[len(tail)-400:]
+	}
+	return tail
+}
+
 func DefaultRun(stdin io.Reader, name string, args ...string) error {
 	name, args = HostArgs(name, args)
 	cmd := exec.Command(name, args...)
@@ -46,10 +54,7 @@ func DefaultRun(stdin io.Reader, name string, args ...string) error {
 	}
 
 	if err := cmd.Run(); err != nil {
-		tail := strings.TrimSpace(stderrBuf.String())
-		if len(tail) > 400 {
-			tail = "..." + tail[len(tail)-400:]
-		}
+		tail := truncateStderrTail(stderrBuf.Bytes())
 		if tail != "" {
 			return fmt.Errorf("%s %s: %w\nstderr: %s", name, strings.Join(args, " "), err, tail)
 		}
@@ -81,7 +86,7 @@ func outputImpl(name string, args ...string) ([]byte, error) {
 	cmd.Stderr = &stderrBuf
 	out, err := cmd.Output()
 	if err != nil {
-		tail := strings.TrimSpace(stderrBuf.String())
+		tail := truncateStderrTail(stderrBuf.Bytes())
 		if tail != "" {
 			return nil, fmt.Errorf("%s %s: %w\nstderr: %s", name, strings.Join(args, " "), err, tail)
 		}

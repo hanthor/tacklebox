@@ -36,18 +36,17 @@ func TestOutput_ErrorIncludesStderrTail(t *testing.T) {
 	}
 }
 
-func TestOutput_FullStderrPreserved(t *testing.T) {
-	// Contract as implemented: outputImpl embeds the WHOLE stderr tail in
-	// the error, unlike DefaultRun which truncates to 400 chars. This test
-	// pins that behavior; see tuna-os/tacklebox#196 (DefaultRun truncates,
-	// outputImpl does not) for the proposed unification.
+func TestOutput_StderrTruncatedTo400Chars(t *testing.T) {
+	// Unified behavior per tuna-os/tacklebox#196: outputImpl truncates stderr
+	// to 400 chars, matching DefaultRun.
 	long := strings.Repeat("x", 600)
 	_, err := Output("sh", "-c", "echo "+long+" >&2; exit 1")
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	if !strings.Contains(err.Error(), strings.Repeat("x", 600)) {
-		t.Errorf("outputImpl should include the full stderr tail, got: %.140s", err)
+	wantTail := "..." + strings.Repeat("x", 400)
+	if !strings.Contains(err.Error(), wantTail) {
+		t.Errorf("outputImpl error = %q, want truncated tail containing %q", err.Error(), wantTail)
 	}
 }
 

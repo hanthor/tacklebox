@@ -15,16 +15,18 @@ import (
 )
 
 // customizeTimeoutSeconds is the podman --timeout applied to the customize
-// container: default 1800s, TBOX_CUSTOMIZE_TIMEOUT=<seconds> overrides,
-// 0 disables. Unparsable values keep the default rather than silently
-// disabling the cap.
+// container. Default 0 (disabled): podman 5.8.4 on the GitHub runners wedges
+// `podman commit` after a `--timeout` run (tuna-os/tunaOS#1893), so the cap
+// is now opt-in via TBOX_CUSTOMIZE_TIMEOUT=<seconds>. The caller's outer
+// deadline still bounds a wedged customize; setting a value here only
+// restores the tighter in-container cap on a known-good runner.
 func customizeTimeoutSeconds() int {
 	if v := strings.TrimSpace(os.Getenv("TBOX_CUSTOMIZE_TIMEOUT")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			return n
 		}
 	}
-	return 1800
+	return 0
 }
 
 // CustomizeLive runs the recipe's live_customize scripts inside a container
@@ -84,6 +86,12 @@ func CustomizeLive(image string, scripts []string) (string, error) {
 		"run", "--name", ctr,
 		"--cap-add", "sys_admin",
 		"--security-opt", "label=disable",
+		// File logging, not journald: the GitHub/RunsOn runner images lack a
+		// usable systemd-journald for the container, and conmon dies with
+		// "[conmon:e]: Include journald in compilation path" otherwise
+		// (tuna-os/tunaOS#1893). Build-time customize output is read from the
+		// stream anyway; a file log driver loses nothing.
+		"--log-driver", "k8s-file",
 	)
 	// Hard cap on the customize container (tuna-os/tunaOS#1772): a customize
 	// script that wedges — flatpak against a blackholed network being the
@@ -147,8 +155,15 @@ func CustomizeLive(image string, scripts []string) (string, error) {
 	// budget killed the job. Stream it and mark it so a hang is attributable
 	// to this step instead of invisible.
 	fmt.Printf(">>> [customize] committing %s -> %s\n", ctr, tag)
-	commitArgs := append(prefix[1:], "commit", ctr, tag)
-	if err := runner.RunStreamed(prefix[0], commitArgs...); err != nil {
+	// Bound the commit: podman 5.8.4 on the GitHub runners wedges here
+	// (tuna-os/tunaOS#1893) — a `stop` before this did not help and itself
+	// wedged, so don't add one. `timeout --foreground` makes a persistent
+	// wedge fail in 600s with a named error instead of hanging until the
+	// caller's job budget cancels the run. It wraps the full prefix so it
+	// works in both root and SUDO_USER contexts.
+	commitArgs := append(append([]string{}, prefix...), "commit", ctr, tag)
+	bounded := append([]string{"timeout", "--foreground", "600"}, commitArgs...)
+	if err := runner.RunStreamed(bounded[0], bounded[1:]...); err != nil {
 		return "", fmt.Errorf("commit customized %s: %w", image, err)
 	}
 	rmArgs = append(prefix[1:], "rm", "-f", "--ignore", ctr)

@@ -1,8 +1,8 @@
 # Tacklebox — Architecture
 
 How the parts fit together. For features and known bugs see
-[`TODO.md`](TODO.md); for the SuperISO/tacklebox unification roadmap
-see [`../PLAN-merge.md`](../PLAN-merge.md).
+[`TODO.md`](TODO.md); for the SuperISO lineage that Tacklebox evolved
+from, see [`README.md`](README.md).
 
 ## What tacklebox does
 
@@ -37,7 +37,10 @@ tacklebox/
 │   ├── update.go              # the `update` command (host-side USB refresh)
 │   ├── update_all.go          # `update-all` boot-time cross-env updater
 │   ├── status.go              # the `status` command (inspect installed envs)
+│   ├── add.go / remove.go      # mutate environments on existing media
 │   └── verify.go              # the `verify` regression-checker
+├── cmd/purebuild/             # native, rootless pure-Go ISO proving harness
+├── cmd/tbwasm/                # browser/WASM entry point and OPFS blob store
 ├── internal/
 │   ├── recipe/                # JSON recipe schema
 │   ├── target/                # Target interface + implementations
@@ -50,6 +53,8 @@ tacklebox/
 │   │   ├── initramfs.go       # initramfs probe + dracut rebuild + cache
 │   │   └── bootloader.go      # systemd-boot install + BLS entry writer
 │   ├── blockdev/              # sgdisk + mkfs wrappers
+│   ├── oci/                   # registry client, layer unpacking, content stores
+│   ├── purefs/                # rootless EROFS, FAT ESP, and ISO9660 authoring
 │   └── runner/                # subprocess wrapper (verbose toggle, sudo)
 ├── embedded.go                # go:embed of src/dracut/ (consumed by initramfs.go)
 ├── src/
@@ -59,6 +64,12 @@ tacklebox/
 ├── fixtures/                  # CI fixture recipes
 └── .github/workflows/ci.yml   # lint-test + verify-smoke pipeline
 ```
+
+There are two image-assembly paths. The `cmd/tacklebox` path shells out to
+host tools and can provision block devices as well as ISOs. The pure-Go path
+is shared by `cmd/purebuild` (a native proving harness) and `cmd/tbwasm` (the
+browser builder); it creates live ISOs without Podman, mount operations,
+`mksquashfs`, `xorriso`, or root privileges.
 
 ## The build flow
 
@@ -118,6 +129,35 @@ tacklebox/
    - BlockTarget: unmount + detach loop. Returns the .img / device path.
    - IsoTarget: extract sd-boot from EFISource, mirror pxeboot to iso-root,
      `mkfs.fat` + mtools the ESP image, run `xorriso` to wrap iso-root.
+
+## The pure-Go ISO build flow
+
+The browser and native pure-build entry points share the same `internal/oci`
+and `internal/purefs` packages. Their data flow is:
+
+1. **Resolve and fetch** — `oci.Client` resolves an amd64 manifest and streams
+   its layers from the registry. Layer application preserves OCI whiteout and
+   overlay ordering semantics.
+2. **Reconstruct the root tree** — `oci.Unpack` builds an `oci.Node` tree while
+   file bodies go to a `BlobStore`. `purebuild` uses an on-disk `DirStore`;
+   `tbwasm` uses OPFS arenas so multi-gigabyte image content does not occupy
+   wasm linear memory.
+3. **Inspect and customize** — `purefs.Introspect` discovers image facts, then
+   the builder optionally grafts a published live-overlay artifact and applies
+   the distro-neutral live-user, autologin, and readiness setup.
+4. **Author filesystems** — `purefs` streams the reconstructed tree into EROFS,
+   creates the FAT32 ESP, and writes the final El Torito ISO9660 image. Kernel,
+   initramfs, UKI, and systemd-boot inputs come from the image tree or explicit
+   builder options.
+5. **Stream the result** — `purebuild` writes a native output file. `tbwasm`
+   exposes promise-based JavaScript calls (`tboxIntrospect`, `tboxBuildIso`,
+   and `tboxBuildDdiIso`) and sends the ISO to the caller in chunks.
+
+`cmd/purebuild` also accepts a rootfs tar or a systemd-sysupdate DDI artifact
+instead of an OCI reference. These inputs join the flow after registry unpack;
+the filesystem and ISO authoring stages remain shared. Changes to the shared
+packages should be exercised through their unit tests and both entry-point
+builds so native and browser behavior do not drift.
 
 ## The Target interface
 
@@ -254,6 +294,17 @@ Three pieces:
 into each env's deployment at install time (`provisionUpdateSystem`).
 Updates are best-effort and never block boot; failures log but exit 0.
 
+## Cross-platform GUI multi-boot manager integration
+
+Tacklebox core orchestration is wrapped by the native desktop manager in [`tuna-os/iso-builder`](https://github.com/tuna-os/iso-builder) (`native/`):
+
+- **Single-language stack**: Implemented in Go using Fyne, directly embedding `internal/oci` and `internal/purefs` packages.
+- **Drive inspection**: Uses `internal/blockdev` and media layout probing to discover Tacklebox-managed USB partitions and calculate deduplication savings.
+- **Host virtualization**: Because `bootc install to-filesystem` requires real Linux kernel semantics (ostree, composefs, `chattr +i`), non-Linux hosts use lightweight helper virtualization:
+  - **macOS**: QEMU+TCG helper VM with block device pass-through via `authopen`.
+  - **Windows**: WSL2 with `usbipd-win` device attachment.
+- **Boot verification**: Integrates throwaway QEMU/OVMF VM boots on Linux to verify created or modified media reaches userspace prior to unmounting.
+
 ## The CI pipeline
 
 `.github/workflows/ci.yml` runs on every push/PR:
@@ -322,8 +373,11 @@ with no `R2_BUCKET`; build + verify always run.
 | Build dies during partitioning                   | `internal/blockdev/format.go`           |
 | Build dies inside `bootc install`                | `internal/install/bootc.go`             |
 | Build dies during ISO assembly                   | `internal/target/iso.go`                |
+| Pure build fails resolving or unpacking an image | `internal/oci/`                         |
+| Pure build fails authoring EROFS, ESP, or ISO    | `internal/purefs/`                      |
+| Browser build stalls or exhausts wasm memory     | `cmd/tbwasm/` (OPFS store and progress reporting) |
 | BLS entry exists but kernel/initrd missing       | `cmd/tacklebox/build.go` (`installEnv`) |
 | Boot stalls at `ostree-prepare-root`             | `src/dracut/95tbox-root/*`              |
-| Boot stalls at `dracut-initqueue` on a live ISO  | `cmd/tacklebox/build.go` (`buildLiveKernelCmdline`) — overlay flag syntax |
+| Boot stalls at `dracut-initqueue` on a live ISO  | `internal/kernelcmdline` (`Live`) — overlay flag syntax |
 | Two envs end up with the same content            | bootc upstream bug; see TODO.md §Bugs   |
 | `tacklebox verify` flags something               | The check name maps 1:1 to a section of `cmd/tacklebox/verify.go` |

@@ -1,6 +1,6 @@
 # 🧰 Tacklebox
 
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/tuna-os/tacklebox/blob/main/LICENSE)
 
 **Tacklebox** is a high-performance orchestrator for `bootc` that provisions multi-tenant, updatable, and deduplicated bootable media (USB drives, SD cards, or raw disk images).
 
@@ -15,6 +15,7 @@ Born from the `superiso` project, Tacklebox evolves the concept from static ISOs
 *   **📂 Shared Persistence:** Smart OverlayFS mounts allow sharing files in `/home/liveuser` across all OSes while isolating desktop-specific configurations (KDE vs GNOME).
 *   **📦 Distribution Ready:** Built-in support for creating sparse `.img.xz` files for easy sharing.
 *   **🛡️ Integrity First:** Automatically enables `fs-verity` on partitions to support modern container backends like Composefs.
+*   **🖥️ Cross-Platform Desktop GUI:** Native multi-boot manager for Linux, macOS, and Windows shipped via [`tuna-os/iso-builder`](https://github.com/tuna-os/iso-builder) (`native/`), providing visual drive inspection, add/remove/update lifecycle, and VM boot verification.
 
 ## 🏗️ Architecture
 
@@ -68,6 +69,32 @@ Tacklebox automatically handles the unique requirements of the Composefs backend
 
 ## 🛠 Usage
 
+### Installation
+
+Tagged releases provide static Linux binaries for AMD64 and ARM64 on the
+[GitHub Releases page](https://github.com/tuna-os/tacklebox/releases). Download
+the binary and matching `.sha256` file for your architecture, verify it, and
+install it on your `PATH`:
+
+```bash
+sha256sum --check tacklebox-linux-amd64.sha256
+sudo install -m 0755 tacklebox-linux-amd64 /usr/local/bin/tacklebox
+```
+
+To build from source, install the Go version declared by [`go.mod`](go.mod),
+then run:
+
+```bash
+git clone https://github.com/tuna-os/tacklebox.git
+cd tacklebox
+go build -o tacklebox ./cmd/tacklebox
+sudo install -m 0755 tacklebox /usr/local/bin/tacklebox
+```
+
+A container image is also published as `ghcr.io/tuna-os/tacklebox:latest` for
+CI and other container-based workflows. Pin a version or `sha-*` tag when you
+need reproducible builds.
+
 ### Build a Multi-Boot Image
 ```bash
 sudo tacklebox build recipe.json --xz
@@ -94,6 +121,9 @@ tacklebox status
 tacklebox status /mnt/tbx
 tacklebox status /path/to/tacklebox.img
 ```
+
+### Multi-Boot USB Manager GUI
+A cross-platform desktop application (Linux, macOS, Windows) is available in [`tuna-os/iso-builder`](https://github.com/tuna-os/iso-builder) (`native/`). Powered by Tacklebox's core orchestration, it discovers connected drives, inspects installed environments and shared-store dedup savings, manages the add/remove/update lifecycle, and supports post-write VM boot verification.
 
 ## 📋 Recipe Schema
 
@@ -216,7 +246,9 @@ the squashfs cache is keyed by *all* image IDs together. See
 
 ## 🏗 Requirements
 
-*   Go 1.22+
+Go is needed only when building Tacklebox from source; use the version declared
+by [`go.mod`](go.mod). Creating media with the installed CLI also requires:
+
 *   `podman` & `bootc`
 *   `sgdisk` (gdisk)
 *   `mkfs.vfat`, `mkfs.ext4` (with verity support)

@@ -40,6 +40,20 @@ tbox:/dev/*)
 esac
 
 if [ "$tboxroot" = "1" ]; then
+    # Proactively load storage and CD-ROM drivers early in the cmdline hook.
+    # On distros/kernels (e.g. CachyOS/Arch) where CD-ROM drivers are not
+    # auto-loaded by default, sr_mod/cdrom/isofs/erofs/loop must be loaded
+    # so CD-ROM devices (sr0) attach and udev block device probes fire.
+    _kv=$(uname -r)
+    for _rel in drivers/cdrom/cdrom drivers/scsi/sr_mod drivers/block/loop \
+        fs/overlayfs/overlay fs/erofs/erofs fs/isofs/isofs fs/squashfs/squashfs; do
+        _b=${_rel##*/}
+        modprobe "$_b" 2> /dev/null && continue
+        [ -f "/usr/lib/modules/$_kv/kernel/$_rel.ko" ] &&
+            insmod "/usr/lib/modules/$_kv/kernel/$_rel.ko" 2> /dev/null
+    done
+    udevadm trigger --action=add --subsystem-match=block 2> /dev/null || true
+
     # The device path travels via a file, NOT argv: initqueue stores its
     # command as a shell line and re-parses it, so an unquoted \x20
     # (udev's space escape in by-label paths) collapses to x20 and the

@@ -283,7 +283,11 @@ jobs:
   # No actions/cache here: the fixture images are rebuilt every run, so their
   # image IDs (and thus every tacklebox cache key) change every run.
   iso-smoke:
-    runs-on: ubuntu-latest
+    # RunsOn build-amd64 (controlled ubuntu24-full-x64 image): the GitHub
+    # runner's podman 5.8.4 wedges the customize commit and its crun/conmon
+    # cannot be re-pinned (tuna-os/tunaOS#1893). The `runs-on=` marker + `runner=`
+    # group is RunsOn's label format (see docs/runners/labels).
+    runs-on: runs-on=${{ github.run_id }}/runner=build-amd64
     needs: lint-test
     timeout-minutes: 60
     steps:
@@ -330,24 +334,62 @@ jobs:
             podman info --format '>>> OCI runtime: {{.Host.OCIRuntime.Name}} {{.Host.OCIRuntime.Version}}'
           fi
 
+      # podman 5.8.4 (what both the GitHub runner and the ubuntu24 RunsOn image
+      # ship) is broken for this workload: the customize commit wedges and
+      # `podman build` fails with "cannot re-exec process". Install the Kubic
+      # unstable podman (6.x) and drop the image's 5.8.4 shadow from
+      # /usr/local/bin so the pinned podman wins on PATH.
+      - name: install podman 6.x from Kubic unstable
+        run: |
+          set -euo pipefail
+          sudo install -d /etc/apt/keyrings
+          curl -fsSL https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/unstable/xUbuntu_24.04/Release.key \
+            | gpg --dearmor | sudo tee /etc/apt/keyrings/kubic.gpg >/dev/null
+          echo 'deb [signed-by=/etc/apt/keyrings/kubic.gpg] https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/unstable/xUbuntu_24.04/ /' \
+            | sudo tee /etc/apt/sources.list.d/kubic.list
+          sudo apt-get update -qq
+          # Force the Kubic stack: apt kept the image's 4.9.3+conmon2.1.10
+          # (conmon journald failure). Remove the old podman/conmon so the
+          # Kubic podman 6.x + matching conmon/crun come in fresh.
+          sudo apt-get remove -y podman conmon crun || true
+          sudo apt-get install -y podman
+          # conmon 2.1.10 on this image lacks journald support and dies on the
+          # customize run ("[conmon:e]: Include journald in compilation path").
+          # Force a file log driver so conmon never touches journald.
+          sudo install -d /etc/containers/containers.conf.d
+          printf '[engine]\nlog_driver = "k8s-file"\n' | \
+            sudo tee /etc/containers/containers.conf.d/10-tbox-log.conf
+          for p in /usr/local/bin/podman /usr/local/sbin/podman; do
+            if [ -e "$p" ] && ! dpkg -S "$p" >/dev/null 2>&1; then
+              echo ">>> removing non-apt podman shadow: $p"
+              sudo rm -f "$p"
+            fi
+          done
+          hash -r
+          echo ">>> podman now: $(podman --version) / conmon $(conmon --version 2>/dev/null | head -1 || echo none)"
+
       - name: build tacklebox
         run: go build -o tacklebox ./cmd/tacklebox
 
       # Plain podman (no sudo): the images must land in the runner user's
       # store, which is where the live pipeline reads from.
+      # k8s-file log driver for all podman runs resolves the runner journald
+      # gap (tuna-os/tunaOS#1893).
       - name: build fixture live images
         run: |
-          podman build -f fixtures/iso-smoke.Containerfile \
+          # sudo (root) podman: the RunsOn image's rootless re-exec is broken
+          # ("cannot re-exec process"); the tacklebox build below is root too.
+          sudo podman build -f fixtures/iso-smoke.Containerfile \
             --build-arg MARKER=alpha -t localhost/tbox-iso-alpha:latest fixtures
-          podman build -f fixtures/iso-smoke.Containerfile \
+          sudo podman build -f fixtures/iso-smoke.Containerfile \
             --build-arg MARKER=beta -t localhost/tbox-iso-beta:latest fixtures
-          podman build -f fixtures/iso-smoke.Containerfile \
+          sudo podman build -f fixtures/iso-smoke.Containerfile \
             --build-arg MARKER=gamma -t localhost/tbox-iso-gamma:latest fixtures
-          podman build -f fixtures/iso-smoke.Containerfile \
+          sudo podman build -f fixtures/iso-smoke.Containerfile \
             --build-arg MARKER=delta -t localhost/tbox-iso-delta:latest fixtures
-          podman build -f fixtures/iso-smoke.Containerfile \
+          sudo podman build -f fixtures/iso-smoke.Containerfile \
             --build-arg MARKER=epsilon -t localhost/tbox-iso-epsilon:latest fixtures
-          podman build -f fixtures/iso-smoke.Containerfile \
+          sudo podman build -f fixtures/iso-smoke.Containerfile \
             --build-arg MARKER=zeta -t localhost/tbox-iso-zeta:latest fixtures
 
       - name: build per-env ISO

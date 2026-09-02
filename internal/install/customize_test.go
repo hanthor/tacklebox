@@ -1,10 +1,17 @@
 package install
 
 import (
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/tuna-os/tacklebox/internal/runner"
 )
+
+var errUncached = errors.New("no such image")
 
 func writeScript(t *testing.T, dir, name, content string) string {
 	t.Helper()
@@ -93,6 +100,94 @@ func TestCustomizeLiveNoScriptsPassthrough(t *testing.T) {
 	}
 	if ref != "ghcr.io/example/image:latest" {
 		t.Fatalf("no-scripts case must return the original ref, got %s", ref)
+	}
+}
+
+func TestCustomizeTimeoutSeconds(t *testing.T) {
+	t.Setenv("TBOX_CUSTOMIZE_TIMEOUT", "")
+	if got := customizeTimeoutSeconds(); got != 0 {
+		t.Fatalf("default = %d, want 0 (disabled; tunaOS#1893)", got)
+	}
+	t.Setenv("TBOX_CUSTOMIZE_TIMEOUT", "300")
+	if got := customizeTimeoutSeconds(); got != 300 {
+		t.Fatalf("override = %d, want 300", got)
+	}
+	t.Setenv("TBOX_CUSTOMIZE_TIMEOUT", "0")
+	if got := customizeTimeoutSeconds(); got != 0 {
+		t.Fatalf("0 must disable, got %d", got)
+	}
+	// Junk keeps the disabled default rather than silently enabling a cap.
+	t.Setenv("TBOX_CUSTOMIZE_TIMEOUT", "soon")
+	if got := customizeTimeoutSeconds(); got != 0 {
+		t.Fatalf("junk = %d, want the 0 default", got)
+	}
+	t.Setenv("TBOX_CUSTOMIZE_TIMEOUT", "-5")
+	if got := customizeTimeoutSeconds(); got != 0 {
+		t.Fatalf("negative = %d, want the 0 default", got)
+	}
+}
+
+// tuna-os/tunaOS#1772: a wedged customize script produced 87 minutes of
+// silence ending in a bare job cancellation, because (a) quiet mode discarded
+// the container's output, (b) nothing bounded the container, and (c) the two
+// scripts were indistinguishable in the log. This pins all three fixes at the
+// runner seams: the customize `podman run` must go through the STREAMED
+// runner, carry --timeout, and its inner script must announce each script.
+func TestCustomizeLiveStreamsWithTimeoutAndMarkers(t *testing.T) {
+	dir := t.TempDir()
+	s := writeScript(t, dir, "customize-live.sh", "echo hi\n")
+
+	origOut, origRun, origStreamed := runner.OutputFn, runner.RunFn, runner.RunStreamedFn
+	t.Cleanup(func() {
+		runner.OutputFn, runner.RunFn, runner.RunStreamedFn = origOut, origRun, origStreamed
+	})
+
+	runner.OutputFn = func(name string, args ...string) ([]byte, error) {
+		// podmanForImage image inspect — succeed on the first (user) probe.
+		return []byte("sha256:testimageid\n"), nil
+	}
+	var plainCalls [][]string
+	runner.RunFn = func(stdin io.Reader, name string, args ...string) error {
+		plainCalls = append(plainCalls, append([]string{name}, args...))
+		if len(args) > 0 && args[0] == "image" { // `image exists` → cache miss
+			return errUncached
+		}
+		return nil
+	}
+	var streamed [][]string
+	runner.RunStreamedFn = func(stdin io.Reader, name string, args ...string) error {
+		streamed = append(streamed, append([]string{name}, args...))
+		return nil
+	}
+
+	if _, err := CustomizeLive("ghcr.io/example/image:latest", []string{s}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(streamed) != 2 {
+		t.Fatalf("expected the customize run and its commit to stream, got %d streamed calls", len(streamed))
+	}
+	joined := strings.Join(streamed[0], " ")
+	if strings.Contains(joined, "--timeout") {
+		t.Fatalf("customize run must not carry --timeout by default (tunaOS#1893); args: %s", joined)
+	}
+	commitJoined := strings.Join(streamed[1], " ")
+	if !strings.Contains(commitJoined, "timeout --foreground 600") {
+		t.Fatalf("commit must be bounded by timeout; args: %s", commitJoined)
+	}
+	if !strings.Contains(commitJoined, "commit") {
+		t.Fatalf("the customize commit must stream too; args: %s", commitJoined)
+	}
+	inner := streamed[0][len(streamed[0])-1]
+	// baseline.sh is prepended, so two scripts and two markers.
+	if !strings.Contains(inner, "(1/2) baseline.sh") || !strings.Contains(inner, "(2/2) customize-live.sh") {
+		t.Fatalf("inner script must announce each script; got:\n%s", inner)
+	}
+	for _, c := range plainCalls {
+		j := strings.Join(c, " ")
+		if strings.Contains(j, " run ") {
+			t.Fatalf("the customize `podman run` went through the quiet runner: %s", j)
+		}
 	}
 }
 

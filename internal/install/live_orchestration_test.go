@@ -60,6 +60,14 @@ func newMockRunner(t *testing.T) *mockRunner {
 		runner.OutputFn = origOutput
 		runner.RunCombinedFn = origCombined
 	})
+
+	dir := t.TempDir()
+	script := filepath.Join(dir, "mksquashfs")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
 	return m
 }
 
